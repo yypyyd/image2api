@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed } from 'vue'
 import { api, jsonBody } from '../api'
-import { parseImportInput } from '../utils/import'
+import { parseImportFile, parseImportInput, uniqueImportItems } from '../utils/import'
 import Icon from './Icon.vue'
 
 const emit = defineEmits(['close', 'imported'])
@@ -11,6 +11,9 @@ const weight = ref(0)
 const status = ref('')
 const isError = ref(false)
 const submitting = ref(false)
+const fileInput = ref(null)
+const fileItems = ref([])
+const fileNames = ref([])
 
 // type → token pool (for the post-import weight PATCH).
 const TYPE_POOL = { openai: 'chatgpt', adobe: 'adobe', runway: 'runway', leonardo: 'leonardo', krea: 'krea', imagine: 'imagine', grok: 'grok' }
@@ -18,7 +21,7 @@ const TYPE_POOL = { openai: 'chatgpt', adobe: 'adobe', runway: 'runway', leonard
 // Live preview of what the parser would extract — updates as the user types
 // so they can see whether their paste was understood before clicking import.
 const detected = computed(() => {
-  const items = parseImportInput(input.value)
+  const items = uniqueImportItems([...parseImportInput(input.value), ...fileItems.value])
   const openai = items.filter((x) => x.type === 'openai').length
   const adobe = items.filter((x) => x.type === 'adobe').length
   const runway = items.filter((x) => x.type === 'runway').length
@@ -29,13 +32,15 @@ const detected = computed(() => {
   return { total: items.length, openai, adobe, runway, leonardo, krea, imagine, grok }
 })
 
+const importItems = computed(() => uniqueImportItems([...parseImportInput(input.value), ...fileItems.value]))
+
 function setStatus(text, err = false) {
   status.value = text || ''
   isError.value = err
 }
 
 async function doSmartImport() {
-  const items = parseImportInput(input.value)
+  const items = importItems.value
   if (!items.length) {
     setStatus('未识别到任何 Cookie 或 JWT', true)
     return
@@ -85,6 +90,29 @@ async function doSmartImport() {
     emit('imported')
   }
 }
+
+async function selectFiles(event) {
+  const files = [...(event.target.files || [])]
+  event.target.value = ''
+  if (!files.length) return
+  try {
+    const parsed = []
+    for (const file of files) parsed.push(...await parseImportFile(file))
+    fileItems.value = uniqueImportItems(parsed)
+    fileNames.value = files.map((file) => file.name)
+    setStatus(`已读取 ${files.length} 个文件，识别到 ${fileItems.value.length} 个账号`)
+  } catch (error) {
+    fileItems.value = []
+    fileNames.value = []
+    setStatus(error?.message || String(error), true)
+  }
+}
+
+function clearFiles() {
+  fileItems.value = []
+  fileNames.value = []
+  setStatus('')
+}
 </script>
 
 <template>
@@ -100,6 +128,8 @@ async function doSmartImport() {
 
       <div class="p-5">
         <p class="text-xs text-slate-500 mb-3 leading-relaxed">自动识别：
+          <strong class="text-slate-700">CPA JSON / ZIP</strong>、
+          <strong class="text-slate-700">Sub2API 聚合 JSON</strong>、
           <strong class="text-slate-700">Adobe Cookie 字符串</strong>(<code class="px-1 bg-slate-100 rounded">k=v; k=v; ...</code>)、
           <strong class="text-slate-700">Cookie JSON 对象</strong>、
           <strong class="text-slate-700">Cookie 数组</strong>(多 Adobe 批量)、
@@ -112,10 +142,19 @@ async function doSmartImport() {
           <strong class="text-slate-700">多个 JWT</strong>(换行分隔)。
           全粘进来即可，无需任何前缀。
         </p>
+        <input ref="fileInput" type="file" accept=".json,.zip,application/json,application/zip" multiple class="hidden" @change="selectFiles" />
+        <div class="mb-3 rounded-lg border border-dashed border-slate-300 bg-slate-50/60 px-3 py-2.5 flex items-center gap-2">
+          <button type="button" class="btn-soft shrink-0" @click="fileInput?.click()">选择 CPA / Sub 文件</button>
+          <span v-if="fileNames.length" class="text-xs text-emerald-700 truncate">
+            {{ fileNames.length === 1 ? fileNames[0] : `${fileNames.length} 个文件` }} · {{ fileItems.length }} 个账号
+          </span>
+          <span v-else class="text-xs text-slate-400 truncate">支持 .json、CPA 批量 .zip，可多选</span>
+          <button v-if="fileNames.length" type="button" class="ml-auto text-xs text-slate-400 hover:text-rose-600" @click="clearFiles">清除</button>
+        </div>
         <textarea v-model="input" rows="10"
                   class="field font-mono text-xs resize-none"
-                  placeholder="直接粘 Cookie 字符串 / JWT / JSON，自动识别"></textarea>
-        <div v-if="input.trim()" class="mt-2 flex items-center gap-2 text-xs">
+                  placeholder="也可直接粘贴 CPA / Sub2API JSON、Cookie 字符串或 JWT，自动识别"></textarea>
+        <div v-if="input.trim() || fileItems.length" class="mt-2 flex items-center gap-2 text-xs flex-wrap">
           <template v-if="detected.total">
             <span class="text-emerald-600">✓ 识别到 <strong class="tabular-nums">{{ detected.total }}</strong> 个账号</span>
             <span v-if="detected.openai" class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-emerald-700 bg-emerald-50 ring-1 ring-emerald-200">

@@ -1,5 +1,10 @@
-// Smart parsing of pasted credentials (Adobe cookies / ChatGPT JWTs),
-// ported verbatim from admin.html so import behaviour is unchanged.
+import { strFromU8, unzipSync } from 'fflate'
+
+// Smart parsing of pasted credentials and exported account files.
+
+const MAX_IMPORT_FILE_BYTES = 20 * 1024 * 1024
+const MAX_ZIP_ENTRY_BYTES = 2 * 1024 * 1024
+const MAX_ZIP_JSON_FILES = 1000
 
 export function looksLikeJwt(s) {
   s = (s || '').replace(/^Bearer\s+/i, '').trim()
@@ -82,48 +87,178 @@ function cookieFromAny(item) {
   return ''
 }
 
-/** Returns a list of { type: 'adobe' | 'openai' | 'runway' | 'leonardo', value }. */
+function classifyString(value) {
+  const stripped = (value || '').replace(/^Bearer\s+/i, '').replace(/^sso=/, '').trim()
+  if (looksLikeJwt(stripped)) {
+    return looksLikeRunwayJwt(stripped)
+      ? { type: 'runway', value: stripped }
+      : looksLikeGrokJwt(stripped)
+        ? { type: 'grok', value: stripped }
+        : { type: 'openai', value: stripped }
+  }
+  return stripped ? { type: cookieType(stripped), value: stripped } : null
+}
+
+function openAIItem(value) {
+  const token = (value || '').replace(/^Bearer\s+/i, '').trim()
+  return looksLikeJwt(token) ? [{ type: 'openai', value: token }] : []
+}
+
+// Returns null when the object is not a CPA/Sub2API shape; an empty array means
+// the shape was recognized but contains no usable access_token (for example an
+// Agent Identity-only credential).
+function structuredOpenAIItems(value) {
+  if (!value || typeof value !== 'object') return null
+  if (Array.isArray(value)) return null
+
+  // Sub2API bundle: { exported_at, accounts: [{ platform, credentials }] }.
+  if (Array.isArray(value.accounts)) {
+    const out = []
+    for (const account of value.accounts) {
+      const parsed = structuredOpenAIItems(account)
+      if (parsed !== null) out.push(...parsed)
+    }
+    return out
+  }
+
+  // A single Sub2API account entry.
+  if (value.credentials && typeof value.credentials === 'object') {
+    const platform = String(value.platform || '').toLowerCase()
+    const mode = String(value.credentials.auth_mode || '').toLowerCase()
+    if (platform === 'openai' || mode === 'chatgpt' || mode === 'agentidentity' || 'access_token' in value.credentials) {
+      return openAIItem(value.credentials.access_token)
+    }
+  }
+
+  // CLIProxyAPI/Codex auth-dir JSON, plus a direct access-token object.
+  const type = String(value.type || '').toLowerCase()
+  const mode = String(value.auth_mode || '').toLowerCase()
+  if (type === 'codex' || mode === 'chatgpt' || mode === 'agentidentity' || 'access_token' in value) {
+    return openAIItem(value.access_token)
+  }
+  return null
+}
+
+function parseJSONValue(j) {
+  // A browser cookie export is one account, not one account per cookie row.
+  if (Array.isArray(j) && j.length > 0 &&
+      j.every((it) => it && typeof it === 'object' && 'name' in it && 'value' in it)) {
+    const joined = j.filter((c) => c && c.name).map((c) => `${c.name}=${c.value}`).join('; ')
+    return joined ? [{ type: cookieType(joined), value: joined }] : []
+  }
+
+  if (Array.isArray(j)) {
+    const out = []
+    for (const it of j) {
+      const structured = structuredOpenAIItems(it)
+      if (structured !== null) {
+        out.push(...structured)
+        continue
+      }
+      if (isImagineObj(it)) {
+        out.push({ type: 'imagine', value: JSON.stringify(it) })
+        continue
+      }
+      if (typeof it === 'string') {
+        const parsed = classifyString(it)
+        if (parsed) out.push(parsed)
+        continue
+      }
+      const v = cookieFromAny(it)
+      if (v) out.push({ type: cookieType(v), value: v })
+    }
+    return out
+  }
+
+  const structured = structuredOpenAIItems(j)
+  if (structured !== null) return structured
+
+  if (j && typeof j === 'object') {
+    if (isImagineObj(j)) return [{ type: 'imagine', value: JSON.stringify(j) }]
+    const v = cookieFromAny(j)
+    return v ? [{ type: cookieType(v), value: v }] : []
+  }
+  if (typeof j === 'string') {
+    const item = classifyString(j)
+    return item ? [item] : []
+  }
+  return []
+}
+
+export function uniqueImportItems(items) {
+  const seen = new Set()
+  return (items || []).filter((item) => {
+    if (!item?.type || !item?.value) return false
+    const key = `${item.type}\u0000${item.value}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+/** Returns normalized provider credentials as { type, value } items. */
 export function parseImportInput(text) {
   text = (text || '').trim()
   if (!text) return []
   // Try JSON first.
   try {
     const j = JSON.parse(text)
-    if (Array.isArray(j) && j.length > 0) {
-      // Chrome cookie export: array of {name,value} → one cookie account.
-      if (j.every((it) => it && typeof it === 'object' && 'name' in it && 'value' in it)) {
-        const joined = j.filter((c) => c && c.name).map((c) => `${c.name}=${c.value}`).join('; ')
-        return joined ? [{ type: cookieType(joined), value: joined }] : []
-      }
-      // Otherwise treat as multiple accounts. An Imagine credential is itself a
-      // JSON object {token,refreshToken} — keep it as its JSON string value.
-      return j.map((it) => {
-        if (isImagineObj(it)) return { type: 'imagine', value: JSON.stringify(it) }
-        const v = cookieFromAny(it)
-        return { type: cookieType(v), value: v }
-      }).filter((x) => x.value)
-    }
-    if (j && typeof j === 'object') {
-      if (isImagineObj(j)) return [{ type: 'imagine', value: JSON.stringify(j) }]
-      const v = cookieFromAny(j)
-      return v ? [{ type: cookieType(v), value: v }] : []
-    }
+    return uniqueImportItems(parseJSONValue(j))
   } catch (_) { /* not JSON */ }
   // Not JSON → split per line, identify each. A JWT is either a Runway token
   // (top-level id+sso, no openai claims) or a ChatGPT token; anything else is
   // treated as an Adobe cookie string.
   const lines = text.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
-  return lines.map((line) => {
-    // Accept a bare JWT or one with a leading `sso=` (grok cookie value form).
-    const stripped = line.replace(/^Bearer\s+/i, '').replace(/^sso=/, '')
-    if (looksLikeJwt(stripped)) {
-      const value = stripped
-      return looksLikeRunwayJwt(value)
-        ? { type: 'runway', value }
-        : looksLikeGrokJwt(value)
-          ? { type: 'grok', value }
-          : { type: 'openai', value }
+  return uniqueImportItems(lines.map(classifyString).filter(Boolean))
+}
+
+function parseJSONDocument(text, label) {
+  let parsed
+  try {
+    parsed = JSON.parse(text)
+  } catch (_) {
+    throw new Error(`${label} 不是有效的 JSON`)
+  }
+  return parseJSONValue(parsed)
+}
+
+export function parseImportFileBytes(bytes, filename = 'accounts.json') {
+  const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)
+  if (data.byteLength > MAX_IMPORT_FILE_BYTES) throw new Error('导入文件不能超过 20 MB')
+
+  const isZip = /\.zip$/i.test(filename) || (data[0] === 0x50 && data[1] === 0x4b)
+  let items = []
+  if (isZip) {
+    let count = 0
+    let total = 0
+    let limitError = ''
+    const files = unzipSync(data, {
+      filter(file) {
+        if (file.name.endsWith('/') || !/\.json$/i.test(file.name)) return false
+        count++
+        total += Number(file.originalSize || 0)
+        if (count > MAX_ZIP_JSON_FILES) limitError = 'ZIP 内 JSON 文件不能超过 1000 个'
+        if (Number(file.originalSize || 0) > MAX_ZIP_ENTRY_BYTES) limitError = `${file.name} 解压后超过 2 MB`
+        if (total > MAX_IMPORT_FILE_BYTES) limitError = 'ZIP 解压后的 JSON 总大小不能超过 20 MB'
+        return !limitError
+      },
+    })
+    if (limitError) throw new Error(limitError)
+    for (const [name, content] of Object.entries(files)) {
+      items.push(...parseJSONDocument(strFromU8(content), name))
     }
-    return { type: cookieType(line), value: line }
-  })
+  } else {
+    items = parseJSONDocument(strFromU8(data), filename)
+  }
+
+  items = uniqueImportItems(items)
+  if (!items.length) {
+    throw new Error('文件中没有可用的 ChatGPT access_token（仅 Agent Identity 的凭据不能用于生图）')
+  }
+  return items
+}
+
+export async function parseImportFile(file) {
+  if (!file) return []
+  return parseImportFileBytes(new Uint8Array(await file.arrayBuffer()), file.name)
 }
