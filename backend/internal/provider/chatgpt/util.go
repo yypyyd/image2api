@@ -31,9 +31,15 @@ var (
 	sedimentIDPattern    = regexp.MustCompile(`sediment://([A-Za-z0-9_-]+)`)
 	realImageIDPattern   = regexp.MustCompile(`\bfile_00000000[a-f0-9]{24}\b`)
 	conversationIDRE     = regexp.MustCompile(`"conversation_id"\s*:\s*"([^"]+)"`)
-	scriptSrcRE          = regexp.MustCompile(`<script[^>]+src="([^"]+)"`)
-	dataBuildPathRE      = regexp.MustCompile(`c/[^/]*/_`)
-	htmlDataBuildRE      = regexp.MustCompile(`<html[^>]*data-build="([^"]*)"`)
+	// skipped_mainline is currently sent inside a JSON string in the SSE
+	// payload. Depending on the upstream serializer it can be compact, contain
+	// whitespace, or have one or more escaping backslashes before the quotes.
+	// Matching the exact compact spelling caused valid delegated image tasks to
+	// be rejected as "no async marker".
+	skippedMainlineRE = regexp.MustCompile(`\\*"skipped_mainline\\*"\s*:\s*true`)
+	scriptSrcRE       = regexp.MustCompile(`<script[^>]+src="([^"]+)"`)
+	dataBuildPathRE   = regexp.MustCompile(`c/[^/]*/_`)
+	htmlDataBuildRE   = regexp.MustCompile(`<html[^>]*data-build="([^"]*)"`)
 
 	// asyncMarkers signal that ChatGPT accepted the prompt and switched to the
 	// async image pipeline (image is delivered later via conversation polling
@@ -43,8 +49,6 @@ var (
 		"image_gen_async",
 		"image_gen_task_id",
 		"trigger_async_ux",
-		`"skipped_mainline":true`,
-		`\"skipped_mainline\":true`,
 	}
 
 	// contentPolicyMarkers are stable substrings of ChatGPT's content-audit
@@ -82,7 +86,7 @@ func containsAsyncMarker(text string) bool {
 			return true
 		}
 	}
-	return false
+	return skippedMainlineRE.MatchString(text)
 }
 
 // detectContentPolicyRejection reports whether text contains a ChatGPT content
