@@ -6,6 +6,7 @@
 package custom
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -23,6 +24,7 @@ var (
 	ErrAuth              = errors.New("custom upstream auth failed")
 	ErrQuotaExhausted    = errors.New("custom upstream quota exhausted")
 	ErrTemporaryUpstream = errors.New("custom upstream temporary error")
+	ErrBadRequest        = errors.New("custom upstream rejected request")
 )
 
 type Client struct{}
@@ -56,6 +58,137 @@ func sanitizeErr(err error) string {
 }
 
 func httpClient() *http.Client { return &http.Client{Timeout: 10 * time.Minute} }
+
+// ChatResponse is a successful OpenAI-compatible chat-completions response.
+// Streaming bodies remain connected to the upstream and must be closed by the
+// caller. Non-streaming bodies are validated and buffered before return so an
+// HTTP-200 business error can safely fail over to another custom account.
+type ChatResponse struct {
+	Header http.Header
+	Body   io.ReadCloser
+	Stream bool
+}
+
+// ChatCompletions forwards a request to the upstream OpenAI-compatible chat
+// endpoint. The caller-facing model name is replaced with upstreamModel while
+// every other request field is preserved verbatim.
+func (c *Client) ChatCompletions(ctx context.Context, baseURL, apiKey, upstreamModel string, payload []byte, stream bool) (*ChatResponse, error) {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" || strings.TrimSpace(apiKey) == "" {
+		return nil, ErrAuth
+	}
+	var body map[string]any
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	dec.UseNumber()
+	if err := dec.Decode(&body); err != nil {
+		return nil, fmt.Errorf("%w: invalid json", ErrBadRequest)
+	}
+	body["model"] = upstreamModel
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid request", ErrBadRequest)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/chat/completions", bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	if stream {
+		req.Header.Set("Accept", "text/event-stream")
+	}
+	resp, err := httpClient().Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		defer resp.Body.Close()
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
+		return nil, mapStatus(resp.StatusCode, errBody)
+	}
+
+	if !stream {
+		defer resp.Body.Close()
+		responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20+1))
+		if err != nil {
+			return nil, fmt.Errorf("%w: response read failed", ErrTemporaryUpstream)
+		}
+		if len(responseBody) > 32<<20 {
+			return nil, fmt.Errorf("%w: response too large", ErrTemporaryUpstream)
+		}
+		if !validChatCompletion(responseBody) {
+			return nil, fmt.Errorf("%w: bad chat response: %s", ErrTemporaryUpstream, clip(responseBody, 160))
+		}
+		return &ChatResponse{Header: resp.Header.Clone(), Body: io.NopCloser(bytes.NewReader(responseBody))}, nil
+	}
+
+	// Read through the first SSE data event before exposing downstream headers.
+	// This catches HTTP-200 JSON business errors and empty streams while failover
+	// is still safe. The validated prefix is replayed to the downstream unchanged.
+	reader := bufio.NewReader(resp.Body)
+	prefix, err := readValidSSEPrefix(reader)
+	if err != nil {
+		resp.Body.Close()
+		return nil, err
+	}
+	return &ChatResponse{
+		Header: resp.Header.Clone(),
+		Body:   &prefixedReadCloser{Reader: io.MultiReader(bytes.NewReader(prefix), reader), Closer: resp.Body},
+		Stream: true,
+	}, nil
+}
+
+type prefixedReadCloser struct {
+	io.Reader
+	io.Closer
+}
+
+func validChatCompletion(raw []byte) bool {
+	var out struct {
+		Object  string            `json:"object"`
+		Choices []json.RawMessage `json:"choices"`
+		Error   any               `json:"error"`
+	}
+	if json.Unmarshal(raw, &out) != nil || out.Error != nil || len(out.Choices) == 0 {
+		return false
+	}
+	return out.Object == "" || out.Object == "chat.completion"
+}
+
+func readValidSSEPrefix(r *bufio.Reader) ([]byte, error) {
+	var prefix bytes.Buffer
+	for prefix.Len() <= 256<<10 {
+		line, err := r.ReadBytes('\n')
+		prefix.Write(line)
+		if len(line) > 0 {
+			trimmed := strings.TrimSpace(string(line))
+			if strings.HasPrefix(trimmed, "data:") {
+				data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+				if data == "[DONE]" {
+					return nil, fmt.Errorf("%w: stream ended before first completion chunk", ErrTemporaryUpstream)
+				}
+				var chunk struct {
+					Object  string            `json:"object"`
+					Choices []json.RawMessage `json:"choices"`
+					Error   any               `json:"error"`
+				}
+				if json.Unmarshal([]byte(data), &chunk) == nil && chunk.Error == nil && len(chunk.Choices) > 0 &&
+					(chunk.Object == "" || chunk.Object == "chat.completion.chunk") {
+					return prefix.Bytes(), nil
+				}
+				return nil, fmt.Errorf("%w: bad stream response: %s", ErrTemporaryUpstream, clip([]byte(data), 160))
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil, fmt.Errorf("%w: empty chat stream", ErrTemporaryUpstream)
+			}
+			return nil, fmt.Errorf("%w: stream read failed", ErrTemporaryUpstream)
+		}
+	}
+	return nil, fmt.Errorf("%w: stream prelude too large", ErrTemporaryUpstream)
+}
 
 // GenerateImage calls the upstream OpenAI image API. With reference images it
 // uses /v1/images/edits (multipart); otherwise /v1/images/generations. Returns
@@ -339,7 +472,7 @@ func mapStatus(status int, body []byte) error {
 		if isCreditError(string(body)) {
 			return fmt.Errorf("%w: %s", ErrTemporaryUpstream, clip(body, 160))
 		}
-		return fmt.Errorf("custom: %d %s", status, clip(body, 160))
+		return fmt.Errorf("%w: %d %s", ErrBadRequest, status, clip(body, 160))
 	}
 }
 

@@ -34,7 +34,7 @@ async function refreshAll() {
 }
 
 // ---- windowed event aggregates (from /dashboard) ----
-const EMPTY_WINDOW = { total: 0, success: 0, failed: 0, pending: 0, image: 0, video: 0, api: 0, web: 0, spent: 0 }
+const EMPTY_WINDOW = { total: 0, success: 0, failed: 0, pending: 0, image: 0, video: 0, text: 0, api: 0, web: 0, spent: 0 }
 const today = computed(() => dash.value?.today || EMPTY_WINDOW)
 const todayDau = computed(() => dash.value?.today_dau || 0)
 const day = computed(() => dash.value?.day || EMPTY_WINDOW)
@@ -67,8 +67,8 @@ const topUsers = computed(() => analytics.value.top_users || [])
 const topUserMax = computed(() => Math.max(1, ...topUsers.value.map((u) => u.spent)))
 
 // ---- 24h trend (always 24h) ----
-const hourBuckets = computed(() => dash.value?.hourly || Array.from({ length: 24 }, () => ({ image: 0, video: 0 })))
-const hourMax = computed(() => Math.max(1, ...hourBuckets.value.map((b) => b.image + b.video)))
+const hourBuckets = computed(() => dash.value?.hourly || Array.from({ length: 24 }, () => ({ image: 0, video: 0, text: 0 })))
+const hourMax = computed(() => Math.max(1, ...hourBuckets.value.map((b) => b.image + b.video + (b.text || 0))))
 
 // ---- operations cards ----
 const cdk = computed(() => dash.value?.cdk || {})
@@ -88,7 +88,8 @@ const tokens = computed(() => {
 const modelTypes = computed(() => {
   const image = models.value.filter((m) => m.type === 'image').length
   const video = models.value.filter((m) => m.type === 'video').length
-  return { image, video, total: models.value.length }
+  const text = models.value.filter((m) => m.type === 'text').length
+  return { image, video, text, total: models.value.length }
 })
 
 const providerHealth = computed(() =>
@@ -215,7 +216,7 @@ onUnmounted(() => clearInterval(timer))
           <span v-if="day.pending" class="text-amber-300 tabular-nums">{{ day.pending }} 进行中</span>
         </div>
         <div v-if="day.total" class="text-[10px] text-white/40 mt-1 tabular-nums">
-          Web {{ day.web }} · API {{ day.api }} · 图 {{ day.image }} · 视 {{ day.video }}
+          Web {{ day.web }} · API {{ day.api }} · 文 {{ day.text || 0 }} · 图 {{ day.image }} · 视 {{ day.video }}
         </div>
       </div>
 
@@ -233,7 +234,7 @@ onUnmounted(() => clearInterval(timer))
           <span v-if="lifetime.failed" class="text-rose-300 tabular-nums">{{ lifetime.failed }} 失败</span>
         </div>
         <div class="text-[10px] text-white/40 mt-1 tabular-nums">
-          API {{ lifetime.api || 0 }} · 图 {{ lifetime.image || 0 }} · 视 {{ lifetime.video || 0 }}
+          API {{ lifetime.api || 0 }} · 文 {{ lifetime.text || 0 }} · 图 {{ lifetime.image || 0 }} · 视 {{ lifetime.video || 0 }}
         </div>
       </div>
 
@@ -283,7 +284,7 @@ onUnmounted(() => clearInterval(timer))
       <div class="card p-4">
         <div class="text-xs text-white/55">模型</div>
         <div class="text-xl font-semibold tabular-nums mt-2">{{ modelTypes.total }}</div>
-        <div class="text-[11px] text-white/45 mt-1">图像 {{ modelTypes.image }} · 视频 {{ modelTypes.video }}</div>
+        <div class="text-[11px] text-white/45 mt-1">文本 {{ modelTypes.text }} · 图像 {{ modelTypes.image }} · 视频 {{ modelTypes.video }}</div>
       </div>
       <div class="card p-4">
         <div class="text-xs text-white/55">活跃用户 · 24h</div>
@@ -387,6 +388,7 @@ onUnmounted(() => clearInterval(timer))
         <div class="px-5 py-3 border-b border-white/[0.06] flex items-baseline justify-between">
           <h2 class="text-sm font-semibold">24 小时生成趋势</h2>
           <div class="text-[11px] text-white/45 flex items-center gap-3">
+            <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-sm bg-sky-400/80"></span>文本</span>
             <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-sm bg-indigo-400/80"></span>图像</span>
             <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-sm bg-fuchsia-400/80"></span>视频</span>
             <span class="tabular-nums">峰值 {{ hourMax }}/h</span>
@@ -396,15 +398,16 @@ onUnmounted(() => clearInterval(timer))
           <div class="flex items-end gap-[3px] flex-1 min-h-[8rem]">
             <div v-for="(b, i) in hourBuckets" :key="i"
                  class="group/bar relative flex-1 flex flex-col justify-end rounded-t overflow-visible"
-                 :style="{ height: Math.max(4, ((b.image + b.video) / hourMax) * 100) + '%' }">
+                 :style="{ height: Math.max(4, ((b.image + b.video + (b.text || 0)) / hourMax) * 100) + '%' }">
               <!-- hover tooltip -->
               <div class="pointer-events-none absolute -top-9 left-1/2 -translate-x-1/2 z-10 hidden group-hover/bar:block
                           whitespace-nowrap rounded-md bg-black/90 ring-1 ring-white/10 px-2 py-1 text-[10px] text-white/90 tabular-nums">
-                {{ 23 - i }}h 前 · 图 {{ b.image }} / 视 {{ b.video }}
+                {{ 23 - i }}h 前 · 文 {{ b.text || 0 }} / 图 {{ b.image }} / 视 {{ b.video }}
               </div>
+              <div v-if="b.text" class="bg-sky-400/80 group-hover/bar:bg-sky-400" :style="{ flex: b.text }"></div>
               <div v-if="b.video" class="bg-fuchsia-400/80 group-hover/bar:bg-fuchsia-400" :style="{ flex: b.video }"></div>
               <div v-if="b.image" class="bg-indigo-400/80 group-hover/bar:bg-indigo-400" :style="{ flex: b.image }"></div>
-              <div v-if="!b.image && !b.video" class="bg-white/[0.06] group-hover/bar:bg-white/15 flex-1 rounded-t"></div>
+              <div v-if="!b.image && !b.video && !b.text" class="bg-white/[0.06] group-hover/bar:bg-white/15 flex-1 rounded-t"></div>
             </div>
           </div>
           <div class="flex justify-between text-[10px] text-white/40 mt-2 tabular-nums">
@@ -544,8 +547,8 @@ onUnmounted(() => clearInterval(timer))
                class="flex items-center gap-3 px-2 py-2 text-xs rounded-lg hover:bg-white/[0.03]">
             <span class="w-1.5 h-1.5 rounded-full shrink-0" :class="logDot(e.status)"></span>
             <span class="text-[10px] uppercase tracking-wider font-medium w-9"
-                  :class="e.kind === 'video' ? 'text-fuchsia-300' : 'text-indigo-300'">
-              {{ e.kind === 'video' ? '视频' : '图像' }}
+                  :class="e.kind === 'text' ? 'text-sky-300' : (e.kind === 'video' ? 'text-fuchsia-300' : 'text-indigo-300')">
+              {{ e.kind === 'text' ? '文本' : (e.kind === 'video' ? '视频' : '图像') }}
             </span>
             <span class="font-mono text-white/85 truncate w-40 shrink-0">{{ e.model }}</span>
             <span class="text-white/55 truncate flex-1 min-w-0">{{ e.prompt }}</span>

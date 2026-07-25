@@ -14,11 +14,11 @@ const showCustom = ref(false)
 const editing = ref(null) // null = add, object = edit
 const testing = ref(null) // model being tested, or null
 
-const kindFilter = ref('')      // '' | 'image' | 'video'
+const kindFilter = ref('')      // '' | 'image' | 'video' | 'text'
 const statusFilter = ref('')    // '' | 'enabled' | 'disabled'
 const search = ref('')
 
-const TYPE_LABEL = { image: '生图', video: '生视频' }
+const TYPE_LABEL = { image: '生图', video: '生视频', text: '文本' }
 const REF_MODE_LABEL = { none: '无', frame: '首帧/首尾帧', asset: '参考图模式' }
 
 async function loadModels() {
@@ -56,8 +56,9 @@ const stats = computed(() => {
   const total = models.value.length
   const image = models.value.filter((m) => m.type === 'image').length
   const video = models.value.filter((m) => m.type === 'video').length
+  const text = models.value.filter((m) => m.type === 'text').length
   const enabled = models.value.filter((m) => m.enabled !== false).length
-  return { total, image, video, enabled, disabled: total - enabled }
+  return { total, image, video, text, enabled, disabled: total - enabled }
 })
 
 const filtered = computed(() => {
@@ -77,7 +78,7 @@ onMounted(loadModels)
 <template>
   <section class="space-y-4">
     <!-- KPI strip — same shape as LogsView / InvitesAdminView -->
-    <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+    <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
       <div class="card p-4">
         <div class="text-[11px] uppercase tracking-wider text-white/45">总数</div>
         <div class="text-2xl font-semibold mt-1 tabular-nums">{{ stats.total }}</div>
@@ -91,6 +92,10 @@ onMounted(loadModels)
         <div class="text-2xl font-semibold mt-1 tabular-nums text-fuchsia-300">{{ stats.video }}</div>
       </div>
       <div class="card p-4">
+        <div class="text-[11px] uppercase tracking-wider text-sky-300/80">文本</div>
+        <div class="text-2xl font-semibold mt-1 tabular-nums text-sky-300">{{ stats.text }}</div>
+      </div>
+      <div class="card p-4">
         <div class="text-[11px] uppercase tracking-wider text-emerald-300/80">启用</div>
         <div class="text-2xl font-semibold mt-1 tabular-nums text-emerald-300">{{ stats.enabled }}<span class="text-white/35 text-lg ml-1">/ {{ stats.total }}</span></div>
       </div>
@@ -102,6 +107,7 @@ onMounted(loadModels)
         <button @click="kindFilter = ''" class="fp" :class="kindFilter === '' && 'fp-on'">全部</button>
         <button @click="kindFilter = 'image'" class="fp" :class="kindFilter === 'image' && 'fp-on'">图像</button>
         <button @click="kindFilter = 'video'" class="fp" :class="kindFilter === 'video' && 'fp-on'">视频</button>
+        <button @click="kindFilter = 'text'" class="fp" :class="kindFilter === 'text' && 'fp-on'">文本</button>
       </div>
       <div class="w-px h-5 bg-white/10"></div>
       <div class="flex items-center gap-1">
@@ -153,7 +159,7 @@ onMounted(loadModels)
             <th class="text-left px-3 py-3 font-medium">定价</th>
             <th class="text-left px-3 py-3 font-medium">能力</th>
             <th class="text-right px-3 py-3 font-medium">权重</th>
-            <th class="text-right px-3 py-3 font-medium">生图次数</th>
+            <th class="text-right px-3 py-3 font-medium">调用次数</th>
             <th class="text-left px-3 py-3 font-medium">状态</th>
             <th class="text-right px-5 py-3 font-medium">操作</th>
           </tr>
@@ -173,9 +179,9 @@ onMounted(loadModels)
             <!-- Type chip with the same shape as Logs/Provider 健康 -->
             <td class="px-3 py-3.5 align-middle">
               <span class="inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[11px] font-medium ring-1"
-                    :class="m.type === 'video'
-                      ? 'bg-fuchsia-500/10 text-fuchsia-300 ring-fuchsia-400/30'
-                      : 'bg-indigo-500/10 text-indigo-300 ring-indigo-400/30'">
+                    :class="m.type === 'text'
+                      ? 'bg-sky-500/10 text-sky-300 ring-sky-400/30'
+                      : (m.type === 'video' ? 'bg-fuchsia-500/10 text-fuchsia-300 ring-fuchsia-400/30' : 'bg-indigo-500/10 text-indigo-300 ring-indigo-400/30')">
                 {{ TYPE_LABEL[m.type] || m.type }}
               </span>
             </td>
@@ -185,7 +191,16 @@ onMounted(loadModels)
             <td class="px-3 py-3.5 align-middle">
               <!-- Each tier shows a pair: 普通价 (emerald) + 代理价 (amber).
                    代理价未设置时回退普通价数值。 -->
-              <div v-if="m.type === 'image'" class="flex flex-wrap gap-1">
+              <div v-if="m.type === 'text'" class="flex flex-wrap gap-1">
+                <span class="price-chip">
+                  <span class="text-white/85">每次</span>
+                  <span class="text-white/30 mx-1">普通</span>
+                  <span class="text-emerald-300 tabular-nums">{{ points(m.prices?.request) }}</span>
+                  <span class="text-amber-300/40 ml-1.5">代理</span>
+                  <span class="text-amber-300 tabular-nums">{{ points(m.prices_agent?.request ?? m.prices?.request) }}</span>
+                </span>
+              </div>
+              <div v-else-if="m.type === 'image'" class="flex flex-wrap gap-1">
                 <span v-for="r in (m.resolutions || [])" :key="r" class="price-chip">
                   <span class="text-white/85">{{ r }}</span>
                   <span class="text-white/30 mx-1">普通</span>
@@ -219,6 +234,7 @@ onMounted(loadModels)
                  video frame mode, supported resolutions for video. -->
             <td class="px-3 py-3.5 align-middle">
               <div class="flex flex-wrap items-center gap-1 text-[11px]">
+                <span v-if="m.type === 'text'" class="cap-chip cap-slate">Chat Completions</span>
                 <!-- reference capability with count: frame mode = 首尾帧, else 参考图 -->
                 <span v-if="m.max_reference_images > 0"
                       class="cap-chip cap-emerald"

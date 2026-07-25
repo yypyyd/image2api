@@ -1,6 +1,6 @@
 <script setup>
 // API 对接文档 — OpenAI-compatible. Lists live models and shows ready-to-run
-// curl / Python(openai SDK) examples for image + video, wired to this
+// curl / Python(openai SDK) examples for text + image + video, wired to this
 // deployment's base URL and the caller's model ids.
 import { ref, computed, onMounted } from 'vue'
 import { auth } from '../auth'
@@ -19,11 +19,13 @@ onMounted(async () => {
 
 const imageModels = computed(() => models.value.filter((m) => m.type === 'image'))
 const videoModels = computed(() => models.value.filter((m) => m.type === 'video'))
+const textModels = computed(() => models.value.filter((m) => m.type === 'text'))
 function pubName(m) {
   return m?.alias || m?.id || ''
 }
 const sampleImage = computed(() => pubName(imageModels.value[0]) || 'firefly-image-4')
 const sampleVideo = computed(() => pubName(videoModels.value[0]) || 'firefly-kling3')
+const sampleText = computed(() => pubName(textModels.value[0]) || 'gpt-4.1-mini')
 const sampleSeconds = computed(() => String(videoModels.value[0]?.durations?.[0] || '8s').replace(/s$/, ''))
 
 function priceOf(m) {
@@ -65,6 +67,12 @@ const videoParams = [
   ['size', 'string', '可选', '如 "1280x720" / "720x1280" → 决定比例与分辨率'],
   ['input_reference', 'file', '可选', '首帧/参考图(multipart 文件;runway 图生视频必填 1 张)'],
 ]
+const textParams = [
+  ['model', 'string', '必填', '文本模型名(别名优先),见上表(文本)'],
+  ['messages', 'array', '必填', 'OpenAI Chat Completions 消息数组'],
+  ['stream', 'boolean', '可选', 'true 返回 text/event-stream,以 data: [DONE] 结束'],
+  ['temperature', 'number', '可选', '原样传给上游;其他 OpenAI 兼容字段同样透传'],
+]
 
 // ---- size → 比例 × 分辨率档 对照表(用 size 该传的值)----
 // size 的长边映射档位:<1800→1K · 1800–3499→2K · ≥3500→4K;宽高比映射比例。
@@ -102,6 +110,32 @@ const videoSizeTable = [
 
 // ---- examples (built in script so refs resolve correctly) ----
 const examples = computed(() => [
+  {
+    title: '文本对话 · curl (非流式)',
+    code:
+`curl ${base.value}/v1/chat/completions \
+  -H "Authorization: Bearer ${keyHint.value}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "${sampleText.value}",
+    "messages": [{"role":"user","content":"用一句话介绍你自己"}]
+  }'`,
+  },
+  {
+    title: '文本对话 · Python (openai SDK, 流式)',
+    code:
+`from openai import OpenAI
+
+client = OpenAI(api_key="${keyHint.value}", base_url="${base.value}/v1")
+
+stream = client.chat.completions.create(
+    model="${sampleText.value}",
+    messages=[{"role": "user", "content": "你好"}],
+    stream=True,
+)
+for chunk in stream:
+    print(chunk.choices[0].delta.content or "", end="")`,
+  },
   {
     title: '文生图 · curl',
     code:
@@ -230,7 +264,7 @@ async function copy(text) {
     <header>
       <div class="text-[10px] uppercase tracking-[0.3em] text-sky-300/70 font-medium">开发者</div>
       <h1 class="mt-2 text-4xl md:text-5xl font-bold tracking-tight">接口文档</h1>
-      <p class="text-white/45 mt-2">完全兼容 OpenAI 接口规范 — 改个 <code class="text-white/70">base_url</code> 和 <code class="text-white/70">api_key</code> 即可直接调用。图像 / 视频 / 图生图全支持。</p>
+      <p class="text-white/45 mt-2">兼容 OpenAI 接口规范 — 改个 <code class="text-white/70">base_url</code> 和 <code class="text-white/70">api_key</code> 即可直接调用。文本(含流式)/ 图像 / 视频 / 图生图全支持。</p>
     </header>
 
     <!-- quickstart -->
@@ -255,6 +289,7 @@ async function copy(text) {
         <h2 class="text-sm font-semibold text-white/80">端点</h2>
         <ul class="mt-4 space-y-2.5 text-sm font-mono">
           <li class="flex items-center gap-2"><span class="badge-get">GET</span><span class="text-white/80">/v1/models</span></li>
+          <li class="flex items-center gap-2"><span class="badge-post">POST</span><span class="text-white/80">/v1/chat/completions</span><span class="text-white/35 font-sans text-xs">文本 / SSE 流式</span></li>
           <li class="flex items-center gap-2"><span class="badge-post">POST</span><span class="text-white/80">/v1/images/generations</span><span class="text-white/35 font-sans text-xs">文生图</span></li>
           <li class="flex items-center gap-2"><span class="badge-post">POST</span><span class="text-white/80">/v1/images/edits</span><span class="text-white/35 font-sans text-xs">图生图(multipart)</span></li>
           <li class="flex items-center gap-2"><span class="badge-post">POST</span><span class="text-white/80">/v1/videos</span><span class="text-white/35 font-sans text-xs">建视频任务</span></li>
@@ -280,8 +315,8 @@ async function copy(text) {
           <tbody>
             <tr v-for="m in models" :key="m.id" class="border-b border-white/[0.04] last:border-0">
               <td class="px-4 py-3 font-mono text-white/90">{{ pubName(m) }}</td>
-              <td class="px-4 py-3 text-white/60">{{ m.type === 'video' ? '视频' : '图像' }}</td>
-              <td class="px-4 py-3 text-white/60">{{ (m.type === 'video' ? m.durations : m.resolutions || [])?.join(' · ') || '—' }}</td>
+              <td class="px-4 py-3 text-white/60">{{ m.type === 'text' ? '文本' : (m.type === 'video' ? '视频' : '图像') }}</td>
+              <td class="px-4 py-3 text-white/60">{{ m.type === 'text' ? 'Chat Completions' : ((m.type === 'video' ? m.durations : m.resolutions || [])?.join(' · ') || '—') }}</td>
               <td class="px-4 py-3 text-right tabular-nums text-white/80">{{ priceOf(m) }}</td>
             </tr>
             <tr v-if="!models.length"><td colspan="4" class="px-4 py-10 text-center text-white/35">暂无可用模型</td></tr>
@@ -292,6 +327,25 @@ async function copy(text) {
 
     <!-- parameters -->
     <section class="grid lg:grid-cols-2 gap-6">
+      <div class="lg:col-span-2">
+        <h2 class="text-lg font-semibold mb-3">文本对话参数 <span class="text-xs font-normal text-white/40">/v1/chat/completions · JSON / SSE</span></h2>
+        <div class="card overflow-hidden">
+          <table class="w-full text-sm">
+            <thead><tr class="text-left text-[11px] uppercase tracking-wider text-white/40 border-b border-white/[0.08]">
+              <th class="px-4 py-2.5 font-medium">参数</th><th class="px-4 py-2.5 font-medium">类型</th><th class="px-4 py-2.5 font-medium">必填</th><th class="px-4 py-2.5 font-medium">说明</th>
+            </tr></thead>
+            <tbody>
+              <tr v-for="p in textParams" :key="p[0]" class="border-b border-white/[0.04] last:border-0">
+                <td class="px-4 py-2.5 font-mono text-white/85">{{ p[0] }}</td>
+                <td class="px-4 py-2.5 text-white/50 font-mono text-xs">{{ p[1] }}</td>
+                <td class="px-4 py-2.5 text-white/55">{{ p[2] }}</td>
+                <td class="px-4 py-2.5 text-white/60 text-xs">{{ p[3] }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="text-xs text-white/40 mt-2">文本按每次请求固定积分计费;流式与非流式同价。上游失败、无有效 completion 或流式未正常结束会自动退款。</p>
+      </div>
       <div>
         <h2 class="text-lg font-semibold mb-3">文生图参数 <span class="text-xs font-normal text-white/40">/v1/images/generations</span></h2>
         <div class="card overflow-hidden">
@@ -427,14 +481,15 @@ async function copy(text) {
     <section>
       <h2 class="text-lg font-semibold mb-3">响应 & 计费</h2>
       <div class="card p-6 space-y-3 text-sm text-white/70">
-        <p><strong class="text-white/90">图像</strong>(generations / edits)返回 OpenAI 图片格式:<code class="text-white/85 font-mono">{{ '{ "created": ..., "data": [{ "url": "..." }] }' }}</code> —— <code class="text-white/85 font-mono">data[0].url</code> 是产物 URL,服务端不留存(<strong class="text-white/90">不返回 base64</strong>)。多数模型返回上游<strong class="text-white/90">原始直链</strong>;少数上游需鉴权的(如 gpt-image)会返回一个本站转发链 <code class="text-white/85 font-mono">/v1/images/{id}/content</code>,由服务端带账号凭据取回。<strong class="text-white/90">两种链接都会过期</strong>,请<strong class="text-white/90">尽快下载或转存到你自己的存储</strong>。</p>
+        <p><strong class="text-white/90">文本</strong>返回标准 <code class="text-white/85 font-mono">chat.completion</code>;传 <code class="text-white/85 font-mono">stream:true</code> 时返回 <code class="text-white/85 font-mono">chat.completion.chunk</code> SSE,并以 <code class="text-white/85 font-mono">data: [DONE]</code> 结束。</p>
+        <p><strong class="text-white/90">图像</strong>(generations / edits)默认返回 OpenAI 图片格式:<code class="text-white/85 font-mono">{{ '{ "created": ..., "data": [{ "b64_json": "..." }] }' }}</code>。显式传 <code class="text-white/85 font-mono">response_format:"url"</code> 可返回产物 URL;URL 可能过期,请尽快下载或转存。</p>
         <p><strong class="text-white/90">视频</strong>(异步,Sora 风格三步):</p>
         <ol class="list-decimal list-inside space-y-1 text-white/65 pl-1">
           <li><code class="text-white/85 font-mono">POST /v1/videos</code> 立即返回任务对象 <code class="text-white/85 font-mono">{{ '{ "id": "...", "object": "video", "status": "queued", ... }' }}</code></li>
           <li>轮询 <code class="text-white/85 font-mono">GET /v1/videos/{id}</code>,<code class="text-white/70">status</code> 从 <code class="text-white/70">queued → in_progress → completed</code>(或 <code class="text-white/70">failed</code>)</li>
           <li>完成后 <code class="text-white/85 font-mono">GET /v1/videos/{id}/content</code> 返回 <strong class="text-white/90">mp4 原始二进制</strong>(非 base64、非 URL)</li>
         </ol>
-        <p><strong class="text-white/90">计费(预扣)</strong>:生成<strong class="text-white/90">前</strong>按上表价格从你的 Key 账号预扣积分;图像或视频上游失败会自动退回 —— 失败不扣费。</p>
+        <p><strong class="text-white/90">计费(预扣)</strong>:请求<strong class="text-white/90">前</strong>按上表价格从你的 Key 账号预扣积分;文本按每请求固定价,图像/视频按档位价格。上游失败或返回无效结果会自动退回 —— 失败不扣费。</p>
         <p><strong class="text-white/90">参数映射</strong>:<code class="text-white/70">size</code>(宽x高)同时决定<strong class="text-white/90">比例 + 分辨率档</strong>(长边:&lt;1800→1K · 1800–3499→2K · ≥3500→4K),<code class="text-white/70">seconds</code>→视频时长。<strong class="text-white/90">没有 quality 参数</strong>,分辨率只看 size。档位须是该模型支持的(不支持会回退到该模型最低档);参数须落在定价表内否则 400,余额不足 402。</p>
         <div class="pt-2 grid sm:grid-cols-2 gap-2 text-xs">
           <div class="flex items-center gap-2"><span class="badge-err">401</span> Key 无效 / 上游需重新授权</div>

@@ -24,8 +24,8 @@ type EventListFilter struct {
 	UserID        string
 	UserIDs       []string // when set, keep ONLY rows whose user_id is in this list (admin 用户搜索)
 	Query         string   // free-text search over prompt / model / error (server-side, 跨页)
-	ExcludeSource string // when set, omit rows with this source (e.g. hide API-key "v1" usage from the customer logs page)
-	Source        string // when set, keep ONLY rows with this source (admin 来源 filter): "v1" (API key) / "user" (前台) / "admin" (测试模型)
+	ExcludeSource string   // when set, omit rows with this source (e.g. hide API-key "v1" usage from the customer logs page)
+	Source        string   // when set, keep ONLY rows with this source (admin 来源 filter): "v1" (API key) / "user" (前台) / "admin" (测试模型)
 	HasFile       bool     // when true, keep ONLY rows with a non-empty file (the 创作记录 gallery — paginates over real media)
 	ExcludeFiles  []string // when set, omit rows whose file is in this list (e.g. hide homepage showcase media from user galleries)
 	MediaOnly     bool     // when true, keep only rows that are pending or have a stored file — the 画图台 grid, so deleted works don't eat a slot
@@ -184,6 +184,7 @@ type DashboardWindow struct {
 	Pending int64   `json:"pending"`
 	Image   int64   `json:"image"`
 	Video   int64   `json:"video"`
+	Text    int64   `json:"text"`
 	API     int64   `json:"api"` // source = 'v1' (OpenAI-compatible key)
 	Web     int64   `json:"web"` // everything else (web / playground)
 	Spent   float64 `json:"spent"`
@@ -210,6 +211,7 @@ type UserSpend struct {
 type HourBucket struct {
 	Image int64 `json:"image"`
 	Video int64 `json:"video"`
+	Text  int64 `json:"text"`
 }
 
 // WindowStats rolls up counts + spend over a single window in one query.
@@ -221,6 +223,7 @@ func (r *EventRepository) WindowStats(ctx context.Context, since time.Time) (*Da
 		Pending int64   `gorm:"column:pending"`
 		Image   int64   `gorm:"column:image"`
 		Video   int64   `gorm:"column:video"`
+		Text    int64   `gorm:"column:text"`
 		API     int64   `gorm:"column:api"`
 		Spent   float64 `gorm:"column:spent"`
 	}
@@ -234,6 +237,7 @@ func (r *EventRepository) WindowStats(ctx context.Context, since time.Time) (*Da
 			COUNT(*) FILTER (WHERE status = 'pending') AS pending,
 			COUNT(*) FILTER (WHERE kind = 'image') AS image,
 			COUNT(*) FILTER (WHERE kind = 'video') AS video,
+			COUNT(*) FILTER (WHERE kind = 'text') AS text,
 			COUNT(*) FILTER (WHERE source = 'v1') AS api,
 			COALESCE(SUM(cost) FILTER (WHERE status = 'success'), 0) AS spent`).
 		Where("ts >= ?", since).
@@ -242,7 +246,7 @@ func (r *EventRepository) WindowStats(ctx context.Context, since time.Time) (*Da
 	}
 	return &DashboardWindow{
 		Total: out.Total, Success: out.Success, Failed: out.Failed, Pending: out.Pending,
-		Image: out.Image, Video: out.Video, API: out.API, Web: out.Total - out.API,
+		Image: out.Image, Video: out.Video, Text: out.Text, API: out.API, Web: out.Total - out.API,
 		Spent: out.Spent,
 	}, nil
 }
@@ -281,6 +285,7 @@ func (r *EventRepository) HourlyBuckets(ctx context.Context) ([24]HourBucket, er
 		HoursAgo int   `gorm:"column:hours_ago"`
 		Image    int64 `gorm:"column:image"`
 		Video    int64 `gorm:"column:video"`
+		Text     int64 `gorm:"column:text"`
 	}
 	var rows []hourRow
 	if err := r.db.WithContext(ctx).
@@ -288,7 +293,8 @@ func (r *EventRepository) HourlyBuckets(ctx context.Context) ([24]HourBucket, er
 		Select(`
 			FLOOR(EXTRACT(EPOCH FROM (NOW() - ts)) / 3600)::int AS hours_ago,
 			COUNT(*) FILTER (WHERE kind = 'video') AS video,
-			COUNT(*) FILTER (WHERE kind <> 'video') AS image`).
+			COUNT(*) FILTER (WHERE kind = 'image') AS image,
+			COUNT(*) FILTER (WHERE kind = 'text') AS text`).
 		Where("ts >= NOW() - INTERVAL '24 hours'").
 		Group("hours_ago").
 		Scan(&rows).Error; err != nil {
@@ -298,7 +304,7 @@ func (r *EventRepository) HourlyBuckets(ctx context.Context) ([24]HourBucket, er
 		if hr.HoursAgo < 0 || hr.HoursAgo >= 24 {
 			continue
 		}
-		out[23-hr.HoursAgo] = HourBucket{Image: hr.Image, Video: hr.Video}
+		out[23-hr.HoursAgo] = HourBucket{Image: hr.Image, Video: hr.Video, Text: hr.Text}
 	}
 	return out, nil
 }
@@ -483,6 +489,8 @@ func (r *EventRepository) Create(ctx context.Context, item *model.EventLog) erro
 		deltas["video"] = 1
 	} else if item.Kind == "image" {
 		deltas["image"] = 1
+	} else if item.Kind == "text" {
+		deltas["text"] = 1
 	}
 	if item.Source == "v1" {
 		deltas["api"] = 1

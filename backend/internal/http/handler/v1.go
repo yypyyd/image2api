@@ -41,6 +41,62 @@ func (h *V1Handler) Models(c *gin.Context) {
 	})
 }
 
+// ChatCompletions — OpenAI POST /v1/chat/completions. The JSON request is
+// forwarded to a configured custom OpenAI-compatible upstream; both ordinary
+// JSON responses and SSE streaming are relayed without buffering.
+func (h *V1Handler) ChatCompletions(c *gin.Context) {
+	principal, err := h.v1.Authenticate(c.Request.Context(), c.GetHeader("Authorization"))
+	if err != nil {
+		h.writeAuthError(c, err)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, 10<<20+1))
+	if err != nil || len(body) > 10<<20 {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"detail": "request body too large"})
+		return
+	}
+	resp, err := h.v1.PrepareChatCompletion(c.Request.Context(), principal, body)
+	if err != nil {
+		h.writeV1Error(c, err, nil)
+		return
+	}
+	defer resp.Body.Close()
+	contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if resp.Stream {
+		contentType = "text/event-stream"
+	} else if contentType == "" {
+		contentType = "application/json"
+	}
+	c.Header("Content-Type", contentType)
+	if resp.Stream {
+		c.Header("Cache-Control", "no-cache")
+		c.Header("Connection", "keep-alive")
+		c.Header("X-Accel-Buffering", "no")
+	}
+	for _, name := range []string{"OpenAI-Request-ID", "X-Request-ID", "OpenAI-Processing-Ms"} {
+		if value := resp.Header.Get(name); value != "" {
+			c.Header(name, value)
+		}
+	}
+	c.Status(http.StatusOK)
+	if resp.Stream {
+		buf := make([]byte, 32<<10)
+		for {
+			n, readErr := resp.Body.Read(buf)
+			if n > 0 {
+				if _, writeErr := c.Writer.Write(buf[:n]); writeErr != nil {
+					return
+				}
+				c.Writer.Flush()
+			}
+			if readErr != nil {
+				return
+			}
+		}
+	}
+	_, _ = io.Copy(c.Writer, resp.Body)
+}
+
 // ImageGenerations — OpenAI POST /v1/images/generations (text-to-image only).
 // Accepts exactly OpenAI's fields; size→aspect ratio and quality→resolution tier
 // are mapped server-side. Returns {created, data:[{b64_json}]}.

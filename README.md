@@ -4,7 +4,7 @@
 
 <h1>image2api</h1>
 
-**多供应商 AI 生图 / 生视频网关 —— 一套 OpenAI 兼容 API,聚合七大平台,开箱即用的运营系统**
+**多供应商 AI 文本 / 生图 / 生视频网关 —— 一套 OpenAI 兼容 API,聚合多平台,开箱即用的运营系统**
 
 <sub>线上实例(品牌):[Vivid AI · vividai.run](https://vividai.run)</sub>
 
@@ -47,7 +47,7 @@
 
 ## ✨ 简介
 
-**image2api** 把 Adobe Firefly、OpenAI、Runway、Grok、Leonardo、Krea、Imagine 等平台,以及**任意 OpenAI 兼容上游**的图像 / 视频能力,统一封装成**一套 OpenAI 兼容的 API**;背后用多账号池自动调度 —— 权重优先 + 并发感知、额度耗尽自动换号、认证失效自动刷新或判死、临时错误自动重试、token 到期前主动续期 —— 对外提供稳定服务。
+**image2api** 把 Adobe Firefly、OpenAI、Runway、Grok、Leonardo、Krea、Imagine 等平台,以及**任意 OpenAI 兼容上游**的文本 / 图像 / 视频能力,统一封装成**一套 OpenAI 兼容的 API**;背后用多账号池自动调度 —— 权重优先 + 并发感知、额度耗尽自动换号、认证失效自动刷新或判死、临时错误自动重试、token 到期前主动续期 —— 对外提供稳定服务。
 
 它不只是 API 代理:自带**积分计费、CDK 充值、邀请奖励、用户体系、管理后台、现代化画图前端**,一条命令即可跑成一个对外运营的 AI 生成站点 —— 作者的线上实例 **[Vivid AI · vividai.run](https://vividai.run)**(品牌)即基于本项目搭建。
 
@@ -90,6 +90,7 @@
 - **去AI特征**(可选):画图台一键开启,生成图片自动做去AI痕迹处理(细节微扰 + 去除元数据),按画质档位加收积分(默认 1K+1 / 2K+2 / 4K+3,后台可改价、可整体关闭);带标记的作品在画图台、创作记录、日志与后台图片管理中均有「去AI特征」标识
 
 #### 🔌 OpenAI 兼容
+- 文本对话 `/v1/chat/completions`(普通 JSON + SSE 流式,兼容 OpenAI SDK)
 - 文生图 `/v1/images/generations` · 图生图 `/v1/images/edits`(multipart 上传参考图) · 视频 `/v1/videos`(Sora 式异步:创建→轮询→`/content` 下载) · `/v1/models`
 - **严格 OpenAI 入参**:`size` **同时决定比例 + 分辨率档**(图像看长边 → 1K/2K/4K,视频看短边 → 720p/1080p),改个 `base_url` + `api_key` 即接现有 OpenAI SDK
 - 图片结果 **base64 直返**,服务端不留存文件,隐私友好;站内 **/docs** 附「分辨率对照表」直接查 `size` 该传什么
@@ -103,7 +104,7 @@
 #### 🔗 自定义上游聚合(OpenAI 兼容)
 - 把任意 **OpenAI 兼容的 v1 端点**当成一个账号接入(填 `base_url` + `key`),无需写代码
 - **按 model id 自动路由**:上游声明支持哪些 id,生成该 id 时即走对应上游(可覆盖内置 provider);id 留空 = 全部
-- 模型管理里自由新建自定义模型(id / 类型 / 比例 / 分辨率·价 / 时长·价 / 参考图),按本地价计费
+- 模型管理里自由新建自定义模型(id / 文本·图像·视频类型 / 每请求价 / 分辨率·价 / 时长·价 / 参考图),按本地价计费
 - 调用**直连不走代理**;上游可配权重与并发,与内置池统一调度
 
 #### 🔐 Token 自动保活
@@ -112,7 +113,7 @@
 - 每日额度按平台重置时间自动恢复 + 重新探测真实余额
 
 #### 💳 计费与运营
-- 积分制(**预扣 + 失败退款**),按模型 / 分辨率 / 时长精细定价;去AI特征按画质另计附加积分
+- 积分制(**预扣 + 失败退款**),文本按每请求固定价,图像 / 视频按模型、分辨率、时长精细定价;去AI特征按画质另计附加积分
 - **代理价体系**:用户可设为「代理」角色,模型可设代理价;代理用户(含其 API Key 调用)自动按代理价计费,未设代理价则回退普通价
 - **在线充值(易支付)**:微信 / 支付宝扫码,金额档位 + 自定义,订单 30 分钟未付自动取消,支付回调 MD5 验签 + 幂等自动到账;累计充值可查
 - **CDK 兑换码**充值 · **邀请奖励** · 邮箱注册 / 验证码 / 找回密码
@@ -144,13 +145,18 @@
 | **Leonardo.ai** | seedream-4.5 | 图像 |
 | **Krea.ai** | flux-klein-2 | 图像 |
 | **Imagine.art** | imagine-1.5 · imagine-1.5pro | 图像 |
-| **自定义上游** | 任意 OpenAI 兼容 v1 端点(按 id 路由) | 图像 / 视频 |
+| **自定义上游** | 任意 OpenAI 兼容 v1 端点(按 id 路由) | 文本 / 图像 / 视频 |
 
 > 模型由管理后台动态启用并定价,可随时增删。自定义上游支持把任何 OpenAI 兼容服务接成账号,按 model id 路由调用。
 
 ## 🔌 OpenAI 兼容 API
 
 ```bash
+# 文本对话 —— 非流式;传 "stream":true 即返回标准 SSE 并以 data: [DONE] 结束
+curl https://你的域名/v1/chat/completions \
+  -H "Authorization: Bearer sk-xxx" -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4.1-mini","messages":[{"role":"user","content":"你好"}]}'
+
 # 文生图 —— 纯 OpenAI 参数:size 同时决定比例 + 分辨率档(长边 <1800→1K / <3500→2K / ≥3500→4K)
 curl https://你的域名/v1/images/generations \
   -H "Authorization: Bearer sk-xxxx" \
@@ -167,7 +173,7 @@ curl https://你的域名/v1/images/edits \
   -F model="seedream-4.5" -F prompt="改成赛博朋克风格" -F image=@input.png
 ```
 
-图片默认返回 OpenAI 风格 `{ "created": ..., "data": [{ "b64_json": "..." }] }`(原始 base64,无 `data:` 前缀,服务端不留存);显式传 `"response_format":"url"` 可改为 URL 响应。**视频**走异步:`POST /v1/videos` 建任务 → 轮询 `GET /v1/videos/{id}` 至 `completed` → `GET /v1/videos/{id}/content` 取 mp4。完整参数见站内 **/docs** 文档页。
+文本请求原样透传 OpenAI Chat Completions 字段,支持普通 JSON 与 `stream:true` SSE。文本按管理端配置的每请求固定积分收费;上游业务错误、空响应或流未正常结束会记失败并自动退款。图片默认返回 OpenAI 风格 `{ "created": ..., "data": [{ "b64_json": "..." }] }`(原始 base64,无 `data:` 前缀,服务端不留存);显式传 `"response_format":"url"` 可改为 URL 响应。**视频**走异步:`POST /v1/videos` 建任务 → 轮询 `GET /v1/videos/{id}` 至 `completed` → `GET /v1/videos/{id}/content` 取 mp4。完整参数见站内 **/docs** 文档页。
 
 ## 🚀 部署
 

@@ -11,7 +11,7 @@ const emit = defineEmits(['close', 'saved'])
 const RATIO_OPTS = ['1:1', '5:4', '4:3', '3:2', '16:9', '2:1', '21:9', '3:1', '4:1', '8:1', '4:5', '3:4', '2:3', '9:16', '1:3', '1:4', '1:8']
 const IMG_RES = ['1K', '2K', '4K']
 const VID_RES = ['720p', '1080p', '2K', '4K']
-const ALL_RES = ['1K', '2K', '4K', '720p', '1080p']
+const ALL_RES = ['1K', '2K', '4K', '720p', '1080p', 'request']
 const DUR_OPTS = ['5s', '6s', '8s', '10s', '15s']
 
 const id = ref('')
@@ -49,8 +49,9 @@ function removeDur(key) {
 }
 
 const isVideo = computed(() => type.value === 'video')
+const isText = computed(() => type.value === 'text')
 // Resolution tiers depend on type: image = 1K/2K/4K, video = 540p/720p/1080p/2K/4K.
-const resOpts = computed(() => (isVideo.value ? VID_RES : IMG_RES))
+const resOpts = computed(() => (isText.value ? ['request'] : (isVideo.value ? VID_RES : IMG_RES)))
 
 // 首尾帧(frame) only has first+last slots → cap reference images at 2.
 const refsCap = computed(() => (refMode.value === 'frame' ? 2 : 99))
@@ -86,7 +87,7 @@ async function save() {
   if (!mid) { error.value = '请填写模型 id'; return }
   if (refMode.value === 'frame' && Number(maxRefs.value) > 2) maxRefs.value = 2
   const r = collect(res.value, resOpts.value)
-  if (!r.keys.length) { error.value = '请至少勾选一个分辨率并填价格'; return }
+  if (!r.keys.length) { error.value = isText.value ? '请填写每次请求价格' : '请至少勾选一个分辨率并填价格'; return }
   const body = {
     id: mid,
     name: mid,
@@ -95,11 +96,11 @@ async function save() {
     provider: 'custom',
     prices: r.prices,
     prices_agent: r.agent,
-    ratios: ratios.value.slice(),
-    max_reference_images: Number(maxRefs.value) || 0,
-    reference_mode: refMode.value,
+    ratios: isText.value ? [] : ratios.value.slice(),
+    max_reference_images: isText.value ? 0 : (Number(maxRefs.value) || 0),
+    reference_mode: isText.value ? 'none' : refMode.value,
     weight: Number(weight.value) || 0,
-    image_to_image: (Number(maxRefs.value) || 0) > 0,
+    image_to_image: !isText.value && (Number(maxRefs.value) || 0) > 0,
   }
   if (isVideo.value) {
     body.resolutions = r.keys
@@ -143,7 +144,7 @@ async function save() {
           </div>
           <div class="w-28">
             <label class="text-xs text-slate-500 block mb-1">类型</label>
-            <SelectMenu v-model="type" :options="[{value:'image',label:'图像'},{value:'video',label:'视频'}]" />
+            <SelectMenu v-model="type" :options="[{value:'image',label:'图像'},{value:'video',label:'视频'},{value:'text',label:'文本'}]" />
           </div>
           <div class="w-24">
             <label class="text-xs text-slate-500 block mb-1">权重</label>
@@ -151,7 +152,7 @@ async function save() {
           </div>
         </div>
 
-        <div>
+        <div v-if="!isText">
           <label class="text-xs text-slate-500 block mb-1.5">比例(多选)</label>
           <div class="flex flex-wrap gap-1.5">
             <button v-for="r in RATIO_OPTS" :key="r" type="button" @click="toggleRatio(r)"
@@ -161,10 +162,10 @@ async function save() {
         </div>
 
         <div>
-          <label class="text-xs text-slate-500 block mb-1.5">分辨率 · 价格(填普通价 = 支持该档,<strong class="text-slate-600">留空 = 不支持</strong>)</label>
+          <label class="text-xs text-slate-500 block mb-1.5">{{ isText ? '每次请求价格' : '分辨率 · 价格' }}(填普通价 = 支持该档,<strong class="text-slate-600">留空 = 不支持</strong>)</label>
           <div class="space-y-1.5">
             <div v-for="r in resOpts" :key="r" class="flex items-center gap-2">
-              <span class="w-16 text-xs font-mono text-slate-500">{{ r }}</span>
+              <span class="w-16 text-xs font-mono text-slate-500">{{ r === 'request' ? '每次' : r }}</span>
               <input v-model="res[r].price" type="number" class="field !py-1 flex-1" placeholder="普通价(留空=不支持)" />
               <input v-model="res[r].agent" type="number" class="field !py-1 flex-1" placeholder="代理价(留空跟随)" />
             </div>
@@ -192,7 +193,7 @@ async function save() {
           </div>
         </div>
 
-        <div class="flex gap-3">
+        <div v-if="!isText" class="flex gap-3">
           <div class="flex-1">
             <label class="text-xs text-slate-500 block mb-1">参考图张数<span v-if="refMode==='frame'" class="text-white/40">(首尾帧最多 2)</span></label>
             <input v-model.number="maxRefs" type="number" min="0" :max="refsCap" class="field h-10" />

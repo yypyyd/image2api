@@ -81,15 +81,16 @@ const providerGroups = computed(() => {
   const map = new Map()
   for (const m of managed.value) {
     const key = (m.provider || 'unknown').toLowerCase()
-    const g = map.get(key) || { name: m.provider || 'unknown', image: 0, video: 0 }
+    const g = map.get(key) || { name: m.provider || 'unknown', image: 0, video: 0, text: 0 }
     if (m.type === 'video') g.video++
+    else if (m.type === 'text') g.text++
     else g.image++
     map.set(key, g)
   }
   return [...map.entries()].map(([key, g]) => ({
     ...g,
     grad: PROVIDER_TINT[key] || PROVIDER_TINT.default,
-  })).sort((a, b) => (b.image + b.video) - (a.image + a.video))
+  })).sort((a, b) => (b.image + b.video + b.text) - (a.image + a.video + a.text))
 })
 
 // Admin-curated "我们的作品" entries from /admin/api/showcase (kind=work),
@@ -298,6 +299,7 @@ function useExample(ex) {
             <div>
               <div class="text-base font-semibold capitalize text-[color:var(--fg)]">{{ p.name }}</div>
               <div class="text-[10px] uppercase tracking-[0.25em] text-[color:var(--fg-3)] mt-1 flex gap-2">
+                <span v-if="p.text">{{ p.text }} 文本</span>
                 <span v-if="p.image">{{ p.image }} 图像</span>
                 <span v-if="p.video">{{ p.video }} 视频</span>
               </div>

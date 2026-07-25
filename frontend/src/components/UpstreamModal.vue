@@ -99,7 +99,7 @@ async function submit() {
             <button v-for="m in allModels" :key="m.id" type="button" @click="toggle(m.id)"
                     class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs ring-1 transition-colors"
                     :class="selected.includes(m.id) ? 'bg-indigo-500/15 text-indigo-700 ring-indigo-300 font-medium' : 'bg-white text-slate-600 ring-slate-200 hover:ring-slate-300'">
-              <span class="w-1.5 h-1.5 rounded-full" :class="m.type === 'video' ? 'bg-violet-400' : 'bg-emerald-400'"></span>{{ m.alias || m.id }}
+              <span class="w-1.5 h-1.5 rounded-full" :class="m.type === 'text' ? 'bg-sky-400' : (m.type === 'video' ? 'bg-violet-400' : 'bg-emerald-400')"></span>{{ m.alias || m.id }}
             </button>
           </div>
         </div>

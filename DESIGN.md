@@ -1,5 +1,15 @@
 # Design Notes
 
+### 2026-07-26 - OpenAI-compatible text reverse proxy
+
+**Change**: Added `POST /v1/chat/completions` for custom OpenAI-compatible upstream accounts, including ordinary JSON and live SSE streaming. Managed models now accept `type: "text"` and use `prices.request` / `prices_agent.request` as a fixed per-request charge.
+
+**Reason**: API clients need to use the same gateway, API keys, account routing, concurrency controls, and credit balance for text models as they already use for image and video generation.
+
+**Impact**: The gateway rewrites only the upstream `model` field and preserves other Chat Completions request fields. HTTP-200 business errors are rejected before billing is finalized; streaming calls must start with a valid completion chunk and end with `data: [DONE]`. Invalid, interrupted, or incomplete responses are logged as failed and refunded. Streaming holds the selected account and user concurrency slots until the body completes or closes.
+
+**Security boundary**: Clients can select only an enabled local text-model name; they cannot supply an upstream URL or credential. Upstream `base_url` and keys remain admin-managed account data, keys are sent only in the upstream Authorization header, and only a small allowlist of response headers is exposed downstream. Request bodies are capped at 10 MiB and non-stream responses at 32 MiB. This defends against credential disclosure, user-controlled SSRF, and unbounded buffering. As with the existing custom image/video connector, administrators are trusted not to configure an internal or malicious upstream URL; network-level egress filtering remains the deployment operator's responsibility.
+
 ## Account credential import
 
 The account-management import parser accepts pasted credentials as well as CPA (`type: codex`) JSON, CPA multi-account ZIP archives, and Sub2API account bundles. These formats are normalized in the browser to the existing `{ type: "openai", value: accessToken }` representation, so persistence, duplicate-account updates, and asynchronous quota checks continue to use the established ChatGPT token import endpoint.

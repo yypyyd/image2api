@@ -368,7 +368,7 @@ func (s *AdminWriteService) CreateModel(ctx context.Context, body map[string]any
 		return nil, errors.New("id required")
 	}
 	if modelType == "" {
-		return nil, errors.New("type must be image or video")
+		return nil, errors.New("type must be image, video, or text")
 	}
 	if provider == "" {
 		return nil, errors.New("provider required")
@@ -381,8 +381,10 @@ func (s *AdminWriteService) CreateModel(ctx context.Context, body map[string]any
 	// image: tiers derive from the price keys (form omits resolutions);
 	// video: resolutions come straight from the form (720p/1080p…). Python parity.
 	resolutions := jsonArray(body["resolutions"])
-	if modelType != "video" {
+	if modelType == "image" {
 		resolutions = resolutionsFromPrices(prices)
+	} else if modelType == "text" {
+		resolutions = jsonArray(nil)
 	}
 
 	item := &model.ModelConfig{
@@ -418,7 +420,7 @@ func (s *AdminWriteService) UpdateModel(ctx context.Context, modelID string, bod
 	if _, ok := body["type"]; ok {
 		modelType := normalizedModelType(stringValue(body["type"]))
 		if modelType == "" {
-			return nil, errors.New("type must be image or video")
+			return nil, errors.New("type must be image, video, or text")
 		}
 		patch["type"] = modelType
 	}
@@ -615,7 +617,7 @@ func normalizedShowcaseKind(kind string) string {
 
 func normalizedModelType(v string) string {
 	switch strings.TrimSpace(v) {
-	case "image", "video":
+	case "image", "video", "text":
 		return strings.TrimSpace(v)
 	default:
 		return ""

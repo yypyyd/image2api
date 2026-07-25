@@ -215,6 +215,57 @@ type V1ImageRequest struct {
 	AccountID string
 }
 
+// V1ChatResponse is a validated upstream chat-completions response. Body is
+// intentionally streamed; closing it finalizes accounting and releases both
+// the user and custom-account concurrency slots.
+type V1ChatResponse struct {
+	Header http.Header
+	Body   io.ReadCloser
+	Stream bool
+}
+
+type chatAccountingBody struct {
+	inner     io.ReadCloser
+	stream    bool
+	tail      string
+	sawDone   bool
+	completed bool
+	once      sync.Once
+	finish    func(success bool, reason string, upstreamFailure bool)
+}
+
+func (b *chatAccountingBody) Read(p []byte) (int, error) {
+	n, err := b.inner.Read(p)
+	if n > 0 && b.stream {
+		b.tail += string(p[:n])
+		if strings.Contains(b.tail, "data: [DONE]") || strings.Contains(b.tail, "data:[DONE]") {
+			b.sawDone = true
+		}
+		if len(b.tail) > 128 {
+			b.tail = b.tail[len(b.tail)-128:]
+		}
+	}
+	if errors.Is(err, io.EOF) {
+		b.completed = true
+		if !b.stream || b.sawDone {
+			b.once.Do(func() { b.finish(true, "", false) })
+		} else {
+			b.once.Do(func() { b.finish(false, "upstream stream ended without [DONE]", true) })
+		}
+	} else if err != nil {
+		b.once.Do(func() { b.finish(false, "upstream stream read failed", true) })
+	}
+	return n, err
+}
+
+func (b *chatAccountingBody) Close() error {
+	err := b.inner.Close()
+	if !b.completed {
+		b.once.Do(func() { b.finish(false, "client disconnected before completion", false) })
+	}
+	return err
+}
+
 func normalizeImageResponseFormat(value string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "", "b64_json":
@@ -396,6 +447,197 @@ func (s *V1Service) ListModels(ctx context.Context) ([]map[string]any, error) {
 		})
 	}
 	return out, nil
+}
+
+// PrepareChatCompletion validates and bills an OpenAI-compatible chat request,
+// chooses a matching custom upstream account, and returns its JSON/SSE body.
+// Text pricing is fixed per request at prices.request (agent override:
+// prices_agent.request). A response is successful only after a valid non-stream
+// completion reaches EOF or an SSE stream reaches data: [DONE].
+func (s *V1Service) PrepareChatCompletion(ctx context.Context, principal *APIPrincipal, payload []byte) (*V1ChatResponse, error) {
+	var request map[string]any
+	dec := json.NewDecoder(strings.NewReader(string(payload)))
+	dec.UseNumber()
+	if err := dec.Decode(&request); err != nil {
+		return nil, fmt.Errorf("%w: invalid request body", ErrUnsupportedParams)
+	}
+	modelName := strings.TrimSpace(stringValue(request["model"]))
+	messages, ok := request["messages"].([]any)
+	if modelName == "" || !ok || len(messages) == 0 {
+		return nil, fmt.Errorf("%w: model and messages are required", ErrUnsupportedParams)
+	}
+	stream, _ := request["stream"].(bool)
+	prompt := chatPrompt(messages)
+
+	modelItem, err := s.models.Get(ctx, modelName)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrUnknownModel
+		}
+		return nil, err
+	}
+	if !modelItem.Enabled || modelItem.Type != "text" {
+		return nil, ErrUnknownModel
+	}
+	if err := s.checkBannedPrompt(ctx, principal, prompt); err != nil {
+		s.logRejectedEvent(context.WithoutCancel(ctx), "text", modelName, principal, prompt, "v1", err.Error())
+		return nil, err
+	}
+	active, err := s.customActive(ctx, modelItem.ID)
+	if err != nil {
+		return nil, err
+	}
+	if s.custom == nil || len(active) == 0 {
+		return nil, ErrNoProviderAccount
+	}
+
+	bookCtx := context.WithoutCancel(ctx)
+	userSlot := randomUpper(12)
+	if principal != nil && principal.User != nil && !s.userAcquire(bookCtx, principal.User, userSlot) {
+		s.logRejectedEvent(bookCtx, "text", modelName, principal, prompt, "v1", ErrUserConcurrencyFull.Error())
+		return nil, ErrUserConcurrencyFull
+	}
+	userHeld := principal != nil && principal.User != nil
+	releaseUser := func() {
+		if userHeld {
+			s.userRelease(bookCtx, principal.User.ID, userSlot)
+			userHeld = false
+		}
+	}
+
+	price, err := s.chargeForModel(bookCtx, principal, modelItem, "text", "request", "", 0, true)
+	if err != nil {
+		releaseUser()
+		s.logRejectedEvent(bookCtx, "text", modelName, principal, prompt, "v1", err.Error())
+		return nil, err
+	}
+	eventID, err := s.logPendingEvent(bookCtx, "text", modelItem, principal, prompt, "", "", "", 0, price, "", "v1", nil, false)
+	if err != nil {
+		releaseUser()
+		if principal != nil && principal.User != nil && price > 0 {
+			if updated, adjustErr := s.users.AdjustCredits(bookCtx, principal.User.ID, price); adjustErr == nil {
+				principal.User = updated
+			}
+		}
+		return nil, err
+	}
+	startedAt := time.Now()
+	upstreamModel := strings.TrimSpace(modelItem.UpstreamModel)
+	if upstreamModel == "" {
+		upstreamModel = modelItem.ID
+	}
+
+	var lastErr error
+	busy := 0
+	for _, token := range active {
+		if !s.acctAcquire(bookCtx, token.ID, eventID, accountConcurrency(token)) {
+			busy++
+			continue
+		}
+		_ = s.events.SetAccount(bookCtx, eventID, token.ID, token.AccountEmail)
+		_ = s.tokens.TouchLastUsed(bookCtx, token.ID)
+		response, callErr := s.custom.ChatCompletions(ctx, stringValue(token.Meta["base_url"]), token.Value, upstreamModel, payload, stream)
+		if callErr != nil {
+			s.acctRelease(bookCtx, token.ID, eventID)
+			lastErr = callErr
+			switch {
+			case errors.Is(callErr, custom.ErrAuth):
+				s.markTokenFailure(bookCtx, "custom", token, "text", true, false)
+				continue
+			case errors.Is(callErr, custom.ErrQuotaExhausted):
+				s.markTokenFailure(bookCtx, "custom", token, "text", false, true)
+				continue
+			case errors.Is(callErr, custom.ErrTemporaryUpstream):
+				s.markTokenFailure(bookCtx, "custom", token, "text", false, false)
+				continue
+			default:
+				return nil, s.failChatCompletion(bookCtx, principal, eventID, price, releaseUser, callErr)
+			}
+		}
+
+		body := &chatAccountingBody{inner: response.Body, stream: response.Stream}
+		body.finish = func(success bool, reason string, upstreamFailure bool) {
+			defer s.acctRelease(bookCtx, token.ID, eventID)
+			defer releaseUser()
+			elapsed := int(time.Since(startedAt).Milliseconds())
+			if success {
+				_, _ = s.tokens.Update(bookCtx, "custom", token.ID, map[string]any{
+					"last_used_at": time.Now(), "success_total": gorm.Expr("success_total + 1"), "fails": 0,
+				})
+				_ = s.events.UpdateStatus(bookCtx, eventID, "success", "", elapsed)
+				_ = s.models.IncrementGenerationCount(bookCtx, modelItem.ID)
+				if principal != nil && principal.User != nil {
+					_ = s.users.IncrementGenerationCount(bookCtx, principal.User.ID)
+				}
+				_ = s.maybeGrantInviteReward(bookCtx, principal)
+				return
+			}
+			if upstreamFailure {
+				s.markTokenFailure(bookCtx, "custom", token, "text", false, false)
+			}
+			_ = s.events.UpdateStatus(bookCtx, eventID, "failed", reason, elapsed)
+			_ = s.refundIfNeeded(bookCtx, principal, eventID, price)
+		}
+		return &V1ChatResponse{Header: response.Header, Body: body, Stream: response.Stream}, nil
+	}
+
+	if lastErr == nil {
+		if busy > 0 {
+			lastErr = ErrConcurrencyFull
+		} else {
+			lastErr = ErrProviderExecution
+		}
+	}
+	return nil, s.failChatCompletion(bookCtx, principal, eventID, price, releaseUser, lastErr)
+}
+
+func (s *V1Service) failChatCompletion(ctx context.Context, principal *APIPrincipal, eventID string, price float64, releaseUser func(), cause error) error {
+	releaseUser()
+	_ = s.events.UpdateStatus(ctx, eventID, "failed", cause.Error(), 0)
+	_ = s.refundIfNeeded(ctx, principal, eventID, price)
+	switch {
+	case errors.Is(cause, custom.ErrBadRequest):
+		return fmt.Errorf("%w: %v", ErrUnsupportedParams, cause)
+	case errors.Is(cause, custom.ErrAuth):
+		return fmt.Errorf("%w: %v", ErrProviderAuth, cause)
+	case errors.Is(cause, custom.ErrQuotaExhausted):
+		return fmt.Errorf("%w: %v", ErrProviderQuota, cause)
+	case errors.Is(cause, custom.ErrTemporaryUpstream):
+		return fmt.Errorf("%w: %v", ErrProviderTemporary, cause)
+	case errors.Is(cause, ErrConcurrencyFull):
+		return cause
+	default:
+		return fmt.Errorf("%w: %v", ErrProviderExecution, cause)
+	}
+}
+
+func chatPrompt(messages []any) string {
+	parts := make([]string, 0, len(messages))
+	var collect func(any)
+	collect = func(v any) {
+		switch x := v.(type) {
+		case string:
+			if strings.TrimSpace(x) != "" {
+				parts = append(parts, x)
+			}
+		case []any:
+			for _, item := range x {
+				collect(item)
+			}
+		case map[string]any:
+			if text, ok := x["text"]; ok {
+				collect(text)
+			} else if content, ok := x["content"]; ok {
+				collect(content)
+			}
+		}
+	}
+	for _, raw := range messages {
+		if message, ok := raw.(map[string]any); ok {
+			collect(message["content"])
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 func (s *V1Service) PrepareImageRequest(ctx context.Context, principal *APIPrincipal, in V1ImageRequest) (map[string]any, error) {
@@ -3127,6 +3369,9 @@ func modelPrice(item *model.ModelConfig, kind, resolution, duration string, agen
 			return 0, false
 		}
 		return rv + dv, true
+	}
+	if kind == "text" {
+		return tierPrice(item.Prices, item.PricesAgent, "request")
 	}
 	return tierPrice(item.Prices, item.PricesAgent, resolution)
 }

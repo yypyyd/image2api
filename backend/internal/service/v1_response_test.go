@@ -2,7 +2,12 @@ package service
 
 import (
 	"errors"
+	"io"
+	"strings"
 	"testing"
+
+	"backend/internal/model"
+	"gorm.io/datatypes"
 )
 
 func TestNormalizeImageResponseFormat(t *testing.T) {
@@ -32,6 +37,47 @@ func TestNormalizeImageResponseFormat(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Fatalf("normalizeImageResponseFormat() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestModelPriceTextPerRequest(t *testing.T) {
+	item := &model.ModelConfig{
+		Prices:      datatypes.JSONMap{"request": 2.5},
+		PricesAgent: datatypes.JSONMap{"request": 1.5},
+	}
+	if got, ok := modelPrice(item, "text", "", "", false); !ok || got != 2.5 {
+		t.Fatalf("normal text price = %v, %v", got, ok)
+	}
+	if got, ok := modelPrice(item, "text", "", "", true); !ok || got != 1.5 {
+		t.Fatalf("agent text price = %v, %v", got, ok)
+	}
+}
+
+func TestChatAccountingBodyRequiresDoneForStream(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantOK  bool
+		wantBad bool
+	}{
+		{name: "done", body: "data: {}\n\ndata: [DONE]\n\n", wantOK: true},
+		{name: "compact done", body: "data: {}\n\ndata:[DONE]\n\n", wantOK: true},
+		{name: "truncated", body: "data: {}\n\n", wantBad: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var ok, bad bool
+			body := &chatAccountingBody{
+				inner:  io.NopCloser(strings.NewReader(tt.body)),
+				stream: true,
+				finish: func(success bool, _ string, upstreamFailure bool) { ok, bad = success, upstreamFailure },
+			}
+			_, _ = io.ReadAll(body)
+			_ = body.Close()
+			if ok != tt.wantOK || bad != tt.wantBad {
+				t.Fatalf("finish = ok:%v bad:%v, want ok:%v bad:%v", ok, bad, tt.wantOK, tt.wantBad)
 			}
 		})
 	}

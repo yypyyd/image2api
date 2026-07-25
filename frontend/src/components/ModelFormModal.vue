@@ -23,6 +23,8 @@ const imagePrices = ref({})        // 普通价 { '1K': '', '2K': '', ... } keye
 const videoPrices = ref({})        // 普通价 { '5s': '', '10s': '', ... } keyed by durations
 const imagePricesAgent = ref({})   // 代理价(留空 = 跟随普通价)
 const videoPricesAgent = ref({})   // 代理价(留空 = 跟随普通价)
+const textPrice = ref('')          // 文本模型固定每请求价格
+const textPriceAgent = ref('')     // 文本模型代理每请求价格
 // Display weight — admin-set (NOT a catalog param): higher = higher up the
 // dropdown / model list. Defaults to the stored value in edit mode, else 0.
 const weight = ref(Number(props.model?.weight) || 0)
@@ -37,6 +39,7 @@ const entry = computed(() => {
   return catalog.value.find((e) => e.id === selectedId.value) || null
 })
 const isVideo = computed(() => entry.value?.type === 'video')
+const isText = computed(() => entry.value?.type === 'text')
 // Display tiers in canonical ascending order (720p before 1080p; 1K<2K<4K)
 // regardless of how the catalog/stored record happens to list them.
 const resolutions = computed(() => sortResolutions(entry.value?.resolutions || []))
@@ -62,6 +65,8 @@ function resetPrices(e) {
   videoPrices.value = {}
   imagePricesAgent.value = {}
   videoPricesAgent.value = {}
+  textPrice.value = ''
+  textPriceAgent.value = ''
   if (!e) return
   // Both image and video price per resolution; video ALSO prices per duration
   // (real video price = resolution price + duration price).
@@ -81,6 +86,10 @@ onMounted(async () => {
   loading.value = false
   if (isEdit.value) {
     const m = props.model
+    if (m.type === 'text') {
+      textPrice.value = m.prices?.request ?? ''
+      textPriceAgent.value = m.prices_agent?.request ?? ''
+    }
     // Resolution prices apply to both; video additionally has duration prices.
     // Agent prices are an optional overlay (blank = follows the normal price).
     for (const r of (m.resolutions || [])) {
@@ -115,7 +124,26 @@ async function save() {
   }
 
   let payload
-  if (e.type === 'video') {
+  if (e.type === 'text') {
+    const normal = Number(textPrice.value)
+    if (String(textPrice.value).trim() === '' || Number.isNaN(normal) || normal < 0) {
+      error.value = '请填写有效的每次请求价格'; return
+    }
+    const agentRaw = String(textPriceAgent.value).trim()
+    const prices_agent = {}
+    if (agentRaw !== '') {
+      const agent = Number(agentRaw)
+      if (Number.isNaN(agent) || agent < 0) { error.value = '代理价不能小于 0'; return }
+      prices_agent.request = agent
+    }
+    payload = {
+      type: 'text', provider: e.provider, alias: alias.value.trim(),
+      prices: { request: normal }, prices_agent,
+      ratios: [], resolutions: [], durations: [], duration_prices: {}, duration_prices_agent: {},
+      max_reference_images: 0, reference_mode: 'none', image_to_image: false,
+      weight: Number(weight.value) || 0,
+    }
+  } else if (e.type === 'video') {
     // Real video price = resolution price + duration price. Both tiers are
     // priced independently; a blank tier on either axis = unsupported. Charge
     // happens server-side as prices[res] + duration_prices[dur].
@@ -210,22 +238,28 @@ async function save() {
           <div v-if="entry" class="rounded-xl bg-white/[0.03] ring-1 ring-white/[0.06] p-3.5 space-y-2.5">
             <div class="flex items-center gap-2">
               <span class="inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[11px] font-medium ring-1"
-                    :class="isVideo ? 'bg-fuchsia-500/10 text-fuchsia-300 ring-fuchsia-400/30'
-                                    : 'bg-indigo-500/10 text-indigo-300 ring-indigo-400/30'">
-                {{ isVideo ? '生视频' : '生图' }}
+                    :class="isText ? 'bg-sky-500/10 text-sky-300 ring-sky-400/30'
+                                    : (isVideo ? 'bg-fuchsia-500/10 text-fuchsia-300 ring-fuchsia-400/30'
+                                               : 'bg-indigo-500/10 text-indigo-300 ring-indigo-400/30')">
+                {{ isText ? '文本' : (isVideo ? '生视频' : '生图') }}
               </span>
               <span class="text-[11px] text-white/45 capitalize">{{ entry.provider }}</span>
               <span class="ml-auto text-[10px] text-white/30">参数自动加载,不可改</span>
             </div>
 
             <div class="grid grid-cols-[3.5rem_1fr] gap-x-3 gap-y-1.5 text-[11px]">
-              <span class="text-white/40">比例</span>
-              <div class="flex flex-wrap gap-1">
+              <span v-if="!isText" class="text-white/40">比例</span>
+              <div v-if="!isText" class="flex flex-wrap gap-1">
                 <span v-for="r in (entry.ratios || [])" :key="r" class="ro-chip">{{ r }}</span>
                 <span v-if="!(entry.ratios || []).length" class="text-white/30">—</span>
               </div>
 
-              <template v-if="isVideo">
+              <template v-if="isText">
+                <span class="text-white/40">接口</span>
+                <div class="text-white/70 font-mono">/v1/chat/completions</div>
+              </template>
+
+              <template v-else-if="isVideo">
                 <span class="text-white/40">分辨率</span>
                 <div class="flex flex-wrap gap-1">
                   <span v-for="r in resolutions" :key="r" class="ro-chip">{{ r }}</span>
@@ -259,8 +293,22 @@ async function save() {
           <!-- ===== PRICE: image = per-quality; video = per-quality + per-duration (additive) ===== -->
           <template v-if="entry">
             <div class="space-y-4">
+              <div v-if="isText">
+                <label class="lbl">每次请求价格 <span class="text-white/35">(流式与非流式相同;代理价留空 = 跟随普通价)</span></label>
+                <div class="flex items-center gap-2">
+                  <div class="relative flex-1">
+                    <input v-model="textPrice" type="number" min="0" step="0.01" class="field !pr-10" placeholder="普通价" />
+                    <span class="absolute right-2.5 top-1/2 -translate-y-1/2 text-white/30 text-[10px]">积分</span>
+                  </div>
+                  <div class="relative flex-1">
+                    <input v-model="textPriceAgent" type="number" min="0" step="0.01" class="field !pr-10" placeholder="跟随普通" />
+                    <span class="absolute right-2.5 top-1/2 -translate-y-1/2 text-amber-300/40 text-[10px]">代理</span>
+                  </div>
+                </div>
+              </div>
+
               <!-- resolution prices (both image & video): 普通价 + 代理价 -->
-              <div>
+              <div v-else>
                 <label class="lbl">{{ isVideo ? '分辨率价格' : '画质价格' }} <span class="text-white/35">(普通价留空 = 不支持该档;代理价留空 = 跟随普通价)</span></label>
                 <div class="space-y-2">
                   <div v-if="resolutions.length" class="flex items-center gap-2 text-[10px] text-white/35 pl-14">

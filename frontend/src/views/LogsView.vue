@@ -291,8 +291,8 @@ const sourcePill = (s) => ({
               <div class="font-mono text-xs text-white/90 break-all" :title="e.model">{{ e.model }}</div>
               <div class="mt-1 flex items-center gap-1.5 min-w-0">
                 <span class="text-[10px] uppercase tracking-wider font-medium truncate min-w-0"
-                      :class="e.kind === 'video' ? 'text-fuchsia-300/80' : 'text-indigo-300/80'">
-                  {{ e.kind === 'video' ? '视频' : '图像' }}
+                      :class="e.kind === 'text' ? 'text-sky-300/80' : (e.kind === 'video' ? 'text-fuchsia-300/80' : 'text-indigo-300/80')">
+                  {{ e.kind === 'text' ? '文本' : (e.kind === 'video' ? '视频' : '图像') }}
                   <span v-if="e.provider" class="text-white/30 ml-1">· {{ e.provider }}</span>
                 </span>
                 <span class="inline-flex items-center rounded px-1.5 py-px text-[10px] font-medium ring-1 whitespace-nowrap shrink-0"

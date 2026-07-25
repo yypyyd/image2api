@@ -14,7 +14,7 @@ const emit = defineEmits(['close'])
 
 // 该账号所属 provider 的全部模型(图像 + 视频)。
 const models = computed(() =>
-  props.allModels.filter((m) => (m.provider || '') === props.account.pool))
+  props.allModels.filter((m) => m.type !== 'text' && (m.provider || '') === props.account.pool))
 const selectedModel = ref('')
 if (models.value.length) selectedModel.value = models.value[0].alias || models.value[0].id
 
