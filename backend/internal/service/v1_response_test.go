@@ -82,3 +82,19 @@ func TestChatAccountingBodyRequiresDoneForStream(t *testing.T) {
 		})
 	}
 }
+
+func TestOpenAITextResponseAndTranscript(t *testing.T) {
+	header, body := openAITextResponse("chatgpt-auto", "hello", true)
+	defer body.Close()
+	raw, _ := io.ReadAll(body)
+	if header.Get("Content-Type") != "text/event-stream" || !strings.Contains(string(raw), `"object":"chat.completion.chunk"`) || !strings.Contains(string(raw), "data: [DONE]") {
+		t.Fatalf("unexpected SSE response: header=%v body=%s", header, raw)
+	}
+	prompt := chatPrompt([]any{
+		map[string]any{"role": "system", "content": "be brief"},
+		map[string]any{"role": "user", "content": "hi"},
+	})
+	if prompt != "SYSTEM: be brief\nUSER: hi" {
+		t.Fatalf("chatPrompt() = %q", prompt)
+	}
+}

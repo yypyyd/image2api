@@ -57,7 +57,7 @@ const durationTiers = computed(() => {
 const addOptions = computed(() =>
   catalog.value
     .filter((e) => !e.added)
-    .map((e) => ({ value: e.id, label: `${e.id}　·　${e.type === 'video' ? '视频' : '图像'}` }))
+    .map((e) => ({ value: e.id, label: `${e.id}　·　${e.type === 'text' ? '文本' : (e.type === 'video' ? '视频' : '图像')}` }))
 )
 
 function resetPrices(e) {

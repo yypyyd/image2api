@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -450,7 +451,7 @@ func (s *V1Service) ListModels(ctx context.Context) ([]map[string]any, error) {
 }
 
 // PrepareChatCompletion validates and bills an OpenAI-compatible chat request,
-// chooses a matching custom upstream account, and returns its JSON/SSE body.
+// chooses a matching ChatGPT or custom upstream account, and returns JSON/SSE.
 // Text pricing is fixed per request at prices.request (agent override:
 // prices_agent.request). A response is successful only after a valid non-stream
 // completion reaches EOF or an SSE stream reaches data: [DONE].
@@ -483,11 +484,27 @@ func (s *V1Service) PrepareChatCompletion(ctx context.Context, principal *APIPri
 		s.logRejectedEvent(context.WithoutCancel(ctx), "text", modelName, principal, prompt, "v1", err.Error())
 		return nil, err
 	}
+	pool := "custom"
 	active, err := s.customActive(ctx, modelItem.ID)
 	if err != nil {
 		return nil, err
 	}
-	if s.custom == nil || len(active) == 0 {
+	if len(active) == 0 && modelItem.Provider == "chatgpt" {
+		pool = "chatgpt"
+		items, listErr := s.tokens.ListByPool(ctx, pool)
+		if listErr != nil {
+			return nil, listErr
+		}
+		for _, item := range items {
+			// ChatGPT's quota status represents image_gen allowance and does not
+			// prevent ordinary text conversations.
+			if (item.Status == "active" || item.Status == "quota") && !item.Dead && strings.TrimSpace(item.Value) != "" {
+				active = append(active, item)
+			}
+		}
+		s.rotateRoundRobin(pool, active)
+	}
+	if len(active) == 0 || (pool == "custom" && s.custom == nil) || (pool == "chatgpt" && s.chatgpt == nil) {
 		return nil, ErrNoProviderAccount
 	}
 
@@ -536,32 +553,48 @@ func (s *V1Service) PrepareChatCompletion(ctx context.Context, principal *APIPri
 		}
 		_ = s.events.SetAccount(bookCtx, eventID, token.ID, token.AccountEmail)
 		_ = s.tokens.TouchLastUsed(bookCtx, token.ID)
-		response, callErr := s.custom.ChatCompletions(ctx, stringValue(token.Meta["base_url"]), token.Value, upstreamModel, payload, stream)
+		var responseHeader http.Header
+		var responseBody io.ReadCloser
+		responseStream := stream
+		var callErr error
+		if pool == "custom" {
+			response, err := s.custom.ChatCompletions(ctx, stringValue(token.Meta["base_url"]), token.Value, upstreamModel, payload, stream)
+			callErr = err
+			if response != nil {
+				responseHeader, responseBody, responseStream = response.Header, response.Body, response.Stream
+			}
+		} else {
+			text, err := s.chatgpt.GenerateText(ctx, token.Value, prompt, upstreamModel)
+			callErr = err
+			if err == nil {
+				responseHeader, responseBody = openAITextResponse(modelItem.EffectiveName(), text, stream)
+			}
+		}
 		if callErr != nil {
 			s.acctRelease(bookCtx, token.ID, eventID)
 			lastErr = callErr
 			switch {
-			case errors.Is(callErr, custom.ErrAuth):
-				s.markTokenFailure(bookCtx, "custom", token, "text", true, false)
+			case errors.Is(callErr, custom.ErrAuth), errors.Is(callErr, chatgpt.ErrAuth):
+				s.markTokenFailure(bookCtx, pool, token, "text", true, false)
 				continue
-			case errors.Is(callErr, custom.ErrQuotaExhausted):
-				s.markTokenFailure(bookCtx, "custom", token, "text", false, true)
+			case errors.Is(callErr, custom.ErrQuotaExhausted), errors.Is(callErr, chatgpt.ErrQuotaExhausted):
+				s.markTokenFailure(bookCtx, pool, token, "text", false, true)
 				continue
-			case errors.Is(callErr, custom.ErrTemporaryUpstream):
-				s.markTokenFailure(bookCtx, "custom", token, "text", false, false)
+			case errors.Is(callErr, custom.ErrTemporaryUpstream), errors.Is(callErr, chatgpt.ErrTemporaryUpstream):
+				s.markTokenFailure(bookCtx, pool, token, "text", false, false)
 				continue
 			default:
 				return nil, s.failChatCompletion(bookCtx, principal, eventID, price, releaseUser, callErr)
 			}
 		}
 
-		body := &chatAccountingBody{inner: response.Body, stream: response.Stream}
+		body := &chatAccountingBody{inner: responseBody, stream: responseStream}
 		body.finish = func(success bool, reason string, upstreamFailure bool) {
 			defer s.acctRelease(bookCtx, token.ID, eventID)
 			defer releaseUser()
 			elapsed := int(time.Since(startedAt).Milliseconds())
 			if success {
-				_, _ = s.tokens.Update(bookCtx, "custom", token.ID, map[string]any{
+				_, _ = s.tokens.Update(bookCtx, pool, token.ID, map[string]any{
 					"last_used_at": time.Now(), "success_total": gorm.Expr("success_total + 1"), "fails": 0,
 				})
 				_ = s.events.UpdateStatus(bookCtx, eventID, "success", "", elapsed)
@@ -573,12 +606,12 @@ func (s *V1Service) PrepareChatCompletion(ctx context.Context, principal *APIPri
 				return
 			}
 			if upstreamFailure {
-				s.markTokenFailure(bookCtx, "custom", token, "text", false, false)
+				s.markTokenFailure(bookCtx, pool, token, "text", false, false)
 			}
 			_ = s.events.UpdateStatus(bookCtx, eventID, "failed", reason, elapsed)
 			_ = s.refundIfNeeded(bookCtx, principal, eventID, price)
 		}
-		return &V1ChatResponse{Header: response.Header, Body: body, Stream: response.Stream}, nil
+		return &V1ChatResponse{Header: responseHeader, Body: body, Stream: responseStream}, nil
 	}
 
 	if lastErr == nil {
@@ -598,11 +631,13 @@ func (s *V1Service) failChatCompletion(ctx context.Context, principal *APIPrinci
 	switch {
 	case errors.Is(cause, custom.ErrBadRequest):
 		return fmt.Errorf("%w: %v", ErrUnsupportedParams, cause)
-	case errors.Is(cause, custom.ErrAuth):
+	case errors.Is(cause, chatgpt.ErrContentPolicy):
+		return fmt.Errorf("%w: %v", ErrUnsupportedParams, cause)
+	case errors.Is(cause, custom.ErrAuth), errors.Is(cause, chatgpt.ErrAuth):
 		return fmt.Errorf("%w: %v", ErrProviderAuth, cause)
-	case errors.Is(cause, custom.ErrQuotaExhausted):
+	case errors.Is(cause, custom.ErrQuotaExhausted), errors.Is(cause, chatgpt.ErrQuotaExhausted):
 		return fmt.Errorf("%w: %v", ErrProviderQuota, cause)
-	case errors.Is(cause, custom.ErrTemporaryUpstream):
+	case errors.Is(cause, custom.ErrTemporaryUpstream), errors.Is(cause, chatgpt.ErrTemporaryUpstream):
 		return fmt.Errorf("%w: %v", ErrProviderTemporary, cause)
 	case errors.Is(cause, ErrConcurrencyFull):
 		return cause
@@ -611,30 +646,67 @@ func (s *V1Service) failChatCompletion(ctx context.Context, principal *APIPrinci
 	}
 }
 
+func openAITextResponse(modelName, content string, stream bool) (http.Header, io.ReadCloser) {
+	id := "chatcmpl-" + randomUpper(16)
+	created := time.Now().Unix()
+	contentType := "application/json"
+	var raw []byte
+	if !stream {
+		raw, _ = json.Marshal(map[string]any{
+			"id": id, "object": "chat.completion", "created": created, "model": modelName,
+			"choices": []map[string]any{{
+				"index": 0, "message": map[string]any{"role": "assistant", "content": content},
+				"logprobs": nil, "finish_reason": "stop",
+			}},
+			"usage": map[string]any{"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+		})
+	} else {
+		contentType = "text/event-stream"
+		first, _ := json.Marshal(map[string]any{
+			"id": id, "object": "chat.completion.chunk", "created": created, "model": modelName,
+			"choices": []map[string]any{{"index": 0, "delta": map[string]any{"role": "assistant", "content": content}, "finish_reason": nil}},
+		})
+		last, _ := json.Marshal(map[string]any{
+			"id": id, "object": "chat.completion.chunk", "created": created, "model": modelName,
+			"choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
+		})
+		raw = []byte("data: " + string(first) + "\n\ndata: " + string(last) + "\n\ndata: [DONE]\n\n")
+	}
+	return http.Header{"Content-Type": []string{contentType}}, io.NopCloser(bytes.NewReader(raw))
+}
+
 func chatPrompt(messages []any) string {
 	parts := make([]string, 0, len(messages))
-	var collect func(any)
-	collect = func(v any) {
+	var collect func(any, *[]string)
+	collect = func(v any, out *[]string) {
 		switch x := v.(type) {
 		case string:
 			if strings.TrimSpace(x) != "" {
-				parts = append(parts, x)
+				*out = append(*out, x)
 			}
 		case []any:
 			for _, item := range x {
-				collect(item)
+				collect(item, out)
 			}
 		case map[string]any:
 			if text, ok := x["text"]; ok {
-				collect(text)
+				collect(text, out)
 			} else if content, ok := x["content"]; ok {
-				collect(content)
+				collect(content, out)
 			}
 		}
 	}
 	for _, raw := range messages {
 		if message, ok := raw.(map[string]any); ok {
-			collect(message["content"])
+			var content []string
+			collect(message["content"], &content)
+			if len(content) > 0 {
+				role := strings.ToUpper(strings.TrimSpace(stringValue(message["role"])))
+				if role == "" {
+					role = "USER"
+				}
+				parts = append(parts, role+": "+strings.Join(content, "\n"))
+			}
 		}
 	}
 	return strings.Join(parts, "\n")

@@ -68,6 +68,300 @@ func (c *Client) SetProxy(proxy string) {
 	c.proxy = strings.TrimSpace(proxy)
 }
 
+// GenerateText submits a new ChatGPT Web conversation and returns the final
+// assistant text. The web backend always speaks SSE; callers may reshape the
+// completed text into either OpenAI JSON or SSE.
+func (c *Client) GenerateText(ctx context.Context, accessToken, prompt, model string) (string, error) {
+	direct, err := c.newDirectSession(accessToken)
+	if err != nil {
+		return "", err
+	}
+	scriptSources, dataBuild, err := c.bootstrap(ctx, direct)
+	if err != nil {
+		return "", err
+	}
+	reqs, err := c.getChatRequirements(ctx, direct, accessToken, scriptSources, dataBuild)
+	if err != nil {
+		return "", err
+	}
+	conduitToken, err := c.prepareTextConversation(ctx, direct, accessToken, prompt, reqs, model)
+	if err != nil {
+		return "", err
+	}
+	submit, err := c.newSession(accessToken)
+	if err != nil {
+		return "", err
+	}
+	text, conversationID, err := c.startTextConversation(ctx, submit, accessToken, prompt, reqs, conduitToken, model)
+	if err == nil && strings.TrimSpace(text) != "" {
+		return text, nil
+	}
+	if conversationID == "" {
+		return "", err
+	}
+	// The SSE sometimes closes after the conversation acknowledgement but before
+	// the final text patch. Fetch the authoritative conversation tree briefly,
+	// just like image generation polls after its async acknowledgement.
+	for i := 0; i < 5; i++ {
+		conversation, getErr := c.getConversation(ctx, direct, accessToken, conversationID)
+		if getErr == nil {
+			if final := latestAssistantText(conversation); final != "" {
+				return final, nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	if err != nil {
+		return "", err
+	}
+	return "", fmt.Errorf("%w: conversation contained no assistant response", ErrTemporaryUpstream)
+}
+
+func textModelSlug(model string) string {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "", "chatgpt-auto", "auto", "gpt-5-5-mini":
+		return "auto"
+	case "chatgpt-thinking":
+		return "gpt-5-5-thinking"
+	default:
+		return strings.TrimSpace(model)
+	}
+}
+
+func (c *Client) prepareTextConversation(ctx context.Context, session tlsclient.HttpClient, accessToken, prompt string, reqs *chatRequirements, model string) (string, error) {
+	path := "/backend-api/f/conversation/prepare"
+	payload := map[string]any{
+		"action":               "next",
+		"parent_message_id":    "client-created-root",
+		"model":                textModelSlug(model),
+		"timezone_offset_min":  -480,
+		"timezone":             "Asia/Shanghai",
+		"conversation_mode":    map[string]any{"kind": "primary_assistant"},
+		"supports_buffering":   true,
+		"supported_encodings":  []string{"v1"},
+		"client_prepare_state": "success",
+		"partial_query": map[string]any{
+			"id":      newUUID(),
+			"author":  map[string]any{"role": "user"},
+			"content": map[string]any{"content_type": "text", "parts": []string{prompt}},
+		},
+		"client_contextual_info": map[string]any{"app_name": "chatgpt.com"},
+	}
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header = c.imageHeaders(accessToken, path, reqs, "no-token", "application/json")
+	resp, err := session.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
+	}
+	respBody, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return "", readErr
+	}
+	if err := ensureOK(resp.StatusCode, respBody, "text_prepare"); err != nil {
+		return "", err
+	}
+	var data map[string]any
+	if json.Unmarshal(respBody, &data) != nil {
+		return "", fmt.Errorf("%w: text prepare returned non-json", ErrTemporaryUpstream)
+	}
+	return strings.TrimSpace(stringValue(data["conduit_token"])), nil
+}
+
+func (c *Client) startTextConversation(ctx context.Context, session tlsclient.HttpClient, accessToken, prompt string, reqs *chatRequirements, conduitToken, model string) (string, string, error) {
+	path := "/backend-api/f/conversation"
+	payload := map[string]any{
+		"action": "next",
+		"messages": []map[string]any{{
+			"id":          newUUID(),
+			"author":      map[string]any{"role": "user"},
+			"create_time": float64(time.Now().Unix()),
+			"content":     map[string]any{"content_type": "text", "parts": []string{prompt}},
+			"metadata":    map[string]any{"serialization_metadata": map[string]any{"custom_symbol_offsets": []any{}}},
+		}},
+		"parent_message_id":        "client-created-root",
+		"model":                    textModelSlug(model),
+		"client_prepare_state":     "success",
+		"timezone_offset_min":      -480,
+		"timezone":                 "Asia/Shanghai",
+		"conversation_mode":        map[string]any{"kind": "primary_assistant"},
+		"enable_message_followups": true,
+		"supports_buffering":       true,
+		"supported_encodings":      []string{"v1"},
+		"client_contextual_info":   map[string]any{"app_name": "chatgpt.com"},
+	}
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return "", "", err
+	}
+	req.Header = c.imageHeaders(accessToken, path, reqs, conduitToken, "text/event-stream")
+	resp, err := session.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", "", ensureOK(resp.StatusCode, respBody, "text_start")
+	}
+
+	latest := ""
+	assistantStarted := false
+	conversationID := ""
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 8*1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(line[5:])
+		if data == "[DONE]" {
+			break
+		}
+		if conversationID == "" {
+			if match := conversationIDRE.FindStringSubmatch(data); len(match) >= 2 {
+				conversationID = match[1]
+			}
+		}
+		if text, active, updated := applyAssistantEvent([]byte(data), latest, assistantStarted); updated {
+			latest, assistantStarted = text, active
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", conversationID, fmt.Errorf("%w: text stream read failed", ErrTemporaryUpstream)
+	}
+	latest = strings.TrimSpace(latest)
+	if latest == "" && conversationID == "" {
+		return "", "", fmt.Errorf("%w: text stream contained no conversation acknowledgement", ErrTemporaryUpstream)
+	}
+	return latest, conversationID, nil
+}
+
+func latestAssistantText(conversation map[string]any) string {
+	mapping, _ := conversation["mapping"].(map[string]any)
+	latest := ""
+	latestAt := -1.0
+	for _, rawNode := range mapping {
+		node, _ := rawNode.(map[string]any)
+		message, _ := node["message"].(map[string]any)
+		author, _ := message["author"].(map[string]any)
+		if strings.ToLower(strings.TrimSpace(stringValue(author["role"]))) != "assistant" {
+			continue
+		}
+		content, _ := message["content"].(map[string]any)
+		if stringValue(content["content_type"]) != "text" {
+			continue
+		}
+		parts, _ := content["parts"].([]any)
+		var texts []string
+		for _, part := range parts {
+			if value, ok := part.(string); ok && strings.TrimSpace(value) != "" {
+				texts = append(texts, value)
+			}
+		}
+		text := strings.TrimSpace(strings.Join(texts, "\n"))
+		if text == "" {
+			continue
+		}
+		created := numericValue(message["create_time"])
+		if created >= latestAt {
+			latest, latestAt = text, created
+		}
+	}
+	return latest
+}
+
+func numericValue(value any) float64 {
+	switch number := value.(type) {
+	case float64:
+		return number
+	case float32:
+		return float64(number)
+	case int:
+		return float64(number)
+	case int64:
+		return float64(number)
+	case json.Number:
+		parsed, _ := number.Float64()
+		return parsed
+	default:
+		return 0
+	}
+}
+
+func assistantTextFromEvent(raw []byte) string {
+	text, _, _ := applyAssistantEvent(raw, "", false)
+	return text
+}
+
+// applyAssistantEvent understands ChatGPT's v1 SSE encoding: the assistant
+// message is added with an empty parts[0], then later patch events append text
+// at /message/content/parts/0.
+func applyAssistantEvent(raw []byte, current string, active bool) (string, bool, bool) {
+	var event map[string]any
+	if json.Unmarshal(raw, &event) != nil {
+		return current, active, false
+	}
+	message, _ := event["message"].(map[string]any)
+	if message == nil {
+		if value, _ := event["v"].(map[string]any); value != nil {
+			message, _ = value["message"].(map[string]any)
+		}
+	}
+	author, _ := message["author"].(map[string]any)
+	if strings.ToLower(strings.TrimSpace(stringValue(author["role"]))) == "assistant" {
+		content, _ := message["content"].(map[string]any)
+		if stringValue(content["content_type"]) == "text" {
+			parts, _ := content["parts"].([]any)
+			texts := make([]string, 0, len(parts))
+			for _, part := range parts {
+				if value, ok := part.(string); ok {
+					texts = append(texts, value)
+				}
+			}
+			joined := strings.Join(texts, "\n")
+			if joined == "" && active {
+				return current, true, false
+			}
+			return joined, true, true
+		}
+	}
+	if !active || stringValue(event["o"]) != "patch" {
+		return current, active, false
+	}
+	patches, _ := event["v"].([]any)
+	updated := false
+	for _, rawPatch := range patches {
+		patch, _ := rawPatch.(map[string]any)
+		if stringValue(patch["p"]) != "/message/content/parts/0" {
+			continue
+		}
+		value, ok := patch["v"].(string)
+		if !ok {
+			continue
+		}
+		switch stringValue(patch["o"]) {
+		case "append":
+			current += value
+			updated = true
+		case "replace", "add":
+			current = value
+			updated = true
+		}
+	}
+	return current, active, updated
+}
+
 func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, aspectRatio, resolution string, refs [][]byte, downloadResult bool) ([]byte, map[string]any, error) {
 	// Everything except the generation submit egresses on the local IP. Only
 	// startImageGeneration (the /backend-api/f/conversation POST) goes through

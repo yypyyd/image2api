@@ -25,7 +25,7 @@ function pubName(m) {
 }
 const sampleImage = computed(() => pubName(imageModels.value[0]) || 'firefly-image-4')
 const sampleVideo = computed(() => pubName(videoModels.value[0]) || 'firefly-kling3')
-const sampleText = computed(() => pubName(textModels.value[0]) || 'gpt-4.1-mini')
+const sampleText = computed(() => pubName(textModels.value[0]) || 'gpt-5-5-mini')
 const sampleSeconds = computed(() => String(videoModels.value[0]?.durations?.[0] || '8s').replace(/s$/, ''))
 
 function priceOf(m) {

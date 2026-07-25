@@ -411,6 +411,22 @@ func (h *UserGenerationHandler) Models(c *gin.Context) {
 func (h *UserGenerationHandler) catalogEntries(c *gin.Context) ([]gin.H, error) {
 	items := []gin.H{
 		{
+			"id":          "gpt-5-5-mini",
+			"provider":    "chatgpt",
+			"type":        "text",
+			"ratios":      []string{},
+			"resolutions": []string{},
+			"description": "ChatGPT GPT-5.5 Mini 文本模型",
+		},
+		{
+			"id":          "gpt-5-5-thinking",
+			"provider":    "chatgpt",
+			"type":        "text",
+			"ratios":      []string{},
+			"resolutions": []string{},
+			"description": "ChatGPT Thinking 文本模型",
+		},
+		{
 			"id":       "gpt-image-2",
 			"provider": "chatgpt",
 			"type":     "image",
