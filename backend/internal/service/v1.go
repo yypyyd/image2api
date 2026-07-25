@@ -1445,7 +1445,6 @@ func (s *V1Service) finishUnimplementedEvent(ctx context.Context, eventID string
 	return s.events.UpdateStatus(ctx, eventID, "failed", "generation executor not implemented yet", 0)
 }
 
-
 // grokConcurrencyPerAccount is how many simultaneous generations one grok account
 // may run (grok tolerates 10, unlike the 1-per-account default elsewhere).
 const grokConcurrencyPerAccount = 10
@@ -2408,9 +2407,8 @@ func (s *V1Service) generateChatGPTImage(ctx context.Context, eventID string, mo
 		return nil, "", err
 	}
 
-	// Round-robin order; on a transient upstream error (e.g. "image generation
-	// did not start (no async marker)") FAIL OVER to the next account
-	// (tempFailover=true, capped at maxTempDeadAccounts) — never mark the
+	// Round-robin order; on a transient upstream error FAIL OVER to the next
+	// account (tempFailover=true, capped at maxTempDeadAccounts) — never mark the
 	// account dead. Auth/quota fail over immediately (see runPoolWithFailover).
 	var imageURL string
 	data, err := s.runPoolWithFailover(ctx, eventID, "chatgpt", active, "image", func(token model.TokenAccount) ([]byte, error) {

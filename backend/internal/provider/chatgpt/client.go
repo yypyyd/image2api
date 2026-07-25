@@ -943,18 +943,13 @@ func (c *Client) startImageGeneration(ctx context.Context, session tlsclient.Htt
 	if conversationID == "" {
 		return "", nil, nil, errors.New("chatgpt SSE closed without conversation_id")
 	}
-	// Intermittently (~10% on gpt-5-5-thinking) the stream returns a conversation
-	// id but never emits the async pipeline marker and no image is ever produced —
-	// polling such a conversation only burns the whole budget and surfaces as the
-	// non-retryable "image poll timeout". The async marker is the reliable "the
-	// image generation task actually started" signal, so when it is absent (and
-	// nothing was streamed inline) treat the attempt as a transient upstream
-	// failure. That is retryable: a fresh submission reliably engages the pipeline,
-	// so the pool retries the same account a few times and then fails over to
-	// another account (换号重试) instead of failing the request.
-	if !asyncStarted && len(fileIDs) == 0 && len(sedimentIDs) == 0 {
-		return "", nil, nil, fmt.Errorf("%w: image generation did not start (no async marker)", ErrTemporaryUpstream)
-	}
+	// A conversation id is the authoritative acknowledgement that the submit was
+	// accepted. The async marker is only an SSE optimisation: the web backend now
+	// omits or delays it for many otherwise valid image tasks, which then appear in
+	// the conversation endpoint during polling. Rejecting those conversations here
+	// caused the majority of requests to fail before the generated asset had a
+	// chance to arrive. A genuinely text-only/refused turn is still detected by
+	// pollForImage via conversationEndedWithoutImage/conversationRejected.
 	return conversationID, fileIDs, sedimentIDs, nil
 }
 
