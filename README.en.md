@@ -159,7 +159,7 @@ curl https://your-domain/v1/images/edits \
   -F model="seedream-4.5" -F prompt="make it cyberpunk" -F image=@input.png
 ```
 
-Images return OpenAI-style `{ "created": ..., "data": [{ "b64_json": "..." }] }` (raw base64, no `data:` prefix, nothing stored server-side). **Video** is async: `POST /v1/videos` → poll `GET /v1/videos/{id}` until `completed` → `GET /v1/videos/{id}/content` for the mp4. Full parameters are documented on the in-app **/docs** page.
+Images default to the OpenAI-style `{ "created": ..., "data": [{ "b64_json": "..." }] }` response (raw base64, no `data:` prefix, nothing stored server-side); explicitly pass `"response_format":"url"` for a URL response. **Video** is async: `POST /v1/videos` → poll `GET /v1/videos/{id}` until `completed` → `GET /v1/videos/{id}/content` for the mp4. Full parameters are documented on the in-app **/docs** page.
 
 ## 🚀 Deployment
 

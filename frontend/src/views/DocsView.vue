@@ -47,12 +47,16 @@ const imageParams = [
   ['model', 'string', '必填', '模型名(别名优先),见上表(图像)'],
   ['prompt', 'string', '必填', '文字描述'],
   ['size', 'string', '可选', '宽x高,如 "1024x1024"。同时决定「比例」+「分辨率档」(按长边)。具体怎么填见下方对照表;留空 = 1:1 · 2K'],
+  ['quality', 'string', '可选', 'low / medium / high / auto,映射到模型支持的分辨率档'],
+  ['response_format', 'string', '可选', 'b64_json(默认)或 url'],
 ]
 const editParams = [
   ['image', 'file', '必填', '输入图;多张参考图重复 image[] 字段(multipart 文件上传)'],
   ['prompt', 'string', '必填', '编辑/参考描述'],
   ['model', 'string', '必填', '模型名(别名优先,需支持图生图)'],
   ['size', 'string', '可选', '同图像:决定比例 + 分辨率档(见下方对照表)'],
+  ['quality', 'string', '可选', 'low / medium / high / auto'],
+  ['response_format', 'string', '可选', 'b64_json(默认)或 url'],
 ]
 const videoParams = [
   ['model', 'string', '必填', '模型名(别名优先),见上表(视频)'],

@@ -167,7 +167,7 @@ curl https://你的域名/v1/images/edits \
   -F model="seedream-4.5" -F prompt="改成赛博朋克风格" -F image=@input.png
 ```
 
-图片返回 OpenAI 风格 `{ "created": ..., "data": [{ "b64_json": "..." }] }`(原始 base64,无 `data:` 前缀,服务端不留存)。**视频**走异步:`POST /v1/videos` 建任务 → 轮询 `GET /v1/videos/{id}` 至 `completed` → `GET /v1/videos/{id}/content` 取 mp4。完整参数见站内 **/docs** 文档页。
+图片默认返回 OpenAI 风格 `{ "created": ..., "data": [{ "b64_json": "..." }] }`(原始 base64,无 `data:` 前缀,服务端不留存);显式传 `"response_format":"url"` 可改为 URL 响应。**视频**走异步:`POST /v1/videos` 建任务 → 轮询 `GET /v1/videos/{id}` 至 `completed` → `GET /v1/videos/{id}/content` 取 mp4。完整参数见站内 **/docs** 文档页。
 
 ## 🚀 部署
 

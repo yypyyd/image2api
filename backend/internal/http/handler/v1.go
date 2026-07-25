@@ -68,11 +68,13 @@ func (h *V1Handler) ImageGenerations(c *gin.Context) {
 	}
 
 	resp, err := h.v1.PrepareImageRequest(c.Request.Context(), principal, service.V1ImageRequest{
-		Model:   body.Model,
-		Prompt:  body.Prompt,
-		N:       body.N,
-		Size:    body.Size,
-		BaseURL: requestBaseURL(c),
+		Model:          body.Model,
+		Prompt:         body.Prompt,
+		N:              body.N,
+		Size:           body.Size,
+		Quality:        body.Quality,
+		ResponseFormat: body.ResponseFormat,
+		BaseURL:        requestBaseURL(c),
 	})
 	if err != nil {
 		h.writeV1Error(c, err, resp)
@@ -109,6 +111,8 @@ func (h *V1Handler) ImageEdits(c *gin.Context) {
 		Prompt:          c.PostForm("prompt"),
 		N:               n,
 		Size:            c.PostForm("size"),
+		Quality:         c.PostForm("quality"),
+		ResponseFormat:  c.PostForm("response_format"),
 		ReferenceImages: refs,
 		BaseURL:         requestBaseURL(c),
 	})
