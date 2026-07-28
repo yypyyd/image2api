@@ -481,7 +481,7 @@ async function copy(text) {
     <section>
       <h2 class="text-lg font-semibold mb-3">响应 & 计费</h2>
       <div class="card p-6 space-y-3 text-sm text-white/70">
-        <p><strong class="text-white/90">文本</strong>返回标准 <code class="text-white/85 font-mono">chat.completion</code>;传 <code class="text-white/85 font-mono">stream:true</code> 时返回 <code class="text-white/85 font-mono">chat.completion.chunk</code> SSE,并以 <code class="text-white/85 font-mono">data: [DONE]</code> 结束。</p>
+        <p><strong class="text-white/90">文本</strong>返回标准 <code class="text-white/85 font-mono">chat.completion</code>;传 <code class="text-white/85 font-mono">stream:true</code> 时返回 <code class="text-white/85 font-mono">chat.completion.chunk</code> SSE,并以 <code class="text-white/85 font-mono">data: [DONE]</code> 结束。号池型文本模型(ChatGPT / Grok)的流式为整段一次性下发的模拟流;接 OpenAI 兼容上游的模型为真流式透传。</p>
         <p><strong class="text-white/90">图像</strong>(generations / edits)默认返回 OpenAI 图片格式:<code class="text-white/85 font-mono">{{ '{ "created": ..., "data": [{ "b64_json": "..." }] }' }}</code>。显式传 <code class="text-white/85 font-mono">response_format:"url"</code> 可返回产物 URL;URL 可能过期,请尽快下载或转存。</p>
         <p><strong class="text-white/90">视频</strong>(异步,Sora 风格三步):</p>
         <ol class="list-decimal list-inside space-y-1 text-white/65 pl-1">

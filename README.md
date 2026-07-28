@@ -91,7 +91,7 @@
 
 #### 🔌 OpenAI 兼容
 - 文本对话 `/v1/chat/completions`(普通 JSON + SSE 流式,兼容 OpenAI SDK)
-- 可直接复用后台现有 ChatGPT 账号池并使用真实模型名(`gpt-5-5-mini` / `gpt-5-5-thinking`),也可走自定义 OpenAI 兼容上游
+- 可直接复用后台现有 ChatGPT 账号池并使用真实模型名(`gpt-5-5-mini` / `gpt-5-5-thinking`),也可复用 Grok 账号池做文本对话(免费 Basic 号即可,fast 模式),或走自定义 OpenAI 兼容上游
 - 文生图 `/v1/images/generations` · 图生图 `/v1/images/edits`(multipart 上传参考图) · 视频 `/v1/videos`(Sora 式异步:创建→轮询→`/content` 下载) · `/v1/models`
 - **严格 OpenAI 入参**:`size` **同时决定比例 + 分辨率档**(图像看长边 → 1K/2K/4K,视频看短边 → 720p/1080p),改个 `base_url` + `api_key` 即接现有 OpenAI SDK
 - 图片结果 **base64 直返**,服务端不留存文件,隐私友好;站内 **/docs** 附「分辨率对照表」直接查 `size` 该传什么
@@ -142,7 +142,7 @@
 | **Adobe Firefly** | firefly-image-5 · firefly-gpt-image-2 · flux-kontext-max · firefly-video · firefly-ray · gemini-veo31 | 图像 / 视频 |
 | **OpenAI** | gpt-image-2 | 图像 |
 | **Runway** | runway-gen4-turbo · nano-banana-2(Nano Banana 2) | 视频 / 图像 |
-| **Grok（grok.com）** | grok-video（imagine 文生 / 图生视频) | 视频 |
+| **Grok（grok.com）** | grok-video（imagine 文生 / 图生视频) · grok-imagine-image（Lite 生图,免费号可用） · grok-chat（文本,免费号可用） | 文本 / 图像 / 视频 |
 | **Leonardo.ai** | seedream-4.5 | 图像 |
 | **Krea.ai** | flux-klein-2 | 图像 |
 | **Imagine.art** | imagine-1.5 · imagine-1.5pro | 图像 |
@@ -258,7 +258,7 @@ backend/                       后端源码(Go)
 │   │   ├── adobe/             Adobe Firefly(tls-client 指纹)
 │   │   ├── chatgpt/           OpenAI(含 PoW / turnstile)
 │   │   ├── runway/            Runway 视频 + Nano Banana 图像
-│   │   ├── grok/              Grok(grok.com,statsig 伪造,视频)
+│   │   ├── grok/              Grok(grok.com,statsig 伪造,文本 / 生图 / 视频)
 │   │   ├── leonardo/          Leonardo
 │   │   ├── krea/              Krea
 │   │   ├── imagine/           Imagine.art

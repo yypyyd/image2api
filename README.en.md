@@ -133,7 +133,7 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 | **Adobe Firefly** | firefly-image-5 · firefly-gpt-image-2 · flux-kontext-max · firefly-video · firefly-ray · gemini-veo31 | Image / Video |
 | **OpenAI** | gpt-image-2 | Image |
 | **Runway** | runway-gen4-turbo · nano-banana-2 (Nano Banana 2) | Video / Image |
-| **Grok (grok.com)** | grok-video (imagine text/image-to-video) | Video |
+| **Grok (grok.com)** | grok-video (imagine text/image-to-video) · grok-imagine-image (Lite, works on free accounts) · grok-chat (text, works on free accounts) | Text / Image / Video |
 | **Leonardo.ai** | seedream-4.5 | Image |
 | **Krea.ai** | flux-klein-2 | Image |
 | **Imagine.art** | imagine-1.5 · imagine-1.5pro | Image |
@@ -245,7 +245,7 @@ backend/                       Backend source (Go)
 │   │   ├── adobe/             Adobe Firefly (tls-client fingerprint)
 │   │   ├── chatgpt/           OpenAI (incl. PoW / turnstile)
 │   │   ├── runway/            Runway video + Nano Banana image
-│   │   ├── grok/              Grok (grok.com, spoofed statsig, video)
+│   │   ├── grok/              Grok (grok.com, spoofed statsig, text / image / video)
 │   │   ├── leonardo/          Leonardo
 │   │   ├── krea/              Krea
 │   │   ├── imagine/           Imagine.art

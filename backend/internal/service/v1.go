@@ -518,8 +518,29 @@ func (s *V1Service) PrepareChatCompletion(ctx context.Context, principal *APIPri
 		}
 		s.rotateRoundRobin(pool, active)
 	}
-	if len(active) == 0 || (pool == "custom" && s.custom == nil) || (pool == "chatgpt" && s.chatgpt == nil) {
+	if len(active) == 0 && modelItem.Provider == "grok" {
+		pool = "grok"
+		items, listErr := s.tokens.ListByPool(ctx, pool)
+		if listErr != nil {
+			return nil, listErr
+		}
+		for _, item := range items {
+			// grok's quota status tracks media generation credits; text chat runs
+			// on a separate rate limit, so quota-paused accounts still chat. The
+			// image/video_limited flags are media-only too.
+			if (item.Status == "active" || item.Status == "quota") && !item.Dead && strings.TrimSpace(item.Value) != "" {
+				active = append(active, item)
+			}
+		}
+		s.rotateRoundRobin(pool, active)
+	}
+	if len(active) == 0 || (pool == "custom" && s.custom == nil) || (pool == "chatgpt" && s.chatgpt == nil) || (pool == "grok" && s.grok == nil) {
 		return nil, ErrNoProviderAccount
+	}
+	if pool == "grok" && s.settings != nil {
+		if proxy, err := s.settings.GetValue(ctx, "proxy.url"); err == nil {
+			s.grok.SetProxy(proxy)
+		}
 	}
 
 	bookCtx := context.WithoutCancel(ctx)
@@ -561,7 +582,11 @@ func (s *V1Service) PrepareChatCompletion(ctx context.Context, principal *APIPri
 	var lastErr error
 	busy := 0
 	for _, token := range active {
-		if !s.acctAcquire(bookCtx, token.ID, eventID, accountConcurrency(token)) {
+		slots := accountConcurrency(token)
+		if pool == "grok" {
+			slots = grokConcurrencyPerAccount
+		}
+		if !s.acctAcquire(bookCtx, token.ID, eventID, slots) {
 			busy++
 			continue
 		}
@@ -571,13 +596,20 @@ func (s *V1Service) PrepareChatCompletion(ctx context.Context, principal *APIPri
 		var responseBody io.ReadCloser
 		responseStream := stream
 		var callErr error
-		if pool == "custom" {
+		switch pool {
+		case "custom":
 			response, err := s.custom.ChatCompletions(ctx, stringValue(token.Meta["base_url"]), token.Value, upstreamModel, payload, stream)
 			callErr = err
 			if response != nil {
 				responseHeader, responseBody, responseStream = response.Header, response.Body, response.Stream
 			}
-		} else {
+		case "grok":
+			text, err := s.grok.GenerateText(ctx, token.Value, prompt, grok.ChatModeForModel(upstreamModel))
+			callErr = err
+			if err == nil {
+				responseHeader, responseBody = openAITextResponse(modelItem.EffectiveName(), text, stream)
+			}
+		default:
 			text, err := s.chatgpt.GenerateText(ctx, token.Value, prompt, upstreamModel)
 			callErr = err
 			if err == nil {
@@ -588,13 +620,19 @@ func (s *V1Service) PrepareChatCompletion(ctx context.Context, principal *APIPri
 			s.acctRelease(bookCtx, token.ID, eventID)
 			lastErr = callErr
 			switch {
-			case errors.Is(callErr, custom.ErrAuth), errors.Is(callErr, chatgpt.ErrAuth):
+			case errors.Is(callErr, custom.ErrAuth), errors.Is(callErr, chatgpt.ErrAuth), errors.Is(callErr, grok.ErrAuth):
 				s.markTokenFailure(bookCtx, pool, token, "text", true, false)
+				continue
+			case errors.Is(callErr, grok.ErrQuotaExhausted):
+				// grok's chat rate limit is per-mode and short-lived, and is
+				// unrelated to the media credits the "quota" status guards —
+				// don't pause the account, just fail over.
+				s.markTokenFailure(bookCtx, pool, token, "text", false, false)
 				continue
 			case errors.Is(callErr, custom.ErrQuotaExhausted), errors.Is(callErr, chatgpt.ErrQuotaExhausted):
 				s.markTokenFailure(bookCtx, pool, token, "text", false, true)
 				continue
-			case errors.Is(callErr, custom.ErrTemporaryUpstream), errors.Is(callErr, chatgpt.ErrTemporaryUpstream):
+			case errors.Is(callErr, custom.ErrTemporaryUpstream), errors.Is(callErr, chatgpt.ErrTemporaryUpstream), errors.Is(callErr, grok.ErrTemporaryUpstream):
 				s.markTokenFailure(bookCtx, pool, token, "text", false, false)
 				continue
 			default:
@@ -647,11 +685,11 @@ func (s *V1Service) failChatCompletion(ctx context.Context, principal *APIPrinci
 		return fmt.Errorf("%w: %v", ErrUnsupportedParams, cause)
 	case errors.Is(cause, chatgpt.ErrContentPolicy):
 		return fmt.Errorf("%w: %v", ErrUnsupportedParams, cause)
-	case errors.Is(cause, custom.ErrAuth), errors.Is(cause, chatgpt.ErrAuth):
+	case errors.Is(cause, custom.ErrAuth), errors.Is(cause, chatgpt.ErrAuth), errors.Is(cause, grok.ErrAuth):
 		return fmt.Errorf("%w: %v", ErrProviderAuth, cause)
-	case errors.Is(cause, custom.ErrQuotaExhausted), errors.Is(cause, chatgpt.ErrQuotaExhausted):
+	case errors.Is(cause, custom.ErrQuotaExhausted), errors.Is(cause, chatgpt.ErrQuotaExhausted), errors.Is(cause, grok.ErrQuotaExhausted):
 		return fmt.Errorf("%w: %v", ErrProviderQuota, cause)
-	case errors.Is(cause, custom.ErrTemporaryUpstream), errors.Is(cause, chatgpt.ErrTemporaryUpstream):
+	case errors.Is(cause, custom.ErrTemporaryUpstream), errors.Is(cause, chatgpt.ErrTemporaryUpstream), errors.Is(cause, grok.ErrTemporaryUpstream):
 		return fmt.Errorf("%w: %v", ErrProviderTemporary, cause)
 	case errors.Is(cause, ErrConcurrencyFull):
 		return cause
