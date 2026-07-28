@@ -490,7 +490,9 @@ async function copy(text) {
           <li>完成后 <code class="text-white/85 font-mono">GET /v1/videos/{id}/content</code> 返回 <strong class="text-white/90">mp4 原始二进制</strong>(非 base64、非 URL)</li>
         </ol>
         <p><strong class="text-white/90">计费(预扣)</strong>:请求<strong class="text-white/90">前</strong>按上表价格从你的 Key 账号预扣积分;文本按每请求固定价,图像/视频按档位价格。上游失败或返回无效结果会自动退回 —— 失败不扣费。</p>
+        <p><strong class="text-white/90">模型发现</strong>:<code class="text-white/85 font-mono">GET /v1/models</code> 为标准 OpenAI 列表,每个模型额外带 <code class="text-white/70">kind</code>(image/video/text)、<code class="text-white/70">supported_ratios</code>、<code class="text-white/70">supported_resolutions</code>;视频模型还带 <code class="text-white/70">supported_durations</code>(如 <code class="text-white/70">["5s"]</code>),即 <code class="text-white/70">seconds</code> 可传的档位。</p>
         <p><strong class="text-white/90">参数映射</strong>:<code class="text-white/70">size</code>(宽x高)同时决定<strong class="text-white/90">比例 + 分辨率档</strong>(长边:&lt;1800→1K · 1800–3499→2K · ≥3500→4K),<code class="text-white/70">seconds</code>→视频时长。<strong class="text-white/90">没有 quality 参数</strong>,分辨率只看 size。档位须是该模型支持的(不支持会回退到该模型最低档);参数须落在定价表内否则 400,余额不足 402。</p>
+        <p><strong class="text-white/90">错误格式</strong>:与 OpenAI 一致,统一返回 <code class="text-white/85 font-mono">{{ '{ "error": { "message": "...", "type": "...", "param": null, "code": "..." } }' }}</code>;<code class="text-white/70">type</code> 为 <code class="text-white/70">invalid_request_error / insufficient_quota / rate_limit_error / server_error</code>。</p>
         <div class="pt-2 grid sm:grid-cols-2 gap-2 text-xs">
           <div class="flex items-center gap-2"><span class="badge-err">401</span> Key 无效 / 上游需重新授权</div>
           <div class="flex items-center gap-2"><span class="badge-err">404</span> 未知 model / 视频任务不存在</div>

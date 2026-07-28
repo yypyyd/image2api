@@ -947,11 +947,12 @@ func (s *TokenService) checkPendingGrok(tokenID, ssoToken string) {
 // RefreshGrokLiveness re-validates every live grok account each maintenance tick.
 // Grok sso can't be renewed and has no reset-based death deadline (billingPeriodEnd
 // is only a credits-renewal date — the sso keeps working past it), so liveness is
-// probed directly: GET /rest/subscriptions. No ACTIVE entry — a lapsed membership
-// flips to SUBSCRIPTION_STATUS_INACTIVE (empty array / 401 also count) — means the
-// paid membership is gone → the account is disabled+dead. Otherwise the credits
-// balance is re-synced and 恢复时间 is refreshed from the credits' own weekly
-// reset (NOT the subscription's billing-period end).
+// probed directly: GET /rest/subscriptions. Only a genuinely dead session (3x
+// 401/403) kills the account: a missing ACTIVE entry just means the account is on
+// the free Basic tier, which can still run Lite 生图 — it's flagged video_limited
+// (imagine video needs SuperGrok) and stays usable for image. The credits balance
+// is re-synced and 恢复时间 refreshed from the credits' own weekly reset (NOT the
+// subscription's billing-period end).
 func (s *TokenService) RefreshGrokLiveness(ctx context.Context) {
 	if s.grok == nil {
 		return
@@ -988,10 +989,9 @@ func (s *TokenService) RefreshGrokLiveness(ctx context.Context) {
 			}
 			continue // other transient upstream error → leave as-is, retry next tick
 		}
-		if sub == nil || !sub.Member {
-			// no ACTIVE subscription (INACTIVE / empty) → membership lapsed → dead.
-			_, _ = s.tokens.Update(ctx, "grok", it.ID, map[string]any{"status": "disabled", "dead": true})
-			continue
+		// Basic (no ACTIVE subscription): image-only. Super: both kinds.
+		if member := sub != nil && sub.Member; member == it.VideoLimited {
+			_, _ = s.tokens.Update(ctx, "grok", it.ID, map[string]any{"video_limited": !member})
 		}
 		data, derr := s.grok.FetchCreditsBalance(ctx, it.Value)
 		if derr != nil {

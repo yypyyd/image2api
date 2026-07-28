@@ -437,7 +437,7 @@ func (s *V1Service) ListModels(ctx context.Context) ([]map[string]any, error) {
 		if !item.Enabled {
 			continue
 		}
-		out = append(out, map[string]any{
+		entry := map[string]any{
 			"id":                    item.EffectiveName(),
 			"object":                "model",
 			"created":               now,
@@ -445,7 +445,21 @@ func (s *V1Service) ListModels(ctx context.Context) ([]map[string]any, error) {
 			"kind":                  item.Type,
 			"supported_ratios":      repo.JSONStrings(item.Ratios),
 			"supported_resolutions": repo.JSONStrings(item.Resolutions),
-		})
+		}
+		// Video models expose their selectable clip lengths (the /v1/videos
+		// `seconds` param) so a key holder can discover them, e.g. ["5s","8s"].
+		// Prefer the explicit durations list; fall back to the priced tiers.
+		if item.Type == "video" {
+			durations := repo.JSONStrings(item.Durations)
+			if len(durations) == 0 {
+				for d := range item.DurationPrices {
+					durations = append(durations, d)
+				}
+				sort.Strings(durations)
+			}
+			entry["supported_durations"] = durations
+		}
+		out = append(out, entry)
 	}
 	return out, nil
 }
@@ -919,6 +933,27 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		}
 		imageBytes = b
 		upstreamURL = u
+	case "grok":
+		// Lite (fast mode) text-to-image — the only media a free grok account can
+		// generate; ratio/resolution aren't selectable upstream.
+		b, u, execErr := s.generateGrokImage(genCtx, eventID, modelItem, in, urlOnly)
+		if execErr != nil {
+			_ = s.refundIfNeeded(ctx, principal, eventID, price)
+			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
+			switch {
+			case errors.Is(execErr, grok.ErrAuth):
+				return nil, ErrProviderAuth
+			case errors.Is(execErr, grok.ErrQuotaExhausted):
+				return nil, ErrProviderQuota
+			case errors.Is(execErr, grok.ErrTemporaryUpstream):
+				return nil, ErrProviderTemporary
+			default:
+				return nil, fmt.Errorf("%w: %v", ErrProviderExecution, execErr)
+			}
+		}
+		imageBytes = b
+		upstreamURL = u
+		gatedURL = true // assets.grok.com needs the account token → proxy it
 	case "custom":
 		b, u, execErr := s.generateCustomImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, urlOnly)
 		if execErr != nil {
@@ -1396,6 +1431,20 @@ func (s *V1Service) OpenImageContent(ctx context.Context, principal *APIPrincipa
 		}
 		return s.chatgpt.OpenAsset(ctx, acct.Value, ev.File)
 	}
+	// grok asset URLs (assets.grok.com) are auth-gated too — stream them with the
+	// token of the account that generated the image.
+	if ev.Provider == "grok" && s.grok != nil {
+		if s.settings != nil {
+			if proxy, perr := s.settings.GetValue(ctx, "proxy.url"); perr == nil {
+				s.grok.SetProxy(proxy)
+			}
+		}
+		acct, _ := s.tokens.Get(ctx, "grok", ev.AccountID)
+		if acct == nil || strings.TrimSpace(acct.Value) == "" {
+			return nil, "", fmt.Errorf("%w: grok account no longer available for this image", ErrProviderTemporary)
+		}
+		return s.grok.OpenAsset(ctx, acct.Value, ev.File)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ev.File, nil)
 	if err != nil {
 		return nil, "", err
@@ -1511,7 +1560,9 @@ func (s *V1Service) hasActiveProviderToken(ctx context.Context, provider, kind s
 		if item.Status != "active" || item.Dead || strings.TrimSpace(item.Value) == "" {
 			continue
 		}
-		if provider == "adobe" {
+		// adobe tracks the two quotas separately; grok marks Basic (non-Super)
+		// accounts video_limited — they still generate Lite images.
+		if provider == "adobe" || provider == "grok" {
 			if kind == "video" && item.VideoLimited {
 				continue
 			}
@@ -2505,6 +2556,10 @@ func (s *V1Service) generateGrokVideo(ctx context.Context, eventID string, model
 		if item.Status != "active" || item.Dead || strings.TrimSpace(item.Value) == "" {
 			continue
 		}
+		// imagine video needs SuperGrok — skip the Basic accounts (video_limited).
+		if item.VideoLimited {
+			continue
+		}
 		if rem, ok := jsonMapInt(item.Meta, "cached_quota_remaining"); ok && rem <= 0 {
 			continue
 		}
@@ -2560,6 +2615,95 @@ func (s *V1Service) generateGrokVideo(ctx context.Context, eventID string, model
 		}()
 		if done {
 			return data, videoURL, nil
+		}
+		if failover {
+			continue
+		}
+		return nil, "", lastErr
+	}
+	if lastErr == nil {
+		if busy > 0 {
+			return nil, "", ErrConcurrencyFull
+		}
+		lastErr = ErrProviderExecution
+	}
+	return nil, "", lastErr
+}
+
+// generateGrokImage runs grok's Lite (fast mode) text-to-image pipeline across
+// the grok pool. Same policy as generateGrokVideo: no pre-deduct, skip accounts
+// whose cached credits are gone, and treat an out-of-credits / auth failure as a
+// dead account (the grok sso can't be renewed). Lite is text-to-image only.
+// noStore url-only mode: skip the download and return the grok asset URL, which
+// is auth-gated and therefore served through the /content proxy.
+func (s *V1Service) generateGrokImage(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1ImageRequest, noStore bool) ([]byte, string, error) {
+	urlOnly := noStore
+	if s.grok == nil {
+		return nil, "", errors.New("grok client not configured")
+	}
+	if s.settings != nil {
+		if proxy, err := s.settings.GetValue(ctx, "proxy.url"); err == nil {
+			s.grok.SetProxy(proxy)
+		}
+	}
+
+	items, err := s.tokens.ListByPool(ctx, "grok")
+	if err != nil {
+		return nil, "", err
+	}
+	var active []model.TokenAccount
+	for _, item := range items {
+		if item.Status != "active" || item.Dead || item.ImageLimited || strings.TrimSpace(item.Value) == "" {
+			continue
+		}
+		if rem, ok := jsonMapInt(item.Meta, "cached_quota_remaining"); ok && rem <= 0 {
+			continue
+		}
+		active = append(active, item)
+	}
+	active = pinTestAccount(items, active, in.AccountID)
+	if len(active) == 0 {
+		return nil, "", ErrNoProviderAccount
+	}
+	s.rotateRoundRobin("grok", active)
+
+	var lastErr error
+	var imageURL string
+	busy := 0
+	for _, token := range active {
+		if !s.acctAcquire(ctx, token.ID, eventID, grokConcurrencyPerAccount) {
+			busy++
+			continue
+		}
+		var data []byte
+		done, failover := func() (bool, bool) {
+			defer s.acctRelease(ctx, token.ID, eventID)
+			_ = s.events.SetAccount(ctx, eventID, token.ID, token.AccountEmail)
+			_ = s.tokens.TouchLastUsed(ctx, token.ID)
+			d, meta, genErr := s.grok.GenerateImage(ctx, token.Value, in.Prompt, !urlOnly)
+			if genErr == nil {
+				_, _ = s.tokens.Update(ctx, "grok", token.ID, map[string]any{
+					"last_used_at":  time.Now(),
+					"success_total": gorm.Expr("success_total + 1"),
+					"fails":         0,
+				})
+				data = d
+				imageURL = strings.TrimSpace(stringValue(meta["image_url"]))
+				return true, false
+			}
+			lastErr = genErr
+			switch {
+			case errors.Is(genErr, grok.ErrAuth), errors.Is(genErr, grok.ErrQuotaExhausted):
+				s.markTokenFailure(ctx, "grok", token, "image", true, false)
+				return false, true
+			case errors.Is(genErr, grok.ErrTemporaryUpstream):
+				return false, true
+			default:
+				return false, false
+			}
+		}()
+		if done {
+			return data, imageURL, nil
 		}
 		if failover {
 			continue

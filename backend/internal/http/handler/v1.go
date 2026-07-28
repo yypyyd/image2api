@@ -32,7 +32,7 @@ func (h *V1Handler) Models(c *gin.Context) {
 
 	items, err := h.v1.ListModels(c.Request.Context())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to load models"})
+		openaiError(c, http.StatusInternalServerError, "server_error", "", "failed to load models")
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
@@ -52,7 +52,7 @@ func (h *V1Handler) ChatCompletions(c *gin.Context) {
 	}
 	body, err := io.ReadAll(io.LimitReader(c.Request.Body, 10<<20+1))
 	if err != nil || len(body) > 10<<20 {
-		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"detail": "request body too large"})
+		openaiError(c, http.StatusRequestEntityTooLarge, "invalid_request_error", "", "request body too large")
 		return
 	}
 	resp, err := h.v1.PrepareChatCompletion(c.Request.Context(), principal, body)
@@ -119,7 +119,7 @@ func (h *V1Handler) ImageGenerations(c *gin.Context) {
 		User           string `json:"user"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
+		openaiError(c, http.StatusBadRequest, "invalid_request_error", "", "invalid request body")
 		return
 	}
 
@@ -149,16 +149,16 @@ func (h *V1Handler) ImageEdits(c *gin.Context) {
 		return
 	}
 	if !strings.HasPrefix(c.GetHeader("Content-Type"), "multipart/form-data") {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "images/edits requires multipart/form-data"})
+		openaiError(c, http.StatusBadRequest, "invalid_request_error", "", "images/edits requires multipart/form-data")
 		return
 	}
 	if err := c.Request.ParseMultipartForm(64 << 20); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid multipart form"})
+		openaiError(c, http.StatusBadRequest, "invalid_request_error", "", "invalid multipart form")
 		return
 	}
 	refs := readMultipartImages(c, "image", "image[]")
 	if len(refs) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "images/edits requires at least one image file"})
+		openaiError(c, http.StatusBadRequest, "invalid_request_error", "", "images/edits requires at least one image file")
 		return
 	}
 	n, _ := strconv.Atoi(strings.TrimSpace(c.PostForm("n")))
@@ -193,7 +193,7 @@ func (h *V1Handler) CreateVideo(c *gin.Context) {
 	var refs []string
 	if strings.HasPrefix(c.GetHeader("Content-Type"), "multipart/form-data") {
 		if err := c.Request.ParseMultipartForm(64 << 20); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid multipart form"})
+			openaiError(c, http.StatusBadRequest, "invalid_request_error", "", "invalid multipart form")
 			return
 		}
 		modelID = c.PostForm("model")
@@ -213,7 +213,7 @@ func (h *V1Handler) CreateVideo(c *gin.Context) {
 			ReferenceImages []string `json:"reference_images"`
 		}
 		if err := c.ShouldBindJSON(&body); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
+			openaiError(c, http.StatusBadRequest, "invalid_request_error", "", "invalid request body")
 			return
 		}
 		modelID, prompt, size = body.Model, body.Prompt, body.Size
@@ -385,51 +385,61 @@ func openaiImageResponse(m map[string]any) gin.H {
 	return out
 }
 
+// openaiError writes an OpenAI-format error body:
+// {"error": {"message", "type", "param", "code"}}.
+func openaiError(c *gin.Context, status int, errType, code, message string) {
+	body := gin.H{"message": message, "type": errType, "param": nil, "code": nil}
+	if code != "" {
+		body["code"] = code
+	}
+	c.JSON(status, gin.H{"error": body})
+}
+
 func (h *V1Handler) writeAuthError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, service.ErrMissingAPIKey):
-		c.JSON(http.StatusUnauthorized, gin.H{"detail": err.Error()})
+		openaiError(c, http.StatusUnauthorized, "invalid_request_error", "invalid_api_key", err.Error())
 	case errors.Is(err, service.ErrInvalidAPIKey):
-		c.JSON(http.StatusUnauthorized, gin.H{"detail": err.Error()})
+		openaiError(c, http.StatusUnauthorized, "invalid_request_error", "invalid_api_key", err.Error())
 	default:
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to validate api key"})
+		openaiError(c, http.StatusInternalServerError, "server_error", "", "failed to validate api key")
 	}
 }
 
 func (h *V1Handler) writeV1Error(c *gin.Context, err error, payload map[string]any) {
 	switch {
 	case errors.Is(err, service.ErrUnknownModel):
-		c.JSON(http.StatusNotFound, gin.H{"detail": err.Error()})
+		openaiError(c, http.StatusNotFound, "invalid_request_error", "model_not_found", err.Error())
 	case errors.Is(err, service.ErrUnsupportedParams), errors.Is(err, service.ErrBannedPrompt):
-		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		openaiError(c, http.StatusBadRequest, "invalid_request_error", "", err.Error())
 	case errors.Is(err, service.ErrInsufficientFunds):
-		c.JSON(http.StatusPaymentRequired, gin.H{"detail": err.Error()})
+		openaiError(c, http.StatusPaymentRequired, "insufficient_quota", "insufficient_quota", err.Error())
 	case errors.Is(err, service.ErrReferenceTooLarge):
-		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"detail": err.Error()})
+		openaiError(c, http.StatusRequestEntityTooLarge, "invalid_request_error", "", err.Error())
 	case errors.Is(err, service.ErrNoProviderAccount):
-		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": err.Error()})
+		openaiError(c, http.StatusServiceUnavailable, "server_error", "", err.Error())
 	case errors.Is(err, service.ErrProviderAuth):
-		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": err.Error()})
+		openaiError(c, http.StatusServiceUnavailable, "server_error", "", err.Error())
 	case errors.Is(err, service.ErrProviderQuota):
 		// Match the Python contract: provider quota exhaustion maps to 401
 		// (QuotaExhaustedError is handled alongside AuthError in routes.py).
-		c.JSON(http.StatusUnauthorized, gin.H{"detail": err.Error()})
+		openaiError(c, http.StatusUnauthorized, "insufficient_quota", "insufficient_quota", err.Error())
 	case errors.Is(err, service.ErrProviderTemporary):
-		c.JSON(http.StatusServiceUnavailable, gin.H{"detail": err.Error()})
+		openaiError(c, http.StatusServiceUnavailable, "server_error", "", err.Error())
 	case errors.Is(err, service.ErrConcurrencyFull), errors.Is(err, service.ErrUserConcurrencyFull):
-		c.JSON(http.StatusTooManyRequests, gin.H{"detail": err.Error()})
+		openaiError(c, http.StatusTooManyRequests, "rate_limit_error", "rate_limit_exceeded", err.Error())
 	case errors.Is(err, service.ErrVideoJobNotFound):
-		c.JSON(http.StatusNotFound, gin.H{"detail": err.Error()})
+		openaiError(c, http.StatusNotFound, "invalid_request_error", "not_found", err.Error())
 	case errors.Is(err, service.ErrVideoNotReady):
-		c.JSON(http.StatusConflict, gin.H{"detail": err.Error()})
+		openaiError(c, http.StatusConflict, "invalid_request_error", "", err.Error())
 	case errors.Is(err, service.ErrProviderUnsupported):
-		c.JSON(http.StatusNotImplemented, gin.H{"detail": err.Error()})
+		openaiError(c, http.StatusNotImplemented, "server_error", "", err.Error())
 	case errors.Is(err, service.ErrProviderExecution):
-		c.JSON(http.StatusBadGateway, gin.H{"detail": err.Error()})
+		openaiError(c, http.StatusBadGateway, "server_error", "", err.Error())
 	case errors.Is(err, service.ErrGenerationPending):
 		c.JSON(http.StatusNotImplemented, payload)
 	default:
-		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		openaiError(c, http.StatusBadRequest, "invalid_request_error", "", err.Error())
 	}
 }
 
