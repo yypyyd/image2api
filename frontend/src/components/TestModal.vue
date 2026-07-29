@@ -25,7 +25,7 @@ onMounted(async () => {
 
 const ratios = (props.model.ratios && props.model.ratios.length)
   ? props.model.ratios
-  : (isVideo ? ['16x9'] : ['1:1'])
+  : (isVideo ? ['16:9'] : ['1:1'])
 
 const resolutions = (props.model.resolutions && props.model.resolutions.length)
   ? sortResolutions(props.model.resolutions)

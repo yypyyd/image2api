@@ -60,7 +60,7 @@ async function run() {
   const payload = {
     model: selectedModel.value,
     prompt: prompt.value,
-    ratio: (m?.ratios && m.ratios[0]) || (isVideo.value ? '16x9' : '1:1'),
+    ratio: (m?.ratios && m.ratios[0]) || (isVideo.value ? '16:9' : '1:1'),
     resolution: (m?.resolutions && m.resolutions[0]) || '',
     account_id: props.account.id,
   }

@@ -426,7 +426,7 @@ func (s *V1Service) Authenticate(ctx context.Context, authHeader string) (*APIPr
 	}, nil
 }
 
-func (s *V1Service) ListModels(ctx context.Context) ([]map[string]any, error) {
+func (s *V1Service) ListModels(ctx context.Context, extended bool) ([]map[string]any, error) {
 	items, err := s.models.List(ctx)
 	if err != nil {
 		return nil, err
@@ -437,31 +437,38 @@ func (s *V1Service) ListModels(ctx context.Context) ([]map[string]any, error) {
 		if !item.Enabled {
 			continue
 		}
-		entry := map[string]any{
-			"id":                    item.EffectiveName(),
-			"object":                "model",
-			"created":               now,
-			"owned_by":              item.Provider,
-			"kind":                  item.Type,
-			"supported_ratios":      repo.JSONStrings(item.Ratios),
-			"supported_resolutions": repo.JSONStrings(item.Resolutions),
-		}
-		// Video models expose their selectable clip lengths (the /v1/videos
-		// `seconds` param) so a key holder can discover them, e.g. ["5s","8s"].
-		// Prefer the explicit durations list; fall back to the priced tiers.
-		if item.Type == "video" {
-			durations := repo.JSONStrings(item.Durations)
-			if len(durations) == 0 {
-				for d := range item.DurationPrices {
-					durations = append(durations, d)
-				}
-				sort.Strings(durations)
-			}
-			entry["supported_durations"] = durations
-		}
-		out = append(out, entry)
+		out = append(out, v1ModelEntry(item, now, extended))
 	}
 	return out, nil
+}
+
+func v1ModelEntry(item model.ModelConfig, created int64, extended bool) map[string]any {
+	entry := map[string]any{
+		"id":       item.EffectiveName(),
+		"object":   "model",
+		"created":  created,
+		"owned_by": item.Provider,
+	}
+	if !extended {
+		return entry
+	}
+	entry["kind"] = item.Type
+	entry["supported_ratios"] = repo.JSONRatios(item.Ratios)
+	entry["supported_resolutions"] = repo.JSONStrings(item.Resolutions)
+	// Video models expose their selectable clip lengths (the /v1/videos
+	// `seconds` param) so a key holder can discover them, e.g. ["5s","8s"].
+	// Prefer the explicit durations list; fall back to the priced tiers.
+	if item.Type == "video" {
+		durations := repo.JSONStrings(item.Durations)
+		if len(durations) == 0 {
+			for d := range item.DurationPrices {
+				durations = append(durations, d)
+			}
+			sort.Strings(durations)
+		}
+		entry["supported_durations"] = durations
+	}
+	return entry
 }
 
 // PrepareChatCompletion validates and bills an OpenAI-compatible chat request,
@@ -2884,6 +2891,11 @@ func (s *V1Service) reconcileChatGPTQuota(ctx context.Context, tokenID, accessTo
 	}
 	data, err := s.chatgpt.FetchImageQuota(ctx, accessToken)
 	if err != nil || boolValueWithDefault(data["auth_failed"], false) {
+		return
+	}
+	// An unknown read (403/429/timeout) right after a successful render must not
+	// clobber the balance with a bogus 0 or 限额 an account that just worked.
+	if boolValueWithDefault(data["unknown"], false) {
 		return
 	}
 	rem, exhausted := chatgptRemaining(data)

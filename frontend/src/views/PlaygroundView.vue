@@ -82,7 +82,7 @@ const familyPreset = computed(() => {
 const ratios = computed(() => {
   const fromModel = model.value?.ratios || []
   if (fromModel.length) return fromModel
-  return mode.value === 'video' ? ['16x9'] : ['1:1']
+  return mode.value === 'video' ? ['16:9'] : ['1:1']
 })
 // Firefly Image 5 instruct-edit derives the aspect ratio from the reference
 // image — hide the ratio picker (backend also omits aspectRatio) when a ref is

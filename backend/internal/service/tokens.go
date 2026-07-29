@@ -752,14 +752,46 @@ func (s *TokenService) checkPendingChatGPT(tokenID, accessToken string) {
 	}()
 	s.sem <- struct{}{}
 	defer func() { <-s.sem }()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
+	s.probeAndFinishChatGPT(ctx, tokenID, accessToken)
+}
 
+// probeAndFinishChatGPT probes a ChatGPT token's image_gen quota and writes the
+// terminal status. Shared by the import worker and the stale-pending reaper.
+//
+// Crucially it distinguishes a definitive "remaining==0" from an *unknown* read
+// (Cloudflare 403 / 429 / timeout — common when a big batch fires many probes
+// from one IP at once): only a definitive 0 sinks the account to 限额, while an
+// unknown read gets the benefit of the doubt and activates. Treating unknown as
+// exhausted was sidelining perfectly good freshly-registered accounts.
+func (s *TokenService) probeAndFinishChatGPT(ctx context.Context, tokenID, accessToken string) {
 	if s.chatgpt == nil {
 		s.finishPending(ctx, "chatgpt", tokenID, "active", false, nil)
 		return
 	}
-	data, err := s.chatgpt.FetchImageQuota(ctx, accessToken)
+	// Retry on unknown/transient reads with backoff so a rate-limited blip during
+	// a bulk import doesn't misjudge quota.
+	var data map[string]any
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		data, err = s.chatgpt.FetchImageQuota(ctx, accessToken)
+		if err != nil {
+			break
+		}
+		if boolValueWithDefault(data["auth_failed"], false) {
+			break
+		}
+		if !boolValueWithDefault(data["unknown"], false) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			s.finishPending(ctx, "chatgpt", tokenID, "active", false, nil)
+			return
+		case <-time.After(time.Duration(2*(attempt+1)) * time.Second):
+		}
+	}
 	if err != nil {
 		// network/proxy error — benefit of the doubt, activate.
 		s.finishPending(ctx, "chatgpt", tokenID, "active", false, nil)
@@ -767,6 +799,12 @@ func (s *TokenService) checkPendingChatGPT(tokenID, accessToken string) {
 	}
 	if boolValueWithDefault(data["auth_failed"], false) {
 		s.finishPending(ctx, "chatgpt", tokenID, "disabled", true, nil)
+		return
+	}
+	// Still unknown after retries — don't trust it as 0; activate so the account
+	// isn't stranded. A real per-generation probe will re-judge quota on use.
+	if boolValueWithDefault(data["unknown"], false) {
+		s.finishPending(ctx, "chatgpt", tokenID, "active", false, nil)
 		return
 	}
 	rem, exhausted := chatgptRemaining(data)
@@ -781,12 +819,81 @@ func (s *TokenService) checkPendingChatGPT(tokenID, accessToken string) {
 		reset = leonardoResetAfter("")
 	}
 	_, _ = s.tokens.Update(ctx, "chatgpt", tokenID, map[string]any{"cached_quota_reset_after": reset})
-	// remaining<=0(0 / 负数 / 未知)→ 置「限额」,池子不再调度,到点自动恢复。
+	// remaining<=0(0 / 负数)→ 置「限额」,池子不再调度,到点自动恢复。
 	status := "active"
 	if exhausted {
 		status = "quota"
 	}
 	s.finishPending(ctx, "chatgpt", tokenID, status, false, quotaMeta)
+}
+
+// RecheckPendingChatGPT re-probes a ChatGPT account that is still stuck in
+// pending (e.g. an import probe that never completed before a restart). Exported
+// for the maintenance reaper.
+func (s *TokenService) RecheckPendingChatGPT(ctx context.Context, tokenID, accessToken string) {
+	s.sem <- struct{}{}
+	defer func() { <-s.sem }()
+	s.probeAndFinishChatGPT(ctx, tokenID, accessToken)
+}
+
+// ReprobeStalePendingChatGPT re-probes ChatGPT accounts stuck in pending for
+// longer than `older` — e.g. an import whose off-thread probe was interrupted by
+// a process restart, which would otherwise leave a good account pending forever
+// (RecoverQuota only revives 限额, never pending). Each re-probe goes through the
+// shared semaphore so the sweep can't stampede OpenAI.
+func (s *TokenService) ReprobeStalePendingChatGPT(ctx context.Context, older time.Duration) {
+	if s.chatgpt == nil {
+		return
+	}
+	items, err := s.tokens.ListByPool(ctx, "chatgpt")
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-older)
+	for _, it := range items {
+		if it.Status != "pending" || it.Dead || strings.TrimSpace(it.Value) == "" {
+			continue
+		}
+		if it.UpdatedAt.After(cutoff) {
+			continue
+		}
+		id, token := it.ID, it.Value
+		go func() {
+			rctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			defer cancel()
+			s.RecheckPendingChatGPT(rctx, id, token)
+		}()
+	}
+}
+
+// ReprobeStalePendingAdobe re-runs the Adobe import worker for cookies stuck in
+// pending past `older` — a cookie→token exchange interrupted mid-flight (process
+// restart or a redis/network blip during import) otherwise strands the row as an
+// empty-email, unschedulable pending zombie forever (RecoverQuota only revives
+// 限额, never pending). The stored cookie lives on the refresh profile; each
+// re-probe self-limits through checkPendingAdobe's semaphore.
+func (s *TokenService) ReprobeStalePendingAdobe(ctx context.Context, older time.Duration) {
+	if s.adobe == nil {
+		return
+	}
+	items, err := s.tokens.ListByPool(ctx, "adobe")
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-older)
+	for _, it := range items {
+		if it.Status != "pending" || it.Dead {
+			continue
+		}
+		if it.UpdatedAt.After(cutoff) {
+			continue
+		}
+		prof, err := s.refresh.Get(ctx, it.ID)
+		if err != nil || prof == nil || strings.TrimSpace(prof.Cookie) == "" {
+			continue
+		}
+		go s.checkPendingAdobe(it.ID, prof.Cookie)
+	}
 }
 
 // chatgptRemaining normalizes OpenAI's image_gen remaining: the raw rate-limit
@@ -1224,8 +1331,13 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 		patch := map[string]any{}
 		meta := cloneJSONMap(item.Meta)
 		meta["cached_quota_at"] = int(time.Now().Unix())
+		unknown := boolValueWithDefault(data["unknown"], false)
 		rem, exhausted := chatgptRemaining(data)
-		meta["cached_quota_remaining"] = rem
+		// Only trust a definitive reading. An unknown read (403/429/timeout) must
+		// not clobber the cached balance with a bogus 0 nor sink the account.
+		if !unknown {
+			meta["cached_quota_remaining"] = rem
+		}
 		patch["meta"] = meta
 		resetAfter := strings.TrimSpace(stringValue(data["reset_after"]))
 		if resetAfter == "" {
@@ -1233,9 +1345,9 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 		}
 		patch["cached_quota_reset_after"] = resetAfter
 		item.CachedQuotaResetAfter = resetAfter
-		// remaining<=0(负数/未知/0)→ 限额;>0 且当前是 quota → 恢复 active。
-		// auth 失效已在上面置死,这里不再改它的状态。
-		if !authFailed {
+		// remaining<=0(负数/0)→ 限额;>0 且当前是 quota → 恢复 active。unknown 时
+		// 不动状态(疑罪从无)。auth 失效已在上面置死,这里不再改它的状态。
+		if !authFailed && !unknown {
 			if exhausted {
 				patch["status"] = "quota"
 			} else if item.Status == "quota" {

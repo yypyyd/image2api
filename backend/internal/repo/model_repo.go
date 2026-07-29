@@ -3,6 +3,8 @@ package repo
 import (
 	"context"
 	"encoding/json"
+	"strconv"
+	"strings"
 	"time"
 
 	"backend/internal/model"
@@ -65,6 +67,36 @@ func JSONStrings(v datatypes.JSON) []string {
 		return out
 	}
 	return []string{}
+}
+
+// CanonicalRatio normalizes the two ratio spellings accepted by generation
+// inputs to the single W:H spelling exposed by every model-discovery endpoint.
+// Only numeric ratios are rewritten, so unrelated values are left untouched.
+func CanonicalRatio(value string) string {
+	value = strings.TrimSpace(value)
+	left, right, ok := strings.Cut(strings.ToLower(value), "x")
+	if !ok || strings.Contains(right, "x") {
+		return value
+	}
+	if _, err := strconv.Atoi(strings.TrimSpace(left)); err != nil {
+		return value
+	}
+	if _, err := strconv.Atoi(strings.TrimSpace(right)); err != nil {
+		return value
+	}
+	return strings.TrimSpace(left) + ":" + strings.TrimSpace(right)
+}
+
+func CanonicalRatios(values []string) []string {
+	out := make([]string, len(values))
+	for i, value := range values {
+		out[i] = CanonicalRatio(value)
+	}
+	return out
+}
+
+func JSONRatios(v datatypes.JSON) []string {
+	return CanonicalRatios(JSONStrings(v))
 }
 
 func (r *ModelRepository) Create(ctx context.Context, item *model.ModelConfig) error {

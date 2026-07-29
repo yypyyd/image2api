@@ -30,7 +30,11 @@ func (h *V1Handler) Models(c *gin.Context) {
 	}
 	_ = principal
 
-	items, err := h.v1.ListModels(c.Request.Context())
+	// Keep the default response strictly OpenAI-compatible. Some downstream
+	// model importers reject otherwise valid entries when they contain extension
+	// fields. Capability metadata remains available as an explicit opt-in.
+	extended := strings.EqualFold(strings.TrimSpace(c.Query("extended")), "true") || c.Query("extended") == "1"
+	items, err := h.v1.ListModels(c.Request.Context(), extended)
 	if err != nil {
 		openaiError(c, http.StatusInternalServerError, "server_error", "", "failed to load models")
 		return

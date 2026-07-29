@@ -161,6 +161,15 @@ func (m *MaintenanceService) tick(ctx context.Context) {
 		//     means the membership lapsed → disable+dead; otherwise re-sync the
 		//     credits balance and 恢复时间 (from the credits' weekly reset).
 		m.tokenSvc.RefreshGrokLiveness(ctx)
+		// 1f. Re-probe ChatGPT accounts stuck in pending past stalePending — an
+		//     import probe interrupted by a restart (or that never finished) would
+		//     otherwise strand a good freshly-registered account forever, since
+		//     RecoverQuota only revives 限额, never pending.
+		m.tokenSvc.ReprobeStalePendingChatGPT(ctx, m.stalePending)
+		// 1g. Same stale-pending safety net for Adobe: a cookie→token exchange
+		//     interrupted mid-flight (process restart / redis blip during import)
+		//     would otherwise strand the row as an empty-email pending zombie.
+		m.tokenSvc.ReprobeStalePendingAdobe(ctx, m.stalePending)
 	}
 
 	// 2. Auto-renew Adobe cookies whose refresh interval has elapsed.

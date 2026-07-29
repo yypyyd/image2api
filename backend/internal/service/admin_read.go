@@ -93,7 +93,7 @@ func (s *AdminReadService) ModelsView(ctx context.Context) ([]map[string]any, er
 			"name":                  item.Name,
 			"provider":              item.Provider,
 			"enabled":               item.Enabled,
-			"ratios":                repo.JSONStrings(item.Ratios),
+			"ratios":                repo.JSONRatios(item.Ratios),
 			"prices":                map[string]any(item.Prices),
 			"resolutions":           repo.JSONStrings(item.Resolutions),
 			"image_to_image":        item.ImageToImage,

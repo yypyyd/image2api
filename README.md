@@ -92,7 +92,7 @@
 #### 🔌 OpenAI 兼容
 - 文本对话 `/v1/chat/completions`(普通 JSON + SSE 流式,兼容 OpenAI SDK)
 - 可直接复用后台现有 ChatGPT 账号池并使用真实模型名(`gpt-5-5-mini` / `gpt-5-5-thinking`),也可复用 Grok 账号池做文本对话(免费 Basic 号即可,fast 模式),或走自定义 OpenAI 兼容上游
-- 文生图 `/v1/images/generations` · 图生图 `/v1/images/edits`(multipart 上传参考图) · 视频 `/v1/videos`(Sora 式异步:创建→轮询→`/content` 下载) · `/v1/models`
+- 文生图 `/v1/images/generations` · 图生图 `/v1/images/edits`(multipart 上传参考图) · 视频 `/v1/videos`(Sora 式异步:创建→轮询→`/content` 下载) · `/v1/models`(默认严格 OpenAI 字段；`?extended=true` 可取能力元数据，比例统一为 `W:H`)
 - **严格 OpenAI 入参**:`size` **同时决定比例 + 分辨率档**(图像看长边 → 1K/2K/4K,视频看短边 → 720p/1080p),改个 `base_url` + `api_key` 即接现有 OpenAI SDK
 - 图片结果 **base64 直返**,服务端不留存文件,隐私友好;站内 **/docs** 附「分辨率对照表」直接查 `size` 该传什么
 
