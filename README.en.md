@@ -92,7 +92,7 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 #### 🔌 OpenAI Compatible
 - Text-to-image `/v1/images/generations` · image-to-image `/v1/images/edits` (multipart ref upload) · video `/v1/videos` (Sora-style async: create → poll → `/content`) · `/v1/models` (strict OpenAI fields by default; `?extended=true` opts into capability metadata with ratios normalized as `W:H`)
 - **Strict OpenAI params**: `size` drives **both aspect ratio + resolution tier** (images by long edge → 1K/2K/4K, videos by short edge → 720p/1080p) — just swap `base_url` + `api_key` into an existing OpenAI SDK
-- Image results returned **inline as base64** — nothing stored server-side, privacy-friendly; the in-app **/docs** ships a size ↔ tier reference table
+- Image results default to **URLs**. Ordinary API requests do not download, base64-encode, or store the upstream asset; explicitly request `response_format=b64_json` for inline bytes. The in-app **/docs** ships a size ↔ tier reference table
 
 #### 🔁 Account Pools + Smart Failover
 - Round-robin scheduling across the pool; one bad account doesn't break the whole
@@ -159,7 +159,7 @@ curl https://your-domain/v1/images/edits \
   -F model="seedream-4.5" -F prompt="make it cyberpunk" -F image=@input.png
 ```
 
-Images default to the OpenAI-style `{ "created": ..., "data": [{ "b64_json": "..." }] }` response (raw base64, no `data:` prefix, nothing stored server-side); explicitly pass `"response_format":"url"` for a URL response. **Video** is async: `POST /v1/videos` → poll `GET /v1/videos/{id}` until `completed` → `GET /v1/videos/{id}/content` for the mp4. Full parameters are documented on the in-app **/docs** page.
+Images default to the OpenAI-style `{ "created": ..., "data": [{ "url": "..." }] }` response. Ordinary requests return the upstream URL without downloading, base64-encoding, or storing the asset; authenticated ChatGPT/Grok assets use this gateway's streaming `/content` URL. Explicitly pass `"response_format":"b64_json"` for inline image data. **Video** is async: `POST /v1/videos` → poll `GET /v1/videos/{id}` until `completed` → `GET /v1/videos/{id}/content` for the mp4. Full parameters are documented on the in-app **/docs** page.
 
 ## 🚀 Deployment
 

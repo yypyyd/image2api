@@ -103,7 +103,7 @@ func (h *V1Handler) ChatCompletions(c *gin.Context) {
 
 // ImageGenerations — OpenAI POST /v1/images/generations (text-to-image only).
 // Accepts exactly OpenAI's fields; size→aspect ratio and quality→resolution tier
-// are mapped server-side. Returns {created, data:[{b64_json}]}.
+// are mapped server-side. Returns {created, data:[{url}]} by default.
 func (h *V1Handler) ImageGenerations(c *gin.Context) {
 	principal, err := h.v1.Authenticate(c.Request.Context(), c.GetHeader("Authorization"))
 	if err != nil {
@@ -130,6 +130,7 @@ func (h *V1Handler) ImageGenerations(c *gin.Context) {
 	resp, err := h.v1.PrepareImageRequest(c.Request.Context(), principal, service.V1ImageRequest{
 		Model:          body.Model,
 		Prompt:         body.Prompt,
+		RequestID:      imageRequestID(c),
 		N:              body.N,
 		Size:           body.Size,
 		Quality:        body.Quality,
@@ -145,7 +146,7 @@ func (h *V1Handler) ImageGenerations(c *gin.Context) {
 
 // ImageEdits — OpenAI POST /v1/images/edits (image-to-image). multipart/form-data
 // only: image / image[] file uploads (+ optional mask), prompt, model, n, size,
-// quality. Files become reference images. Returns {created, data:[{b64_json}]}.
+// quality. Files become reference images. Returns {created, data:[{url}]} by default.
 func (h *V1Handler) ImageEdits(c *gin.Context) {
 	principal, err := h.v1.Authenticate(c.Request.Context(), c.GetHeader("Authorization"))
 	if err != nil {
@@ -169,6 +170,7 @@ func (h *V1Handler) ImageEdits(c *gin.Context) {
 	resp, err := h.v1.PrepareImageRequest(c.Request.Context(), principal, service.V1ImageRequest{
 		Model:           c.PostForm("model"),
 		Prompt:          c.PostForm("prompt"),
+		RequestID:       imageRequestID(c),
 		N:               n,
 		Size:            c.PostForm("size"),
 		Quality:         c.PostForm("quality"),
@@ -181,6 +183,27 @@ func (h *V1Handler) ImageEdits(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, openaiImageResponse(resp))
+}
+
+func (h *V1Handler) GetImageTask(c *gin.Context) {
+	principal, err := h.v1.Authenticate(c.Request.Context(), c.GetHeader("Authorization"))
+	if err != nil {
+		h.writeAuthError(c, err)
+		return
+	}
+	resp, err := h.v1.ImageTask(c.Request.Context(), principal, c.Query("request_id"))
+	if err != nil {
+		h.writeV1Error(c, err, nil)
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+func imageRequestID(c *gin.Context) string {
+	if value := strings.TrimSpace(c.GetHeader("Idempotency-Key")); value != "" {
+		return value
+	}
+	return strings.TrimSpace(c.GetHeader("X-Request-ID"))
 }
 
 // CreateVideo — OpenAI POST /v1/videos. Creates an async job and returns the
@@ -430,6 +453,8 @@ func (h *V1Handler) writeV1Error(c *gin.Context, err error, payload map[string]a
 		openaiError(c, http.StatusUnauthorized, "insufficient_quota", "insufficient_quota", err.Error())
 	case errors.Is(err, service.ErrProviderTemporary):
 		openaiError(c, http.StatusServiceUnavailable, "server_error", "", err.Error())
+	case errors.Is(err, service.ErrImageTaskNotFound):
+		openaiError(c, http.StatusNotFound, "invalid_request_error", "not_found", err.Error())
 	case errors.Is(err, service.ErrConcurrencyFull), errors.Is(err, service.ErrUserConcurrencyFull):
 		openaiError(c, http.StatusTooManyRequests, "rate_limit_error", "rate_limit_exceeded", err.Error())
 	case errors.Is(err, service.ErrVideoJobNotFound):

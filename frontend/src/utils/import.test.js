@@ -11,6 +11,11 @@ function jwt(email) {
   })}.signature`
 }
 
+function grokJwt(sessionId) {
+  const encode = (value) => Buffer.from(JSON.stringify(value)).toString('base64url')
+  return `${encode({ alg: 'none' })}.${encode({ session_id: sessionId })}.signature`
+}
+
 test('parses a CPA codex auth file', () => {
   const token = jwt('cpa@example.com')
   const items = parseImportInput(JSON.stringify({
@@ -56,7 +61,27 @@ test('rejects Agent Identity-only files with an actionable message', () => {
     auth_mode: 'agentIdentity',
     agent_private_key: 'private',
   }))
-  assert.throws(() => parseImportFileBytes(data, 'agent.json'), /没有可用的 ChatGPT access_token/)
+  assert.throws(() => parseImportFileBytes(data, 'agent.json'), /没有识别到可导入的账号凭据/)
+})
+
+test('parses grok2api sso pool exports', () => {
+  const basicA = grokJwt('basic-a')
+  const basicB = grokJwt('basic-b')
+  const superToken = grokJwt('super-a')
+  const data = strToU8(JSON.stringify({
+    ssoBasic: [
+      { token: basicA, note: '', tags: ['free'] },
+      { token: basicB, note: 'second', tags: [] },
+      { token: basicA, note: 'duplicate', tags: [] },
+      { token: 'not-a-grok-token', note: 'invalid', tags: [] },
+    ],
+    ssoSuper: [{ token: superToken, note: '', tags: [] }],
+  }))
+  assert.deepEqual(parseImportFileBytes(data, 'grok2api_token.json'), [
+    { type: 'grok', value: basicA },
+    { type: 'grok', value: basicB },
+    { type: 'grok', value: superToken },
+  ])
 })
 
 test('keeps existing credential types in mixed JSON arrays', () => {

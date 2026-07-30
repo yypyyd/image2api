@@ -54,8 +54,8 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 		seconds = 10
 	}
 
-	// Only the conversations/new submit egresses via the proxy; reference-frame
-	// upload and the mp4 download run on the local IP.
+	// Separate clients keep the long-lived submit and media operations isolated.
+	// With a Grok proxy configured, both use it so the full flow stays reachable.
 	submitClient, err := c.newTLSClient()
 	if err != nil {
 		return nil, nil, err
@@ -68,9 +68,8 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 	// Self-heal the x-statsig-id anti-bot challenge for THIS session before the
 	// gated submit. Without it the header falls back to the static defaults,
 	// which go stale on a new grok web build and make conversations/new answer
-	// 403 (anti-bot). Fetch on the local IP (the proxy is rotating, so pinning
-	// the seed to a proxy egress IP is pointless). Failure is non-fatal
-	// (statsigID then uses defaults).
+	// 403 (anti-bot). The challenge uses the configured Grok proxy when present;
+	// failure is non-fatal (statsigID then uses defaults).
 	c.ensureChallenge(ctx, directClient, token)
 
 	// Image-to-video: upload each reference frame and collect its asset URL.

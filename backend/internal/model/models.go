@@ -83,6 +83,7 @@ type ShowcaseItem struct {
 
 type EventLog struct {
 	ID         string         `gorm:"primaryKey;size:32"`
+	RequestID  string         `gorm:"size:191;index"`
 	TS         time.Time      `gorm:"index;not null"`
 	Kind       string         `gorm:"size:32;index;not null"`
 	Status     string         `gorm:"size:32;index;not null"`

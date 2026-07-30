@@ -50,7 +50,7 @@ const imageParams = [
   ['prompt', 'string', '必填', '文字描述'],
   ['size', 'string', '可选', '宽x高,如 "1024x1024"。同时决定「比例」+「分辨率档」(按长边)。具体怎么填见下方对照表;留空 = 1:1 · 2K'],
   ['quality', 'string', '可选', 'low / medium / high / auto,映射到模型支持的分辨率档'],
-  ['response_format', 'string', '可选', 'b64_json(默认)或 url'],
+  ['response_format', 'string', '可选', 'url(默认)或 b64_json'],
 ]
 const editParams = [
   ['image', 'file', '必填', '输入图;多张参考图重复 image[] 字段(multipart 文件上传)'],
@@ -58,7 +58,7 @@ const editParams = [
   ['model', 'string', '必填', '模型名(别名优先,需支持图生图)'],
   ['size', 'string', '可选', '同图像:决定比例 + 分辨率档(见下方对照表)'],
   ['quality', 'string', '可选', 'low / medium / high / auto'],
-  ['response_format', 'string', '可选', 'b64_json(默认)或 url'],
+  ['response_format', 'string', '可选', 'url(默认)或 b64_json'],
 ]
 const videoParams = [
   ['model', 'string', '必填', '模型名(别名优先),见上表(视频)'],
@@ -482,7 +482,7 @@ async function copy(text) {
       <h2 class="text-lg font-semibold mb-3">响应 & 计费</h2>
       <div class="card p-6 space-y-3 text-sm text-white/70">
         <p><strong class="text-white/90">文本</strong>返回标准 <code class="text-white/85 font-mono">chat.completion</code>;传 <code class="text-white/85 font-mono">stream:true</code> 时返回 <code class="text-white/85 font-mono">chat.completion.chunk</code> SSE,并以 <code class="text-white/85 font-mono">data: [DONE]</code> 结束。号池型文本模型(ChatGPT / Grok)的流式为整段一次性下发的模拟流;接 OpenAI 兼容上游的模型为真流式透传。</p>
-        <p><strong class="text-white/90">图像</strong>(generations / edits)默认返回 OpenAI 图片格式:<code class="text-white/85 font-mono">{{ '{ "created": ..., "data": [{ "b64_json": "..." }] }' }}</code>。显式传 <code class="text-white/85 font-mono">response_format:"url"</code> 可返回产物 URL;URL 可能过期,请尽快下载或转存。</p>
+        <p><strong class="text-white/90">图像</strong>(generations / edits)默认返回 OpenAI URL 格式:<code class="text-white/85 font-mono">{{ '{ "created": ..., "data": [{ "url": "..." }] }' }}</code>。网关不会下载普通请求的上游图片;如需内联内容可显式传 <code class="text-white/85 font-mono">response_format:"b64_json"</code>。URL 可能过期,请尽快下载或转存。</p>
         <p><strong class="text-white/90">视频</strong>(异步,Sora 风格三步):</p>
         <ol class="list-decimal list-inside space-y-1 text-white/65 pl-1">
           <li><code class="text-white/85 font-mono">POST /v1/videos</code> 立即返回任务对象 <code class="text-white/85 font-mono">{{ '{ "id": "...", "object": "video", "status": "queued", ... }' }}</code></li>

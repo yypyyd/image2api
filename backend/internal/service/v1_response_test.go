@@ -17,7 +17,7 @@ func TestNormalizeImageResponseFormat(t *testing.T) {
 		want    string
 		wantErr bool
 	}{
-		{name: "default is base64", want: "b64_json"},
+		{name: "default is url", want: "url"},
 		{name: "base64", input: "b64_json", want: "b64_json"},
 		{name: "url", input: " URL ", want: "url"},
 		{name: "invalid", input: "bytes", wantErr: true},

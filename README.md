@@ -91,10 +91,10 @@
 
 #### 🔌 OpenAI 兼容
 - 文本对话 `/v1/chat/completions`(普通 JSON + SSE 流式,兼容 OpenAI SDK)
-- 可直接复用后台现有 ChatGPT 账号池并使用真实模型名(`gpt-5-5-mini` / `gpt-5-5-thinking`),也可复用 Grok 账号池做文本对话(免费 Basic 号即可,fast 模式),或走自定义 OpenAI 兼容上游
+- 可直接复用后台现有 ChatGPT 账号池并使用真实模型名(`gpt-5-5-mini` / `gpt-5-5-thinking`);Grok 账号既可运行 Web fast 对话,也会按需用 SSO 自动授权 Grok Build OAuth,通过真实 `grok-4.5` 模型对话;还可走自定义 OpenAI 兼容上游
 - 文生图 `/v1/images/generations` · 图生图 `/v1/images/edits`(multipart 上传参考图) · 视频 `/v1/videos`(Sora 式异步:创建→轮询→`/content` 下载) · `/v1/models`(默认严格 OpenAI 字段；`?extended=true` 可取能力元数据，比例统一为 `W:H`)
 - **严格 OpenAI 入参**:`size` **同时决定比例 + 分辨率档**(图像看长边 → 1K/2K/4K,视频看短边 → 720p/1080p),改个 `base_url` + `api_key` 即接现有 OpenAI SDK
-- 图片结果 **base64 直返**,服务端不留存文件,隐私友好;站内 **/docs** 附「分辨率对照表」直接查 `size` 该传什么
+- 图片结果默认返回 **URL**,普通请求不下载、不做 base64 编码、不留存文件;显式传 `response_format=b64_json` 时才内联图片。携带 `Idempotency-Key` 的请求会把结果保存到账号私有存储,可在网关超时后通过任务查询恢复;站内 **/docs** 附「分辨率对照表」直接查 `size` 该传什么
 
 #### 🔁 多账号池 + 智能故障转移
 - 账号池调度,单账号出错不影响整体
@@ -130,7 +130,7 @@
 
 #### 🛠️ 管理后台
 - 概览看板(趋势 / DAU / 失败 Top / 消费榜)
-- 模型管理(普通价 + 代理价 + 别名) · 账号管理(批量导入 / 去重 / 额度，支持 CPA JSON/ZIP 与 Sub2API 聚合 JSON) · **并发分组** · **订单管理**(筛选 / 搜索 / 分页) · 全站日志 · 用户管理(设为代理 / 分配并发组 / 看累计充值 / 违禁触发次数) · CDK · 图片管理(多选批量删除 / zip 打包下载) · 展示位 · **站点公告** · 站点配置(含易支付、去AI特征开关与附加价格)
+- 模型管理(普通价 + 代理价 + 别名) · 账号管理(批量导入 / 去重 / 额度，支持 CPA JSON/ZIP、Sub2API 聚合 JSON 与 grok2api JSON) · **并发分组** · **订单管理**(筛选 / 搜索 / 分页) · 全站日志 · 用户管理(设为代理 / 分配并发组 / 看累计充值 / 违禁触发次数) · CDK · 图片管理(多选批量删除 / zip 打包下载) · 展示位 · **站点公告** · 站点配置(含易支付、去AI特征开关与附加价格)
 - **违禁词管理**:后台增删违禁词(分页 + 多选批量删除),提示词命中即拦截(画图台 + API,不区分大小写),按词 / 按用户统计触发次数
 
 **🧰 工程亮点**:tls-client(Chrome JA3/JA4 指纹)稳定穿透 Cloudflare · 媒体存 S3/RustFS 经鉴权代理分发 + 保留期清理 · 自愈式维护轮询(恢复额度 / 刷新凭据 / 清理僵死任务并退款) · 一条命令 Docker 部署(TLS 交给你的反代)。
@@ -142,7 +142,7 @@
 | **Adobe Firefly** | firefly-image-5 · firefly-gpt-image-2 · flux-kontext-max · firefly-video · firefly-ray · gemini-veo31 | 图像 / 视频 |
 | **OpenAI** | gpt-image-2 | 图像 |
 | **Runway** | runway-gen4-turbo · nano-banana-2(Nano Banana 2) | 视频 / 图像 |
-| **Grok（grok.com）** | grok-video（imagine 文生 / 图生视频) · grok-imagine-image（Lite 生图,免费号可用） · grok-chat（文本,免费号可用） | 文本 / 图像 / 视频 |
+| **Grok（Web + Build）** | grok-4.5（SSO 自动换取 Build OAuth） · grok-chat-fast（Web） · grok-video · grok-imagine-image | 文本 / 图像 / 视频 |
 | **Leonardo.ai** | seedream-4.5 | 图像 |
 | **Krea.ai** | flux-klein-2 | 图像 |
 | **Imagine.art** | imagine-1.5 · imagine-1.5pro | 图像 |
@@ -161,6 +161,7 @@ curl https://你的域名/v1/chat/completions \
 # 文生图 —— 纯 OpenAI 参数:size 同时决定比例 + 分辨率档(长边 <1800→1K / <3500→2K / ≥3500→4K)
 curl https://你的域名/v1/images/generations \
   -H "Authorization: Bearer sk-xxxx" \
+  -H "Idempotency-Key: image-request-001" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-image-2",
@@ -168,19 +169,23 @@ curl https://你的域名/v1/images/generations \
     "size": "2048x2048"
   }'
 
+# 同步请求遇到 524/504 后按原幂等编号查询,直到 status 为 completed 或 failed
+curl 'https://你的域名/v1/images/tasks?request_id=image-request-001' \
+  -H "Authorization: Bearer sk-xxxx"
+
 # 图生图 —— multipart 上传参考图(可多张 image[])
 curl https://你的域名/v1/images/edits \
   -H "Authorization: Bearer sk-xxxx" \
   -F model="seedream-4.5" -F prompt="改成赛博朋克风格" -F image=@input.png
 ```
 
-文本请求原样透传 OpenAI Chat Completions 字段,支持普通 JSON 与 `stream:true` SSE。文本按管理端配置的每请求固定积分收费;上游业务错误、空响应或流未正常结束会记失败并自动退款。图片默认返回 OpenAI 风格 `{ "created": ..., "data": [{ "b64_json": "..." }] }`(原始 base64,无 `data:` 前缀,服务端不留存);显式传 `"response_format":"url"` 可改为 URL 响应。**视频**走异步:`POST /v1/videos` 建任务 → 轮询 `GET /v1/videos/{id}` 至 `completed` → `GET /v1/videos/{id}/content` 取 mp4。完整参数见站内 **/docs** 文档页。
+文本请求原样透传 OpenAI Chat Completions 字段,支持普通 JSON 与 `stream:true` SSE。文本按管理端配置的每请求固定积分收费;上游业务错误、空响应或流未正常结束会记失败并自动退款。图片默认返回 OpenAI 风格 `{ "created": ..., "data": [{ "url": "..." }] }`;普通请求直接返回上游 URL,不下载、不做 base64 编码、不留存。ChatGPT/Grok 等鉴权素材会返回本站 `/content` 流式代理 URL。显式传 `"response_format":"b64_json"` 才返回内联图片。携带 `Idempotency-Key` 时结果保存到账号私有存储,同步响应遇到网关超时后可轮询 `GET /v1/images/tasks?request_id=...` 恢复。**视频**走异步:`POST /v1/videos` 建任务 → 轮询 `GET /v1/videos/{id}` 至 `completed` → `GET /v1/videos/{id}/content` 取 mp4。完整参数见站内 **/docs** 文档页。
 
 ## 🚀 部署
 
 > 域名 + HTTPS 由你自己的反向代理处理(本项目不内置证书签发)。
 
-**Docker(推荐)**:`docker compose up -d --build` 一条命令拉起 PostgreSQL + Redis + RustFS + 后端 + 前端(nginx **HTTP 监听容器 2000 端口**),把你的反向代理指到 `http://<本机>:2000`(端口用 `WEB_PORT` 改;要改密码 / 密钥 / `CORS_ORIGINS`(反代走 HTTPS 时把 `COOKIE_SECURE` 设为 `true`),直接改 `docker-compose.yml` 里对应值即可)。
+**Docker(推荐)**:`docker compose up -d --build` 一条命令拉起 PostgreSQL + Redis + RustFS + 后端 + 前端(nginx **HTTP 监听容器 2000 端口**),把你的反向代理指到 `http://<本机>:2000`(端口用 `WEB_PORT` 改;要改密码 / 密钥 / `CORS_ORIGINS`(反代走 HTTPS 时把 `COOKIE_SECURE` 设为 `true`),直接改 `docker-compose.yml` 里对应值即可)。服务器无法直连 Grok/xAI 时可设置 `GROK_PROXY_URL=http://proxy:port`;该代理仅用于 Grok，并覆盖 Web 账号校验、Statsig、生成、媒体下载以及 Build OAuth/对话链路。Web 链路仍兼容原有 SOCKS 配置,Build OAuth/对话使用 HTTP(S) 代理。
 
 也可**从源码手动构建**,自备 **PostgreSQL · Redis · RustFS(或任意 S3)· 反向代理**:
 
@@ -258,7 +263,7 @@ backend/                       后端源码(Go)
 │   │   ├── adobe/             Adobe Firefly(tls-client 指纹)
 │   │   ├── chatgpt/           OpenAI(含 PoW / turnstile)
 │   │   ├── runway/            Runway 视频 + Nano Banana 图像
-│   │   ├── grok/              Grok(grok.com,statsig 伪造,文本 / 生图 / 视频)
+│   │   ├── grok/              Grok Web(statsig) + SSO→Build OAuth(grok-4.5)
 │   │   ├── leonardo/          Leonardo
 │   │   ├── krea/              Krea
 │   │   ├── imagine/           Imagine.art

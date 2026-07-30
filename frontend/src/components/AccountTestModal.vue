@@ -4,7 +4,7 @@ import { api, jsonBody } from '../api'
 import Icon from './Icon.vue'
 import SelectMenu from './SelectMenu.vue'
 
-// 账号生成测试:固定使用某个 provider 账号跑一次生成(图像或视频)。
+// 账号能力测试:固定使用某个 provider 账号跑一次文本、图像或视频请求。
 // 模型列表由 AccountsView 打开页面时预加载好传入,弹窗即开即用。
 const props = defineProps({
   account: { type: Object, required: true }, // { pool, id, email, type }
@@ -12,19 +12,20 @@ const props = defineProps({
 })
 const emit = defineEmits(['close'])
 
-// 该账号所属 provider 的全部模型(图像 + 视频)。
+// 该账号所属 provider 的全部模型。
 const models = computed(() =>
-  props.allModels.filter((m) => m.type !== 'text' && (m.provider || '') === props.account.pool))
+  props.allModels.filter((m) => (m.provider || '') === props.account.pool))
 const selectedModel = ref('')
 if (models.value.length) selectedModel.value = models.value[0].alias || models.value[0].id
 
 const modelOptions = computed(() => models.value.map((m) => ({
   value: m.alias || m.id,
-  label: `${m.alias || m.id}${m.type === 'video' ? ' · 视频' : ''}`,
+  label: `${m.alias || m.id}${m.type === 'video' ? ' · 视频' : m.type === 'text' ? ' · 对话' : ''}`,
 })))
 const currentModel = computed(() =>
   models.value.find((m) => (m.alias || m.id) === selectedModel.value) || null)
 const isVideo = computed(() => currentModel.value?.type === 'video')
+const isText = computed(() => currentModel.value?.type === 'text')
 
 const prompt = ref('a cute cat sitting on a desk, studio lighting')
 
@@ -33,6 +34,7 @@ const status = ref('')
 const error = ref('')
 const resultUrl = ref('')
 const resultKind = ref('')
+const resultText = ref('')
 
 // Gateway-timeout recovery — same policy as TestModal: the backend detaches the
 // render from the request, so on a 524/504 we keep polling /jobs/mine?source=admin.
@@ -53,9 +55,10 @@ async function run() {
   if (!prompt.value.trim()) { error.value = '请输入指令'; return }
   busy.value = true
   error.value = ''
-  status.value = isVideo.value ? '正在生成视频 (约 1–3 分钟)…' : '正在生成…'
+  status.value = isVideo.value ? '正在生成视频 (约 1–3 分钟)…' : isText.value ? '正在对话…' : '正在生成…'
   resultUrl.value = ''
   resultKind.value = ''
+  resultText.value = ''
   const m = currentModel.value
   const payload = {
     model: selectedModel.value,
@@ -67,10 +70,11 @@ async function run() {
   if (isVideo.value) payload.duration = firstDuration(m)
   recoverSubmitTs = Date.now()
   const r = await api('/test', jsonBody('POST', payload))
-  if (r.ok && r.data?.url) {
+  if (r.ok && (r.data?.url || r.data?.content)) {
     busy.value = false
     resultUrl.value = r.data.url
-    resultKind.value = r.data.kind || (isVideo.value ? 'video' : 'image')
+    resultText.value = r.data.content || ''
+    resultKind.value = r.data.kind || (isVideo.value ? 'video' : isText.value ? 'text' : 'image')
     status.value = `完成 · ${r.data.provider} · ${(r.data.elapsed_ms / 1000).toFixed(1)}s`
   } else if (GATEWAY_TIMEOUT.has(r.status)) {
     status.value = isVideo.value ? '生成视频中 (约 1–3 分钟)…' : '生成中…'
@@ -120,7 +124,7 @@ async function recover() {
     <div class="card !shadow-2xl my-12 w-full max-w-lg">
       <div class="px-5 py-4 border-b border-white/[0.06] flex items-center justify-between">
         <div class="min-w-0">
-          <h2 class="text-sm font-semibold">账号生成测试</h2>
+          <h2 class="text-sm font-semibold">账号能力测试</h2>
           <div class="text-xs text-white/45 font-mono truncate">{{ account.email || account.id }} · {{ account.pool }}</div>
         </div>
         <button @click="emit('close')" class="text-white/40 hover:text-white transition-colors">
@@ -141,11 +145,13 @@ async function recover() {
         </div>
 
         <button @click="run" :disabled="busy || !models.length" class="btn-primary w-full">
-          <Icon name="spark" class="w-4 h-4" /> {{ busy ? (isVideo ? '生成中…(请耐心等待)' : '生成中…') : '生成' }}
+          <Icon name="spark" class="w-4 h-4" /> {{ busy ? (isVideo ? '生成中…(请耐心等待)' : isText ? '对话中…' : '生成中…') : (isText ? '发送' : '生成') }}
         </button>
 
         <p v-if="status" class="text-xs text-white/55">{{ status }}</p>
         <p v-if="error" class="text-xs text-rose-300 break-all">{{ error }}</p>
+
+        <div v-if="resultText" class="rounded-xl ring-1 ring-white/10 bg-white/[0.03] p-4 text-sm text-white/80 whitespace-pre-wrap break-words">{{ resultText }}</div>
 
         <div v-if="resultUrl" class="rounded-xl ring-1 ring-white/10 bg-white/[0.03] overflow-hidden grid place-items-center min-h-[220px]">
           <video v-if="resultKind === 'video'" :src="resultUrl" controls autoplay

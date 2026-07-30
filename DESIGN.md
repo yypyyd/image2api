@@ -12,11 +12,63 @@
 
 ## Account credential import
 
-The account-management import parser accepts pasted credentials as well as CPA (`type: codex`) JSON, CPA multi-account ZIP archives, and Sub2API account bundles. These formats are normalized in the browser to the existing `{ type: "openai", value: accessToken }` representation, so persistence, duplicate-account updates, and asynchronous quota checks continue to use the established ChatGPT token import endpoint.
+The account-management import parser accepts pasted credentials as well as CPA (`type: codex`) JSON, CPA multi-account ZIP archives, Sub2API account bundles, and grok2api `sso*` pool exports. These formats are normalized in the browser to provider-specific `{ type, value }` items, so persistence, duplicate-account updates, and asynchronous quota checks continue to use the established provider import endpoints.
 
-ZIP processing is memory-only and never extracts paths to disk. It accepts JSON entries only, caps the archive at 1,000 JSON files, each uncompressed JSON entry at 2 MiB, and total uncompressed JSON data at 20 MiB. Duplicate credentials are removed before requests are sent. Agent Identity-only records are skipped because the image provider requires a ChatGPT `access_token`; when a file contains no usable access token, the UI reports that limitation explicitly.
+ZIP processing is memory-only and never extracts paths to disk. It accepts JSON entries only, caps the archive at 1,000 JSON files, each uncompressed JSON entry at 2 MiB, and total uncompressed JSON data at 20 MiB. Duplicate credentials are removed before requests are sent. Agent Identity-only records are skipped because the image provider requires a ChatGPT `access_token`; when a file contains no supported credential, the UI reports that limitation explicitly.
 
 ## Change history
+
+### 2026-07-30 - URL-first image relay
+
+**Change**: `/v1/images/generations` and `/v1/images/edits` now default to `data[].url`. Ordinary API requests leave provider media upstream and skip gateway downloads, base64 encoding, and object-storage writes. Callers may still explicitly request `response_format=b64_json`.
+
+**Reason**: The gateway is being optimized as a lightweight 2api relay. Returning large base64 payloads by default multiplies memory use and bandwidth under high concurrency without adding routing value.
+
+**Impact**: Clients that relied on the omitted `response_format` producing `b64_json` must either consume `data[].url` or explicitly request `b64_json`. Auth-gated ChatGPT/Grok assets continue to use the gateway's streaming `/content` URL. Requests carrying `Idempotency-Key` retain private persistence for timeout recovery.
+
+**Decision**: Make the low-copy URL path the default while retaining an explicit compatibility escape hatch; do not expose authenticated upstream URLs that downstream clients cannot fetch.
+
+### 2026-07-30 - Recover image results after gateway timeouts
+
+**Change**: API image requests may supply `Idempotency-Key`. Those requests store the completed image in private object storage and expose `GET /v1/images/tasks?request_id=...` for `in_progress`, `completed`, or `failed` recovery after a synchronous gateway timeout.
+
+**Reason**: A CDN can return `524` while the detached backend generation continues. Without a lookup contract, downstream clients mark a real in-flight job failed and may submit a duplicate generation.
+
+**Impact**: Requests without an idempotency key keep the existing no-store behavior. Recovery-enabled requests add one indexed event field and one private stored image; the original synchronous OpenAI response remains unchanged.
+
+**Security boundary**: Task lookup authenticates the API key, scopes the query to that key owner's user ID, image kind, and API source, and uses a parameterized database query. Request IDs are limited to 191 characters, and recovered image reads are capped at 32 MiB. A caller cannot use a known request ID to retrieve another user's task or media.
+
+**Decision**: Reuse the downstream idempotency key as the recovery identifier instead of exposing provider job IDs. This keeps provider details private and lets existing clients recover only the request they originally submitted.
+
+### 2026-07-30 - Grok Web SSO to Build OAuth
+
+**Change**: Added an unattended xAI Device OAuth conversion for existing Grok Web SSO accounts, renewable Build credentials stored in private account metadata, and a native `cli-chat-proxy.grok.com/v1/responses` text client for literal models such as `grok-4.5`.
+
+**Reason**: Grok Web uses mode-based `fast/auto/expert/heavy` requests and cannot select `grok-4.5` literally. The upstream grok2api implementation proves that a valid Web SSO session can authorize a separate Build OAuth credential without asking the operator to export CPA credentials.
+
+**Impact**: Existing Grok accounts are upgraded lazily on their first Build-model request. Web image/video and `grok-chat-*` behavior is unchanged. Access, refresh, and ID tokens are never included in account API responses. Refresh tokens are rotated before expiry; if refresh fails, the service retries the SSO conversion.
+
+**Decision**: Keep one visible Grok account row and store its linked Build credential in private metadata instead of introducing a second account pool. This preserves current scheduling, per-account pinning, imports, and administration while routing literal Build models separately from Web modes.
+
+### 2026-07-30 - Grok-only full-path proxy egress
+
+**Change**: Added the `GROK_PROXY_URL` environment fallback and applied a configured Grok proxy to session/quota probes, Statsig discovery, media upload, generation submits, polling, and artifact downloads.
+
+**Reason**: On networks where `grok.com` is blocked or DNS-poisoned, proxying only the generation submit still leaves account validation, anti-bot refresh, and result downloads unable to connect.
+
+**Impact**: Grok traffic uses the dedicated proxy whenever configured. Other providers retain their existing egress behavior, and Grok continues to connect directly when the setting is empty.
+
+**Decision**: Prefer a provider-specific environment variable over changing the shared `proxy.url`, preventing a Grok connectivity workaround from altering Adobe, Runway, or other provider routes.
+
+### 2026-07-30 - grok2api account-pool imports
+
+**Change**: Added structured parsing for grok2api JSON exports whose Grok SSO tokens are stored under `sso*` account pools.
+
+**Reason**: The existing importer recognized pasted Grok SSO JWTs but did not inspect the `ssoBasic[].token` wrapper used by grok2api exports.
+
+**Impact**: Frontend import parsing and account-import guidance only; backend routes and database schema are unchanged.
+
+**Decision**: Accept future `sso*` pool names while validating every entry by the Grok-specific `session_id` JWT claim before classifying it as a Grok credential.
 
 ### 2026-07-29 - Strict OpenAI model discovery by default
 

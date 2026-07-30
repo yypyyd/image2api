@@ -28,8 +28,8 @@ func (c *Client) GenerateImage(ctx context.Context, token, prompt string, downlo
 		return nil, nil, fmt.Errorf("grok: prompt required")
 	}
 
-	// Only the gated submit egresses via the proxy; the statsig challenge and the
-	// artifact download run on the local IP (mirrors GenerateVideo).
+	// Separate clients keep the submit/download lifecycles independent. With a
+	// Grok proxy configured, both clients use it so the full flow has one egress.
 	submitClient, err := c.newTLSClient()
 	if err != nil {
 		return nil, nil, err

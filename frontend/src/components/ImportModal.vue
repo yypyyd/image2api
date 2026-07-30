@@ -138,7 +138,7 @@ function clearFiles() {
           <strong class="text-slate-700">Leonardo Cookie</strong>(含 better-auth)、
           <strong class="text-slate-700">Krea Cookie</strong>(含 sb-superb-auth)、
           <strong class="text-slate-700">Imagine Token</strong>(<code class="px-1 bg-slate-100 rounded">{"token","refreshToken","email","parentId"}</code>)、
-          <strong class="text-slate-700">Grok SSO</strong>(grok.com 的 <code class="px-1 bg-slate-100 rounded">sso</code> 值,仅含 session_id,自动与 ChatGPT/Runway 区分)、
+          <strong class="text-slate-700">Grok SSO</strong>(grok.com 的 <code class="px-1 bg-slate-100 rounded">sso</code> 值或 grok2api JSON,仅含 session_id,自动与 ChatGPT/Runway 区分)、
           <strong class="text-slate-700">多个 JWT</strong>(换行分隔)。
           全粘进来即可，无需任何前缀。
         </p>

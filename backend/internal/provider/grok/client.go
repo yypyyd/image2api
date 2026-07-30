@@ -54,11 +54,18 @@ type Client struct {
 }
 
 func NewClient(proxy string) *Client {
-	return &Client{proxy: strings.TrimSpace(proxy)}
+	return &Client{proxy: configuredProxy(proxy)}
 }
 
 func (c *Client) SetProxy(proxy string) {
-	c.proxy = strings.TrimSpace(proxy)
+	c.proxy = configuredProxy(proxy)
+}
+
+func configuredProxy(proxy string) string {
+	if proxy = strings.TrimSpace(proxy); proxy != "" {
+		return proxy
+	}
+	return strings.TrimSpace(os.Getenv("GROK_PROXY_URL"))
 }
 
 // IsGrokToken reports whether a JWT looks like a Grok website "sso" cookie: a
@@ -731,10 +738,11 @@ func (c *Client) applyHeaders(req *http.Request, token string, extra map[string]
 
 func (c *Client) newTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
 
-// newDirectTLSClient egresses on the local IP (never the proxy). Used for
-// reference-frame upload and result (video) download; only the generate submit
-// (/rest/app-chat/conversations/new) uses the proxy.
-func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(false) }
+// newDirectTLSClient keeps direct egress when no Grok proxy is configured. When
+// GROK_PROXY_URL (or the shared proxy setting) is present, every Grok endpoint
+// must use it: session/quota probes, the Statsig challenge, media upload, submit,
+// polling, and artifact download all fail on networks where grok.com is blocked.
+func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(c.proxy != "") }
 
 func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
 	options := []tlsclient.HttpClientOption{

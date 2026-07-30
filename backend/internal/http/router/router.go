@@ -52,6 +52,7 @@ func New(cfg *config.Config, auth *service.AuthService, handlers Handlers) *gin.
 	engine.POST("/v1/chat/completions", handlers.V1.ChatCompletions)
 	engine.POST("/v1/images/generations", handlers.V1.ImageGenerations)
 	engine.POST("/v1/images/edits", handlers.V1.ImageEdits)
+	engine.GET("/v1/images/tasks", handlers.V1.GetImageTask)
 	// OpenAI Sora-style async video: create job → poll → stream content.
 	engine.POST("/v1/videos", handlers.V1.CreateVideo)
 	engine.GET("/v1/videos/:id", handlers.V1.GetVideo)

@@ -57,6 +57,7 @@ var (
 	// ErrVideoJobNotFound / ErrVideoNotReady — /v1/videos async job lookups.
 	ErrVideoJobNotFound = errors.New("video job not found")
 	ErrVideoNotReady    = errors.New("video is not ready yet")
+	ErrImageTaskNotFound = errors.New("image task not found")
 )
 
 // maxReferenceImageBytes bounds a single decoded reference image. 20 MB
@@ -95,6 +96,10 @@ type V1Service struct {
 	// of fails/last_used. The atomic counter also serializes concurrent picks so
 	// two simultaneous requests never start on the same account.
 	tokenCursors sync.Map
+	// grokBuildLocks serializes SSO->Build conversion/refresh per account. OAuth
+	// refresh tokens may rotate, so concurrent first-use requests must not persist
+	// different generations of the same credential.
+	grokBuildLocks sync.Map
 
 	// inflight maps an in-progress event ID → the cancel func of its generation
 	// work context, so the maintenance sweep can stop a stuck generation the
@@ -189,6 +194,7 @@ type APIPrincipal struct {
 type V1ImageRequest struct {
 	Model  string
 	Prompt string
+	RequestID string
 	Size   string
 	// Quality is OpenAI's image quality (low|medium|high|auto). For our tiered
 	// models it selects the resolution (low→1K, medium→2K, high→4K, auto→default),
@@ -197,7 +203,7 @@ type V1ImageRequest struct {
 	// Resolution directly and ignores this.
 	Quality string
 	// ResponseFormat controls the OpenAI-compatible API response. Empty defaults
-	// to b64_json as documented; url is available when explicitly requested.
+	// to url for low-copy relay; b64_json is available when explicitly requested.
 	ResponseFormat  string
 	AspectRatio     string
 	Resolution      string
@@ -269,10 +275,10 @@ func (b *chatAccountingBody) Close() error {
 
 func normalizeImageResponseFormat(value string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "", "b64_json":
-		return "b64_json", nil
-	case "url":
+	case "", "url":
 		return "url", nil
+	case "b64_json":
+		return "b64_json", nil
 	default:
 		return "", fmt.Errorf("%w: response_format must be b64_json or url", ErrUnsupportedParams)
 	}
@@ -477,6 +483,44 @@ func v1ModelEntry(item model.ModelConfig, created int64, extended bool) map[stri
 // prices_agent.request). A response is successful only after a valid non-stream
 // completion reaches EOF or an SSE stream reaches data: [DONE].
 func (s *V1Service) PrepareChatCompletion(ctx context.Context, principal *APIPrincipal, payload []byte) (*V1ChatResponse, error) {
+	return s.prepareChatCompletion(ctx, principal, payload, "", "v1")
+}
+
+// PrepareAdminChatTest runs one non-streaming text request on a specifically
+// selected provider account. It uses the normal routing/error/accounting path
+// but does not debit the administrator's user balance.
+func (s *V1Service) PrepareAdminChatTest(ctx context.Context, modelName, prompt, accountID string) (string, error) {
+	payload, _ := json.Marshal(map[string]any{
+		"model":    modelName,
+		"messages": []map[string]any{{"role": "user", "content": prompt}},
+		"stream":   false,
+	})
+	response, err := s.prepareChatCompletion(ctx, nil, payload, accountID, "admin")
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 4<<20+1))
+	if err != nil || len(body) > 4<<20 {
+		return "", fmt.Errorf("%w: invalid chat test response", ErrProviderTemporary)
+	}
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if json.Unmarshal(body, &result) != nil || len(result.Choices) == 0 || strings.TrimSpace(result.Choices[0].Message.Content) == "" {
+		return "", fmt.Errorf("%w: empty chat test response", ErrProviderTemporary)
+	}
+	return result.Choices[0].Message.Content, nil
+}
+
+func (s *V1Service) prepareChatCompletion(ctx context.Context, principal *APIPrincipal, payload []byte, accountID, source string) (*V1ChatResponse, error) {
+	if source == "" {
+		source = "v1"
+	}
 	var request map[string]any
 	dec := json.NewDecoder(strings.NewReader(string(payload)))
 	dec.UseNumber()
@@ -502,7 +546,7 @@ func (s *V1Service) PrepareChatCompletion(ctx context.Context, principal *APIPri
 		return nil, ErrUnknownModel
 	}
 	if err := s.checkBannedPrompt(ctx, principal, prompt); err != nil {
-		s.logRejectedEvent(context.WithoutCancel(ctx), "text", modelName, principal, prompt, "v1", err.Error())
+		s.logRejectedEvent(context.WithoutCancel(ctx), "text", modelName, principal, prompt, source, err.Error())
 		return nil, err
 	}
 	pool := "custom"
@@ -525,7 +569,11 @@ func (s *V1Service) PrepareChatCompletion(ctx context.Context, principal *APIPri
 		}
 		s.rotateRoundRobin(pool, active)
 	}
-	if len(active) == 0 && modelItem.Provider == "grok" {
+	configuredGrokModel := strings.TrimSpace(modelItem.UpstreamModel)
+	if configuredGrokModel == "" {
+		configuredGrokModel = modelItem.ID
+	}
+	if len(active) == 0 && (modelItem.Provider == "grok" || grok.IsBuildTextModel(configuredGrokModel)) {
 		pool = "grok"
 		items, listErr := s.tokens.ListByPool(ctx, pool)
 		if listErr != nil {
@@ -541,6 +589,7 @@ func (s *V1Service) PrepareChatCompletion(ctx context.Context, principal *APIPri
 		}
 		s.rotateRoundRobin(pool, active)
 	}
+	active = pinTestAccount(active, active, accountID)
 	if len(active) == 0 || (pool == "custom" && s.custom == nil) || (pool == "chatgpt" && s.chatgpt == nil) || (pool == "grok" && s.grok == nil) {
 		return nil, ErrNoProviderAccount
 	}
@@ -553,7 +602,7 @@ func (s *V1Service) PrepareChatCompletion(ctx context.Context, principal *APIPri
 	bookCtx := context.WithoutCancel(ctx)
 	userSlot := randomUpper(12)
 	if principal != nil && principal.User != nil && !s.userAcquire(bookCtx, principal.User, userSlot) {
-		s.logRejectedEvent(bookCtx, "text", modelName, principal, prompt, "v1", ErrUserConcurrencyFull.Error())
+		s.logRejectedEvent(bookCtx, "text", modelName, principal, prompt, source, ErrUserConcurrencyFull.Error())
 		return nil, ErrUserConcurrencyFull
 	}
 	userHeld := principal != nil && principal.User != nil
@@ -567,10 +616,10 @@ func (s *V1Service) PrepareChatCompletion(ctx context.Context, principal *APIPri
 	price, err := s.chargeForModel(bookCtx, principal, modelItem, "text", "request", "", 0, true)
 	if err != nil {
 		releaseUser()
-		s.logRejectedEvent(bookCtx, "text", modelName, principal, prompt, "v1", err.Error())
+		s.logRejectedEvent(bookCtx, "text", modelName, principal, prompt, source, err.Error())
 		return nil, err
 	}
-	eventID, err := s.logPendingEvent(bookCtx, "text", modelItem, principal, prompt, "", "", "", 0, price, "", "v1", nil, false)
+	eventID, err := s.logPendingEvent(bookCtx, "text", modelItem, principal, prompt, "", "", "", 0, price, "", source, nil, false, "")
 	if err != nil {
 		releaseUser()
 		if principal != nil && principal.User != nil && price > 0 {
@@ -611,7 +660,17 @@ func (s *V1Service) PrepareChatCompletion(ctx context.Context, principal *APIPri
 				responseHeader, responseBody, responseStream = response.Header, response.Body, response.Stream
 			}
 		case "grok":
-			text, err := s.grok.GenerateText(ctx, token.Value, prompt, grok.ChatModeForModel(upstreamModel))
+			var text string
+			var err error
+			if grok.IsBuildTextModel(upstreamModel) {
+				var accessToken string
+				accessToken, err = s.ensureGrokBuildCredential(ctx, token)
+				if err == nil {
+					text, err = s.grok.GenerateBuildText(ctx, accessToken, prompt, upstreamModel)
+				}
+			} else {
+				text, err = s.grok.GenerateText(ctx, token.Value, prompt, grok.ChatModeForModel(upstreamModel))
+			}
 			callErr = err
 			if err == nil {
 				responseHeader, responseBody = openAITextResponse(modelItem.EffectiveName(), text, stream)
@@ -799,6 +858,10 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	// generation from running on for minutes and surfacing a late "success" on an
 	// already-abandoned event.
 	ctx = context.WithoutCancel(ctx)
+	in.RequestID = strings.TrimSpace(in.RequestID)
+	if len(in.RequestID) > 191 {
+		return nil, fmt.Errorf("%w: idempotency key is too long", ErrUnsupportedParams)
+	}
 	if source == "v1" {
 		responseFormat, err := normalizeImageResponseFormat(in.ResponseFormat)
 		if err != nil {
@@ -837,17 +900,17 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		return nil, err
 	}
 	refCount := len(in.ReferenceImages)
-	// API-key (source "v1") requests don't persist the output: we return the image
-	// as base64 inline (OpenAI gpt-image-1 also returns only b64_json) and never
-	// upload to RustFS, so there's no URL. The event is still logged (empty file)
-	// for usage; the customer logs page hides source="v1" rows.
-	noStore := source == "v1"
-	// The documented/default OpenAI response is b64_json, which requires the
-	// provider client to download the generated bytes. Only skip that download
-	// when the caller explicitly asks for response_format=url.
-	urlOnly := noStore && in.ResponseFormat == "url"
+	// API-key requests carrying an idempotency key persist their output so a
+	// gateway-timed-out synchronous response can be recovered by task lookup.
+	// Other API calls keep the original no-store behavior.
+	apiRequest := source == "v1"
+	storeOutput := !apiRequest || in.RequestID != ""
+	// URL is the default API response so the gateway can avoid downloading and
+	// base64-encoding upstream media. Explicit b64_json and idempotent recovery
+	// requests still need the generated bytes.
+	urlOnly := apiRequest && !storeOutput && in.ResponseFormat == "url"
 	var fileURL, relativePath string
-	if !noStore {
+	if storeOutput {
 		fileURL, relativePath = s.allocateOutput(principal, "png", in.BaseURL)
 	}
 	// upstreamURL is the provider's original artifact URL. For API-key (source
@@ -857,7 +920,7 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	// ({base}/v1/images/{eventID}/content) that re-fetches with the account token.
 	var upstreamURL string
 	var gatedURL bool
-	eventID, err := s.logPendingEvent(ctx, "image", modelItem, principal, in.Prompt, aspectRatio, resolution, "", refCount, price, relativePath, source, nil, in.DeAI)
+	eventID, err := s.logPendingEvent(ctx, "image", modelItem, principal, in.Prompt, aspectRatio, resolution, "", refCount, price, relativePath, source, nil, in.DeAI, in.RequestID)
 	if err != nil {
 		return nil, err
 	}
@@ -1022,7 +1085,7 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		_ = s.events.UpdateStatus(ctx, eventID, "failed", "provider not implemented", 0)
 		return nil, fmt.Errorf("%w: %s", ErrProviderUnsupported, modelItem.Provider)
 	}
-	if noStore && in.ResponseFormat == "b64_json" && len(imageBytes) == 0 {
+	if apiRequest && in.ResponseFormat == "b64_json" && len(imageBytes) == 0 {
 		_ = s.refundIfNeeded(ctx, principal, eventID, price)
 		_ = s.events.UpdateStatus(ctx, eventID, "failed", "provider returned no image bytes", 0)
 		return nil, fmt.Errorf("%w: provider returned no image bytes", ErrProviderExecution)
@@ -1034,7 +1097,7 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 			imageBytes = processed
 		}
 	}
-	if !noStore {
+	if storeOutput {
 		// Upload to RustFS. On failure the generation fails and credits are
 		// refunded — we never fall back to local disk.
 		if err := s.store.Put(genCtx, relativePath, imageBytes, "image/png"); err != nil {
@@ -1059,7 +1122,7 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	if charge {
 		_ = s.maybeGrantInviteReward(ctx, principal)
 	}
-	if noStore {
+	if apiRequest {
 		if in.ResponseFormat == "b64_json" {
 			b64 := base64.StdEncoding.EncodeToString(imageBytes)
 			return map[string]any{
@@ -1074,9 +1137,11 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 				"credits":    principalCredits(principal),
 			}, nil
 		}
-		if strings.TrimSpace(upstreamURL) != "" {
+		if storeOutput || strings.TrimSpace(upstreamURL) != "" {
 			outURL := upstreamURL
-			if gatedURL {
+			if storeOutput {
+				outURL = fileURL
+			} else if gatedURL {
 				// Auth-gated URL (chatgpt): store it on the event and return a proxy
 				// URL that re-fetches with the account token (see OpenImageContent).
 				_ = s.events.SetFile(ctx, eventID, upstreamURL)
@@ -1122,6 +1187,54 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		"charged":    price,
 		"credits":    principalCredits(principal),
 	}, nil
+}
+
+// ImageTask recovers an API image request by its idempotency key. Results are
+// scoped to the authenticated API-key owner and returned in OpenAI image shape.
+func (s *V1Service) ImageTask(ctx context.Context, principal *APIPrincipal, requestID string) (map[string]any, error) {
+	requestID = strings.TrimSpace(requestID)
+	if principal == nil || principal.User == nil || requestID == "" {
+		return nil, ErrImageTaskNotFound
+	}
+	event, err := s.events.GetImageByRequestID(ctx, principal.User.ID, requestID)
+	if err != nil {
+		return nil, err
+	}
+	if event == nil {
+		return nil, ErrImageTaskNotFound
+	}
+	result := map[string]any{
+		"id":       requestID,
+		"event_id": event.ID,
+		"created":  event.TS.Unix(),
+		"data":     []any{},
+	}
+	switch event.Status {
+	case "success":
+		if strings.TrimSpace(event.File) == "" {
+			return nil, fmt.Errorf("%w: recovered image file is missing", ErrProviderTemporary)
+		}
+		response, err := s.store.Get(ctx, event.File, "")
+		if err != nil {
+			return nil, fmt.Errorf("%w: failed to load recovered image", ErrProviderTemporary)
+		}
+		defer response.Body.Close()
+		if response.StatusCode >= http.StatusBadRequest {
+			return nil, fmt.Errorf("%w: recovered image is unavailable", ErrProviderTemporary)
+		}
+		body, err := io.ReadAll(io.LimitReader(response.Body, 32<<20+1))
+		if err != nil || len(body) == 0 || len(body) > 32<<20 {
+			return nil, fmt.Errorf("%w: recovered image is invalid", ErrProviderTemporary)
+		}
+		result["status"] = "completed"
+		result["data"] = []map[string]any{{"b64_json": base64.StdEncoding.EncodeToString(body)}}
+	case "failed":
+		result["status"] = "failed"
+		result["error"] = strings.TrimSpace(event.Error)
+	default:
+		result["status"] = "in_progress"
+	}
+	return result, nil
 }
 
 func (s *V1Service) PrepareVideoRequest(ctx context.Context, principal *APIPrincipal, in V1VideoRequest) (map[string]any, error) {
@@ -1174,7 +1287,7 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 	if !noStore {
 		fileURL, relativePath = s.allocateOutput(principal, "mp4", in.BaseURL)
 	}
-	eventID, err := s.logPendingEvent(ctx, "video", modelItem, principal, in.Prompt, aspectRatio, resolution, duration, refCount, price, relativePath, source, nil, false)
+	eventID, err := s.logPendingEvent(ctx, "video", modelItem, principal, in.Prompt, aspectRatio, resolution, duration, refCount, price, relativePath, source, nil, false, "")
 	if err != nil {
 		return nil, err
 	}
@@ -1321,7 +1434,7 @@ func (s *V1Service) StartVideoJob(ctx context.Context, principal *APIPrincipal, 
 	}
 	// Source "v1": no output file is allocated — the result is the upstream URL,
 	// stored on the event when the render completes.
-	eventID, err := s.logPendingEvent(ctx, "video", modelItem, principal, in.Prompt, aspectRatio, resolution, duration, len(in.ReferenceImages), price, "", "v1", nil, false)
+	eventID, err := s.logPendingEvent(ctx, "video", modelItem, principal, in.Prompt, aspectRatio, resolution, duration, len(in.ReferenceImages), price, "", "v1", nil, false, "")
 	if err != nil {
 		return nil, err
 	}
@@ -1861,9 +1974,10 @@ func (s *V1Service) allocateOutput(principal *APIPrincipal, ext, baseURL string)
 	return "/images/" + relativePath, relativePath
 }
 
-func (s *V1Service) logPendingEvent(ctx context.Context, kind string, modelItem *model.ModelConfig, principal *APIPrincipal, prompt, ratio, resolution, duration string, refs int, cost float64, file, source string, refFiles []string, deai bool) (string, error) {
+func (s *V1Service) logPendingEvent(ctx context.Context, kind string, modelItem *model.ModelConfig, principal *APIPrincipal, prompt, ratio, resolution, duration string, refs int, cost float64, file, source string, refFiles []string, deai bool, requestID string) (string, error) {
 	event := &model.EventLog{
 		ID:         "evt-" + randomUpper(12),
+		RequestID:  requestID,
 		TS:         time.Now(),
 		Kind:       kind,
 		Status:     "pending",

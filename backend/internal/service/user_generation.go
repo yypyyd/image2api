@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 
 	"backend/internal/model"
 	"backend/internal/repo"
@@ -100,6 +101,16 @@ func (s *UserGenerationService) AdminTest(ctx context.Context, user *model.User,
 		TokenType: "session",
 	}
 	switch modelItem.Type {
+	case "text":
+		startedAt := time.Now()
+		content, err := s.v1.PrepareAdminChatTest(ctx, in.Model, in.Prompt, in.AccountID)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"kind": "text", "content": content, "provider": modelItem.Provider,
+			"elapsed_ms": time.Since(startedAt).Milliseconds(),
+		}, nil
 	case "video":
 		return s.v1.prepareAdminTestVideo(ctx, principal, V1VideoRequest{
 			Model:           in.Model,

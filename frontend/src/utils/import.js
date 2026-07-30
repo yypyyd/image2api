@@ -104,6 +104,32 @@ function openAIItem(value) {
   return looksLikeJwt(token) ? [{ type: 'openai', value: token }] : []
 }
 
+function grokItem(value) {
+  const token = (value || '').replace(/^Bearer\s+/i, '').replace(/^sso=/, '').trim()
+  return looksLikeGrokJwt(token) ? [{ type: 'grok', value: token }] : []
+}
+
+// grok2api export: { ssoBasic: [{ token, note, tags }], ssoSuper: [...] }.
+// Pool names can grow as grok2api adds account tiers, so accept any sso*
+// array while still validating every token by its Grok-specific JWT claims.
+function structuredGrokItems(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const poolKeys = Object.keys(value).filter((key) => /^sso[\w-]*$/i.test(key) && Array.isArray(value[key]))
+  if (!poolKeys.length) return null
+
+  const out = []
+  for (const key of poolKeys) {
+    for (const entry of value[key]) {
+      if (typeof entry === 'string') {
+        out.push(...grokItem(entry))
+      } else if (entry && typeof entry === 'object') {
+        out.push(...grokItem(entry.token || entry.sso || entry.value))
+      }
+    }
+  }
+  return out
+}
+
 // Returns null when the object is not a CPA/Sub2API shape; an empty array means
 // the shape was recognized but contains no usable access_token (for example an
 // Agent Identity-only credential).
@@ -169,6 +195,9 @@ function parseJSONValue(j) {
     }
     return out
   }
+
+  const structuredGrok = structuredGrokItems(j)
+  if (structuredGrok !== null) return structuredGrok
 
   const structured = structuredOpenAIItems(j)
   if (structured !== null) return structured
@@ -253,7 +282,7 @@ export function parseImportFileBytes(bytes, filename = 'accounts.json') {
 
   items = uniqueImportItems(items)
   if (!items.length) {
-    throw new Error('文件中没有可用的 ChatGPT access_token（仅 Agent Identity 的凭据不能用于生图）')
+    throw new Error('文件中没有识别到可导入的账号凭据（仅 Agent Identity 的凭据不能用于生图）')
   }
   return items
 }

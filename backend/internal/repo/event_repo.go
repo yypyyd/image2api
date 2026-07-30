@@ -539,6 +539,21 @@ func (r *EventRepository) GetByID(ctx context.Context, id string) (*model.EventL
 	return &e, nil
 }
 
+func (r *EventRepository) GetImageByRequestID(ctx context.Context, userID, requestID string) (*model.EventLog, error) {
+	var e model.EventLog
+	err := r.db.WithContext(ctx).
+		Where("user_id = ? AND request_id = ? AND kind = ? AND source = ?", userID, requestID, "image", "v1").
+		Order("created_at DESC").
+		First(&e).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &e, nil
+}
+
 // MarkVideoReady completes an async video job: status=success, file=upstream URL
 // (proxied on /content — never persisted), elapsed.
 func (r *EventRepository) MarkVideoReady(ctx context.Context, eventID, fileURL string, elapsedMS int) error {
