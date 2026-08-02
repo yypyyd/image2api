@@ -461,6 +461,11 @@ func v1ModelEntry(item model.ModelConfig, created int64, extended bool) map[stri
 	entry["kind"] = item.Type
 	entry["supported_ratios"] = repo.JSONRatios(item.Ratios)
 	entry["supported_resolutions"] = repo.JSONStrings(item.Resolutions)
+	// Reference-image capabilities are part of model discovery as well as
+	// request validation. Clients use these fields to render the correct number
+	// of upload slots and to distinguish ordered frames from unordered assets.
+	entry["max_reference_images"] = max(0, item.MaxReferenceImages)
+	entry["reference_mode"] = defaultString(strings.TrimSpace(item.ReferenceMode), "none")
 	// Video models expose their selectable clip lengths (the /v1/videos
 	// `seconds` param) so a key holder can discover them, e.g. ["5s","8s"].
 	// Prefer the explicit durations list; fall back to the priced tiers.

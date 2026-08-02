@@ -33,12 +33,14 @@ func TestV1ModelEntryStrictByDefault(t *testing.T) {
 
 func TestV1ModelEntryExtendedCapabilities(t *testing.T) {
 	item := model.ModelConfig{
-		ID:             "video-model",
-		Provider:       "adobe",
-		Type:           "video",
-		Ratios:         datatypes.JSON([]byte(`["16:9"]`)),
-		Resolutions:    datatypes.JSON([]byte(`["1080p"]`)),
-		DurationPrices: datatypes.JSONMap{"8s": 1, "5s": 1},
+		ID:                 "video-model",
+		Provider:           "adobe",
+		Type:               "video",
+		Ratios:             datatypes.JSON([]byte(`["16:9"]`)),
+		Resolutions:        datatypes.JSON([]byte(`["1080p"]`)),
+		DurationPrices:     datatypes.JSONMap{"8s": 1, "5s": 1},
+		MaxReferenceImages: 2,
+		ReferenceMode:      "frame",
 	}
 
 	got := v1ModelEntry(item, 123, true)
@@ -53,5 +55,28 @@ func TestV1ModelEntryExtendedCapabilities(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got["supported_durations"], []string{"5s", "8s"}) {
 		t.Fatalf("supported_durations = %#v", got["supported_durations"])
+	}
+	if got["max_reference_images"] != 2 {
+		t.Fatalf("max_reference_images = %#v, want 2", got["max_reference_images"])
+	}
+	if got["reference_mode"] != "frame" {
+		t.Fatalf("reference_mode = %#v, want frame", got["reference_mode"])
+	}
+}
+
+func TestV1ModelEntryExtendedReferenceDefaults(t *testing.T) {
+	item := model.ModelConfig{
+		ID:                 "text-model",
+		Provider:           "chatgpt",
+		Type:               "text",
+		MaxReferenceImages: -1,
+	}
+
+	got := v1ModelEntry(item, 123, true)
+	if got["max_reference_images"] != 0 {
+		t.Fatalf("max_reference_images = %#v, want 0", got["max_reference_images"])
+	}
+	if got["reference_mode"] != "none" {
+		t.Fatalf("reference_mode = %#v, want none", got["reference_mode"])
 	}
 }

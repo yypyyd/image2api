@@ -76,7 +76,7 @@ ZIP processing is memory-only and never extracts paths to disk. It accepts JSON 
 
 **Reason**: Some downstream importers validate model objects with a strict OpenAI schema and reject the entire list when an otherwise valid model contains extension fields.
 
-**Impact**: Standard SDKs and strict model importers receive a minimal compatible response. Clients that use `kind`, supported ratios, resolutions, or video durations must opt into the extended response.
+**Impact**: Standard SDKs and strict model importers receive a minimal compatible response. Clients that use `kind`, supported ratios, resolutions, video durations, or reference-image capabilities (`max_reference_images` and `reference_mode`) must opt into the extended response.
 
 **Decision**: Compatibility is the default contract on the OpenAI endpoint; gateway-specific discovery remains explicit and backward-accessible instead of being removed.
 
