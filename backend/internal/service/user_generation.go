@@ -34,6 +34,9 @@ type UserGenerateRequest struct {
 	Resolution      string
 	Duration        string
 	ReferenceImages []string
+	ReferenceVideos []MediaReference
+	ReferenceAudios []MediaReference
+	GenerateAudio   bool
 	// DeAI applies 去AI特征 post-processing to the generated image (image only)
 	// and charges the per-tier surcharge on top of the model price.
 	DeAI bool
@@ -67,6 +70,9 @@ func (s *UserGenerationService) Generate(ctx context.Context, user *model.User, 
 			AspectRatio:     in.Ratio,
 			Resolution:      in.Resolution,
 			ReferenceImages: in.ReferenceImages,
+			ReferenceVideos: in.ReferenceVideos,
+			ReferenceAudios: in.ReferenceAudios,
+			GenerateAudio:   in.GenerateAudio,
 		})
 		if err != nil {
 			return nil, err
@@ -119,6 +125,9 @@ func (s *UserGenerationService) AdminTest(ctx context.Context, user *model.User,
 			AspectRatio:     in.Ratio,
 			Resolution:      in.Resolution,
 			ReferenceImages: in.ReferenceImages,
+			ReferenceVideos: in.ReferenceVideos,
+			ReferenceAudios: in.ReferenceAudios,
+			GenerateAudio:   in.GenerateAudio,
 			AccountID:       in.AccountID,
 		})
 	default:

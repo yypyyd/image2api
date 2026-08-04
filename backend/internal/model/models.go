@@ -95,7 +95,7 @@ type EventLog struct {
 	Duration   string         `gorm:"size:32"`
 	Refs       int            `gorm:"not null;default:0"`
 	DeAI       bool           `gorm:"not null;default:false"` // 去AI特征 was applied (image only)
-	RefFiles   datatypes.JSON `gorm:"type:jsonb"` // relative paths of saved reference images, for回显 on reload
+	RefFiles   datatypes.JSON `gorm:"type:jsonb"`             // relative paths of saved reference images, for回显 on reload
 	Source     string         `gorm:"size:32;index"`
 	// AccountID is the provider token/account chosen to fulfil this generation,
 	// stamped when the upstream call begins. Drives the accounts view's live
@@ -138,6 +138,10 @@ type ModelConfig struct {
 	DurationPricesAgent datatypes.JSONMap `gorm:"type:jsonb;column:duration_prices_agent"`
 	Durations           datatypes.JSON    `gorm:"type:jsonb"`
 	MaxReferenceImages  int               `gorm:"not null;default:0"`
+	MaxReferenceVideos  int               `gorm:"not null;default:0"`
+	MaxReferenceAudios  int               `gorm:"not null;default:0"`
+	MaxReferenceMedia   int               `gorm:"not null;default:0"`
+	SupportsAudioOutput bool              `gorm:"not null;default:false"`
 	ReferenceMode       string            `gorm:"size:32;not null;default:'none'"`
 	// Custom-upstream models (provider="custom"): UpstreamModel is the model name
 	// sent to the upstream OpenAI-compatible API; the base_url + key live on the
@@ -261,15 +265,15 @@ func AutoMigrateModels() []any {
 type Order struct {
 	ID          string    `gorm:"primaryKey;size:40"`
 	UserID      string    `gorm:"size:32;index;not null"`
-	Amount      float64   `gorm:"not null"`               // 充值金额(元)
-	Points      int       `gorm:"not null"`               // 到账积分
-	PayType     string    `gorm:"size:16"`                // wxpay | alipay | admin | cdk
-	Status      string    `gorm:"size:16;index;not null"` // pending | paid | cancelled
+	Amount      float64   `gorm:"not null"`                              // 充值金额(元)
+	Points      int       `gorm:"not null"`                              // 到账积分
+	PayType     string    `gorm:"size:16"`                               // wxpay | alipay | admin | cdk
+	Status      string    `gorm:"size:16;index;not null"`                // pending | paid | cancelled
 	Source      string    `gorm:"size:16;index;not null;default:'epay'"` // epay | admin | cdk
-	Remark      string    `gorm:"type:text"`              // e.g. 兑换码 code / 管理员操作说明
-	TradeNo     string    `gorm:"size:64;index"`          // 易支付平台订单号
-	PayInfo     string    `gorm:"type:text"`              // 二维码 url / 跳转 url
-	PayInfoType string    `gorm:"size:16"`                // qrcode | jump | html | ...
+	Remark      string    `gorm:"type:text"`                             // e.g. 兑换码 code / 管理员操作说明
+	TradeNo     string    `gorm:"size:64;index"`                         // 易支付平台订单号
+	PayInfo     string    `gorm:"type:text"`                             // 二维码 url / 跳转 url
+	PayInfoType string    `gorm:"size:16"`                               // qrcode | jump | html | ...
 	ExpiresAt   time.Time `gorm:"index"`
 	PaidAt      *time.Time
 	CreatedAt   time.Time

@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { api, jsonBody } from '../api'
-import { sortResolutions } from '../utils/format'
+import { api } from '../api'
+import { friendlyGenerationError, sortResolutions } from '../utils/format'
 import Icon from './Icon.vue'
 
 const props = defineProps({
@@ -75,6 +75,19 @@ const duration = ref(durations.value[0])
 
 const refImages = ref([]) // [{ name, dataUrl }]
 const fileInput = ref(null)
+const refVideos = ref([])
+const refAudios = ref([])
+const videoInput = ref(null)
+const audioInput = ref(null)
+const generateAudio = ref(false)
+const maxVideoRefs = computed(() => Math.max(Number(familyPreset.value?.max_reference_videos || 0), Number(props.model?.max_reference_videos || 0)))
+const maxAudioRefs = computed(() => Math.max(Number(familyPreset.value?.max_reference_audios || 0), Number(props.model?.max_reference_audios || 0)))
+const maxMediaRefs = computed(() => Math.max(Number(familyPreset.value?.max_reference_media || 0), Number(props.model?.max_reference_media || 0)))
+const totalRefs = computed(() => refImages.value.length + refVideos.value.length + refAudios.value.length)
+const remainingMediaRefs = computed(() => maxMediaRefs.value > 0
+  ? Math.max(0, maxMediaRefs.value - totalRefs.value)
+  : Number.POSITIVE_INFINITY)
+const supportsAudioOutput = computed(() => !!(familyPreset.value?.supports_audio_output || props.model?.supports_audio_output))
 // Image 5 instruct-edit derives aspect from the reference image — hide the ratio
 // picker when a ref is attached (backend omits aspectRatio to avoid a 400).
 const showRatio = computed(() => !(props.model.id === 'firefly-image-5' && refImages.value.length > 0))
@@ -83,7 +96,7 @@ function openPicker() { fileInput.value && fileInput.value.click() }
 
 function onFiles(ev) {
   const files = Array.from(ev.target.files || [])
-  const room = Math.max(0, maxRefs.value - refImages.value.length)
+  const room = Math.max(0, Math.min(maxRefs.value - refImages.value.length, remainingMediaRefs.value))
   const toAdd = files.slice(0, room)
   for (const f of toAdd) {
     const reader = new FileReader()
@@ -96,6 +109,16 @@ function onFiles(ev) {
 }
 
 function removeRef(i) { refImages.value.splice(i, 1) }
+function onVideoFiles(ev) {
+  const room = Math.max(0, Math.min(maxVideoRefs.value - refVideos.value.length, remainingMediaRefs.value))
+  refVideos.value.push(...Array.from(ev.target.files || []).filter((f) => f.size <= 200 * 1024 * 1024).slice(0, room).map((file) => ({ name: file.name, file })))
+  if (ev.target) ev.target.value = ''
+}
+function onAudioFiles(ev) {
+  const room = Math.max(0, Math.min(maxAudioRefs.value - refAudios.value.length, remainingMediaRefs.value))
+  refAudios.value.push(...Array.from(ev.target.files || []).filter((f) => f.size <= 50 * 1024 * 1024).slice(0, room).map((file) => ({ name: file.name, file })))
+  if (ev.target) ev.target.value = ''
+}
 
 const busy = ref(false)
 const status = ref('')
@@ -119,26 +142,27 @@ async function run() {
     error.value = '该视频模型需要至少 1 张参考图 (首帧)'
     return
   }
+  if (maxMediaRefs.value > 0 && totalRefs.value > maxMediaRefs.value) {
+    error.value = `参考图片、视频和音频合计最多 ${maxMediaRefs.value} 个`
+    return
+  }
   busy.value = true
   error.value = ''
   status.value = isVideo ? '正在生成视频 (约 1–3 分钟)…' : '正在生成…'
   resultUrl.value = ''
   resultKind.value = ''
-  const payload = {
-    model: publishName.value,
-    prompt: prompt.value,
-    ratio: ratio.value,
-    resolution: resolution.value,
-  }
-  if (isVideo) {
-    payload.duration = duration.value
-  }
-  if (refImages.value.length) {
-    // Backend accepts raw base64 only — strip the "data:...;base64," prefix.
-    payload.reference_images = refImages.value.map((r) => r.dataUrl.replace(/^data:[^,]*,/, ''))
-  }
+  const payload = new FormData()
+  payload.append('model', publishName.value)
+  payload.append('prompt', prompt.value)
+  payload.append('ratio', ratio.value)
+  payload.append('resolution', resolution.value)
+  if (isVideo) payload.append('duration', duration.value)
+  if (isVideo && generateAudio.value) payload.append('generate_audio', 'true')
+  for (const item of refImages.value) payload.append('reference_images', await (await fetch(item.dataUrl)).blob(), item.name)
+  for (const item of refVideos.value) payload.append('reference_videos', item.file, item.name)
+  for (const item of refAudios.value) payload.append('reference_audios', item.file, item.name)
   recoverSubmitTs = Date.now()
-  const r = await api('/test', jsonBody('POST', payload))
+  const r = await api('/test', { method: 'POST', body: payload })
   if (r.ok && r.data?.url) {
     busy.value = false
     resultUrl.value = r.data.url
@@ -153,7 +177,7 @@ async function run() {
   } else {
     busy.value = false
     status.value = ''
-    error.value = r.data?.detail || `失败 (${r.status})`
+    error.value = friendlyGenerationError(r.data?.detail || `失败 (${r.status})`)
   }
 }
 
@@ -184,7 +208,7 @@ async function recover() {
   if (mine && latest.status === 'failed') {
     busy.value = false
     status.value = ''
-    error.value = latest.error || '生成失败'
+    error.value = friendlyGenerationError(latest.error || '生成失败')
     return
   }
   // Not resolved yet (event still committing) — keep polling.
@@ -239,6 +263,10 @@ async function recover() {
           </div>
         </div>
 
+        <div v-if="isVideo && maxMediaRefs > 0" class="text-xs text-white/45">
+          参考素材合计最多 {{ maxMediaRefs }} 个，已选 {{ totalRefs }} 个
+        </div>
+
         <!-- reference images -->
         <div v-if="maxRefs > 0">
           <label class="lbl">
@@ -258,13 +286,42 @@ async function recover() {
                 {{ i === 0 ? '首帧' : (i === 1 ? '末帧' : '') }}
               </div>
             </div>
-            <button v-if="refImages.length < maxRefs" type="button" @click="openPicker"
+            <button v-if="refImages.length < maxRefs && remainingMediaRefs > 0" type="button" @click="openPicker"
                     class="w-20 h-20 rounded-lg border-2 border-dashed border-white/15 text-white/40 hover:bg-white/[0.04] hover:border-white/30 transition-colors grid place-items-center">
               <Icon name="plus" class="w-5 h-5" />
             </button>
           </div>
           <input ref="fileInput" type="file" accept="image/*" multiple class="hidden" @change="onFiles" />
         </div>
+
+        <div v-if="isVideo && maxVideoRefs > 0">
+          <label class="lbl">参考视频 (最多 {{ maxVideoRefs }} 个)</label>
+          <div class="space-y-1.5">
+            <div v-for="(item, i) in refVideos" :key="item.name + i" class="flex items-center gap-2 rounded-lg bg-white/[0.04] px-3 py-2 text-xs text-white/65">
+              <span class="truncate flex-1">{{ item.name }}</span>
+              <button type="button" @click="refVideos.splice(i, 1)" class="text-white/35 hover:text-rose-300"><Icon name="close" class="w-3.5 h-3.5" /></button>
+            </div>
+            <button v-if="refVideos.length < maxVideoRefs && remainingMediaRefs > 0" type="button" @click="videoInput?.click()" class="w-full rounded-lg border border-dashed border-white/15 py-2 text-xs text-white/40">+ MP4 / MOV</button>
+          </div>
+          <input ref="videoInput" type="file" accept="video/mp4,video/quicktime,.mov" multiple class="hidden" @change="onVideoFiles" />
+        </div>
+
+        <div v-if="isVideo && maxAudioRefs > 0">
+          <label class="lbl">参考音频 (最多 {{ maxAudioRefs }} 个)</label>
+          <div class="space-y-1.5">
+            <div v-for="(item, i) in refAudios" :key="item.name + i" class="flex items-center gap-2 rounded-lg bg-white/[0.04] px-3 py-2 text-xs text-white/65">
+              <span class="truncate flex-1">{{ item.name }}</span>
+              <button type="button" @click="refAudios.splice(i, 1)" class="text-white/35 hover:text-rose-300"><Icon name="close" class="w-3.5 h-3.5" /></button>
+            </div>
+            <button v-if="refAudios.length < maxAudioRefs && remainingMediaRefs > 0" type="button" @click="audioInput?.click()" class="w-full rounded-lg border border-dashed border-white/15 py-2 text-xs text-white/40">+ MP3 / WAV / M4A</button>
+          </div>
+          <input ref="audioInput" type="file" accept="audio/mpeg,audio/wav,audio/mp4,audio/aac,.mp3,.wav,.m4a,.aac" multiple class="hidden" @change="onAudioFiles" />
+        </div>
+
+        <label v-if="isVideo && supportsAudioOutput" class="flex items-center justify-between text-xs text-white/60">
+          生成同步音频
+          <input v-model="generateAudio" type="checkbox" class="accent-indigo-500" />
+        </label>
 
         <button @click="run" :disabled="busy" class="btn-primary w-full">
           <Icon name="spark" class="w-4 h-4" /> {{ busy ? (isVideo ? '生成中…(请耐心等待)' : '生成中…') : '生成' }}

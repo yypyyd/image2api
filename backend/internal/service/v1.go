@@ -34,20 +34,25 @@ import (
 )
 
 var (
-	ErrMissingAPIKey       = errors.New("missing api key")
-	ErrInvalidAPIKey       = errors.New("invalid api key")
-	ErrUnknownModel        = errors.New("unknown model")
-	ErrUnsupportedParams   = errors.New("unsupported or unpriced parameters for this model")
-	ErrBannedPrompt        = errors.New("prompt contains banned content")
-	ErrInsufficientFunds   = errors.New("insufficient credits")
-	ErrGenerationPending   = errors.New("generation executor not implemented yet")
-	ErrProviderAuth        = errors.New("provider token invalid or expired")
-	ErrNoProviderAccount   = errors.New("no provider account available, please ask an admin to configure one")
-	ErrProviderQuota       = errors.New("provider quota exhausted")
-	ErrProviderTemporary   = errors.New("provider temporary unavailable")
-	ErrProviderExecution   = errors.New("provider request failed")
-	ErrProviderUnsupported = errors.New("provider not implemented")
-	ErrReferenceTooLarge   = errors.New("reference image too large")
+	ErrMissingAPIKey          = errors.New("missing api key")
+	ErrInvalidAPIKey          = errors.New("invalid api key")
+	ErrUnknownModel           = errors.New("unknown model")
+	ErrUnsupportedParams      = errors.New("unsupported or unpriced parameters for this model")
+	ErrBannedPrompt           = errors.New("prompt contains banned content")
+	ErrInsufficientFunds      = errors.New("insufficient credits")
+	ErrGenerationPending      = errors.New("generation executor not implemented yet")
+	ErrProviderAuth           = errors.New("provider token invalid or expired")
+	ErrNoProviderAccount      = errors.New("no provider account available, please ask an admin to configure one")
+	ErrProviderQuota          = errors.New("provider quota exhausted")
+	ErrProviderTemporary      = errors.New("provider temporary unavailable")
+	ErrProviderExecution      = errors.New("provider request failed")
+	ErrProviderUnsupported    = errors.New("provider not implemented")
+	ErrReferenceTooLarge      = errors.New("reference image too large")
+	ErrReferenceVideoTooLarge = errors.New("reference video too large")
+	ErrReferenceAudioTooLarge = errors.New("reference audio too large")
+	// Alias the provider sentinel so HTTP handlers can classify a request-level
+	// moderation refusal without importing Adobe internals.
+	ErrContentRejected = adobe.ErrContentRejected
 	// ErrConcurrencyFull — every eligible account remained at its configured
 	// concurrency limit after the bounded provider queue wait.
 	ErrConcurrencyFull = errors.New("all accounts are at their concurrency limit, please try again shortly")
@@ -63,7 +68,11 @@ var (
 // maxReferenceImageBytes bounds a single decoded reference image. 20 MB
 // comfortably covers real photos/screenshots; anything larger is almost
 // certainly abuse or a mistake. Mirrors Python core/refs.py.
-const maxReferenceImageBytes = 20 * 1024 * 1024
+const (
+	maxReferenceImageBytes = 20 * 1024 * 1024
+	maxReferenceVideoBytes = 200 * 1024 * 1024
+	maxReferenceAudioBytes = 50 * 1024 * 1024
+)
 
 type V1Service struct {
 	cfg      *config.Config
@@ -291,10 +300,21 @@ type V1VideoRequest struct {
 	AspectRatio     string
 	Resolution      string
 	ReferenceImages []string
+	ReferenceVideos []MediaReference
+	ReferenceAudios []MediaReference
+	GenerateAudio   bool
 	// BaseURL — see V1ImageRequest.BaseURL.
 	BaseURL string
 	// AccountID — see V1ImageRequest.AccountID.
 	AccountID string
+}
+
+// MediaReference owns the uploaded bytes so asynchronous /v1/videos jobs do not
+// retain multipart file handles after the HTTP request has returned.
+type MediaReference struct {
+	Data        []byte
+	ContentType string
+	Filename    string
 }
 
 func NewV1Service(cfg *config.Config, models *repo.ModelRepository, users *repo.UserRepository, events *repo.EventRepository, tokens *repo.TokenRepository, settings *repo.SiteSettingRepository, cgroups *repo.ConcurrencyGroupRepository, conc *ConcurrencyService, adobeClient *adobe.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, leonardoClient *leonardo.Client, kreaClient *krea.Client, imagineClient *imagine.Client, grokClient *grok.Client, customClient *custom.Client, store *storage.Client) *V1Service {
@@ -465,6 +485,10 @@ func v1ModelEntry(item model.ModelConfig, created int64, extended bool) map[stri
 	// request validation. Clients use these fields to render the correct number
 	// of upload slots and to distinguish ordered frames from unordered assets.
 	entry["max_reference_images"] = max(0, item.MaxReferenceImages)
+	entry["max_reference_videos"] = max(0, item.MaxReferenceVideos)
+	entry["max_reference_audios"] = max(0, item.MaxReferenceAudios)
+	entry["max_reference_media"] = max(0, item.MaxReferenceMedia)
+	entry["supports_audio_output"] = item.SupportsAudioOutput
 	entry["reference_mode"] = defaultString(strings.TrimSpace(item.ReferenceMode), "none")
 	// Video models expose their selectable clip lengths (the /v1/videos
 	// `seconds` param) so a key holder can discover them, e.g. ["5s","8s"].
@@ -949,6 +973,8 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 				return nil, ErrProviderQuota
 			case errors.Is(execErr, adobe.ErrTemporaryUpstream):
 				return nil, ErrProviderTemporary
+			case errors.Is(execErr, adobe.ErrContentRejected):
+				return nil, execErr
 			default:
 				return nil, fmt.Errorf("%w: %v", ErrProviderExecution, execErr)
 			}
@@ -1284,7 +1310,7 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 		s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, source, err.Error())
 		return nil, err
 	}
-	refCount := len(in.ReferenceImages)
+	refCount := len(in.ReferenceImages) + len(in.ReferenceVideos) + len(in.ReferenceAudios)
 	// API-key (source "v1") requests return base64 inline and never persist a
 	// file — see prepareImageExecution for the rationale.
 	noStore := source == "v1"
@@ -1337,6 +1363,8 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 			return nil, ErrProviderQuota
 		case errors.Is(execErr, adobe.ErrTemporaryUpstream), errors.Is(execErr, runway.ErrTemporaryUpstream), errors.Is(execErr, grok.ErrTemporaryUpstream), errors.Is(execErr, custom.ErrTemporaryUpstream):
 			return nil, ErrProviderTemporary
+		case errors.Is(execErr, adobe.ErrContentRejected):
+			return nil, execErr
 		default:
 			return nil, fmt.Errorf("%w: %v", ErrProviderExecution, execErr)
 		}
@@ -1439,7 +1467,7 @@ func (s *V1Service) StartVideoJob(ctx context.Context, principal *APIPrincipal, 
 	}
 	// Source "v1": no output file is allocated — the result is the upstream URL,
 	// stored on the event when the render completes.
-	eventID, err := s.logPendingEvent(ctx, "video", modelItem, principal, in.Prompt, aspectRatio, resolution, duration, len(in.ReferenceImages), price, "", "v1", nil, false, "")
+	eventID, err := s.logPendingEvent(ctx, "video", modelItem, principal, in.Prompt, aspectRatio, resolution, duration, len(in.ReferenceImages)+len(in.ReferenceVideos)+len(in.ReferenceAudios), price, "", "v1", nil, false, "")
 	if err != nil {
 		return nil, err
 	}
@@ -1837,16 +1865,21 @@ func (s *V1Service) prepareVideo(ctx context.Context, principal *APIPrincipal, i
 	} else if !ok {
 		return nil, "", "", "", 0, ErrNoProviderAccount
 	}
-	refLimit := modelItem.MaxReferenceImages
-	if refLimit <= 0 {
-		refLimit = 10
-	}
-	if len(in.ReferenceImages) > refLimit {
-		return nil, "", "", "", 0, errors.New("too many reference images")
+	if err := validateVideoReferenceLimits(modelItem, in); err != nil {
+		return nil, "", "", "", 0, err
 	}
 	// Reject oversized reference images before charging (all providers, all paths).
 	if err := ensureReferenceSizes(in.ReferenceImages); err != nil {
 		return nil, "", "", "", 0, err
+	}
+	if err := validateMediaReferences(in.ReferenceVideos, "video"); err != nil {
+		return nil, "", "", "", 0, err
+	}
+	if err := validateMediaReferences(in.ReferenceAudios, "audio"); err != nil {
+		return nil, "", "", "", 0, err
+	}
+	if len(in.ReferenceVideos) > 0 && (modelItem.ID == "firefly-kling-3" || modelItem.ID == "firefly-kling-o3") && parseDurationSeconds(duration) > 10 {
+		return nil, "", "", "", 0, fmt.Errorf("%w: Kling video modification supports 3s to 10s", ErrUnsupportedParams)
 	}
 	// Runway i2v strictly requires exactly one first-frame image. Enforce it here,
 	// BEFORE charging, so a missing/extra frame fails fast instead of charge →
@@ -2292,11 +2325,7 @@ func (s *V1Service) generateAdobeVideo(ctx context.Context, eventID string, mode
 	}
 	s.rotateRoundRobin("adobe", active)
 
-	refLimit := modelItem.MaxReferenceImages
-	if refLimit <= 0 {
-		refLimit = 10
-	}
-	refs, err := decodeReferenceImages(in.ReferenceImages, refLimit)
+	refs, err := decodeReferenceImages(in.ReferenceImages, max(1, modelItem.MaxReferenceImages))
 	if err != nil {
 		return nil, "", err
 	}
@@ -2310,15 +2339,29 @@ func (s *V1Service) generateAdobeVideo(ctx context.Context, eventID string, mode
 	// captured from the successful attempt's meta (the upstream presigned URL).
 	var videoURL string
 	data, err := s.runPoolWithFailover(ctx, eventID, "adobe", active, "video", func(token model.TokenAccount) ([]byte, error) {
-		var blobIDs []string
+		inputs := adobe.VideoInputs{GenerateAudio: in.GenerateAudio}
 		for _, ref := range refs {
 			id, upErr := s.adobe.UploadImage(ctx, token.Value, ref, "image/png", engine)
 			if upErr != nil {
 				return nil, upErr
 			}
-			blobIDs = append(blobIDs, id)
+			inputs.ImageBlobIDs = append(inputs.ImageBlobIDs, id)
 		}
-		bytes, meta, genErr := s.adobe.GenerateVideo(ctx, token.Value, engine, in.Prompt, aspectRatio, durationSeconds, resolution, referenceMode, upstreamModel, blobIDs, downloadResult)
+		for _, ref := range in.ReferenceVideos {
+			id, upErr := s.adobe.UploadMedia(ctx, token.Value, ref.Data, ref.ContentType, engine, "video")
+			if upErr != nil {
+				return nil, upErr
+			}
+			inputs.VideoBlobIDs = append(inputs.VideoBlobIDs, id)
+		}
+		for _, ref := range in.ReferenceAudios {
+			id, upErr := s.adobe.UploadMedia(ctx, token.Value, ref.Data, ref.ContentType, engine, "audio")
+			if upErr != nil {
+				return nil, upErr
+			}
+			inputs.AudioBlobIDs = append(inputs.AudioBlobIDs, id)
+		}
+		bytes, meta, genErr := s.adobe.GenerateVideo(ctx, token.Value, engine, in.Prompt, aspectRatio, durationSeconds, resolution, referenceMode, upstreamModel, inputs, downloadResult)
 		if genErr == nil {
 			videoURL = strings.TrimSpace(stringValue(meta["video_url"]))
 		}
@@ -3536,6 +3579,59 @@ func ensureReferenceSizes(inputs []string) error {
 		}
 		if (len(v)*3)/4 > maxReferenceImageBytes {
 			return ErrReferenceTooLarge
+		}
+	}
+	return nil
+}
+
+func validateVideoReferenceLimits(modelItem *model.ModelConfig, in V1VideoRequest) error {
+	imageLimit := max(0, modelItem.MaxReferenceImages)
+	videoLimit := max(0, modelItem.MaxReferenceVideos)
+	audioLimit := max(0, modelItem.MaxReferenceAudios)
+	if len(in.ReferenceImages) > imageLimit {
+		return fmt.Errorf("%w: this model accepts at most %d reference images", ErrUnsupportedParams, imageLimit)
+	}
+	if len(in.ReferenceVideos) > videoLimit {
+		return fmt.Errorf("%w: this model accepts at most %d reference videos", ErrUnsupportedParams, videoLimit)
+	}
+	if len(in.ReferenceAudios) > audioLimit {
+		return fmt.Errorf("%w: this model accepts at most %d reference audios", ErrUnsupportedParams, audioLimit)
+	}
+	if totalLimit := max(0, modelItem.MaxReferenceMedia); totalLimit > 0 {
+		total := len(in.ReferenceImages) + len(in.ReferenceVideos) + len(in.ReferenceAudios)
+		if total > totalLimit {
+			return fmt.Errorf("%w: this model accepts at most %d reference media items in total", ErrUnsupportedParams, totalLimit)
+		}
+	}
+	if in.GenerateAudio && !modelItem.SupportsAudioOutput {
+		return fmt.Errorf("%w: this model does not support generated audio", ErrUnsupportedParams)
+	}
+	return nil
+}
+
+func validateMediaReferences(inputs []MediaReference, kind string) error {
+	for _, ref := range inputs {
+		if len(ref.Data) == 0 {
+			return fmt.Errorf("empty reference %s", kind)
+		}
+		contentType := strings.ToLower(strings.TrimSpace(strings.Split(ref.ContentType, ";")[0]))
+		switch kind {
+		case "video":
+			if len(ref.Data) > maxReferenceVideoBytes {
+				return ErrReferenceVideoTooLarge
+			}
+			if contentType != "video/mp4" && contentType != "video/quicktime" && contentType != "video/mov" {
+				return fmt.Errorf("%w: reference video must be MP4 or MOV", ErrUnsupportedParams)
+			}
+		case "audio":
+			if len(ref.Data) > maxReferenceAudioBytes {
+				return ErrReferenceAudioTooLarge
+			}
+			switch contentType {
+			case "audio/mpeg", "audio/wav", "audio/x-wav", "audio/mp4", "audio/aac", "audio/x-m4a":
+			default:
+				return fmt.Errorf("%w: unsupported reference audio format", ErrUnsupportedParams)
+			}
 		}
 	}
 	return nil

@@ -1,6 +1,9 @@
 package adobe
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestResolveNewPartnerModels(t *testing.T) {
 	tests := []struct {
@@ -38,7 +41,7 @@ func TestNewPartnerPayloadShapes(t *testing.T) {
 }
 
 func TestVeo31LitePayload(t *testing.T) {
-	payload := BuildVideoPayload("veo31-lite", "test", "16:9", 4, "720p", "frame", "", nil)
+	payload := BuildVideoPayload("veo31-lite", "test", "16:9", 4, "720p", "frame", "", VideoInputs{})
 	if payload["modelId"] != "veo" || payload["modelVersion"] != "3.1-lite-generate" {
 		t.Fatalf("unexpected Veo Lite model: %v/%v", payload["modelId"], payload["modelVersion"])
 	}
@@ -58,7 +61,7 @@ func TestNewPartnerVideoPayloads(t *testing.T) {
 		{"seedance20-fast", "seedance", "seedance_2.0_fast"},
 	}
 	for _, tt := range tests {
-		payload := BuildVideoPayload(tt.engine, "test", "16:9", 5, "720p", "frame", "", nil)
+		payload := BuildVideoPayload(tt.engine, "test", "16:9", 5, "720p", "frame", "", VideoInputs{})
 		if payload["modelId"] != tt.modelID || payload["modelVersion"] != tt.version {
 			t.Fatalf("%s model = %v/%v", tt.engine, payload["modelId"], payload["modelVersion"])
 		}
@@ -120,15 +123,71 @@ func TestSupportsVideoResolution(t *testing.T) {
 }
 
 func TestSeedanceAndRayResolutionPayloads(t *testing.T) {
-	seedance := BuildVideoPayload("seedance20", "test", "16:9", 5, "480p", "frame", "", nil)
+	seedance := BuildVideoPayload("seedance20", "test", "16:9", 5, "480p", "frame", "", VideoInputs{})
 	seedanceSize := seedance["size"].(map[string]any)
 	if seedanceSize["width"] != 854 || seedanceSize["height"] != 480 {
 		t.Fatalf("Seedance 480p size = %#v", seedanceSize)
 	}
 
-	ray := BuildVideoPayload("luma", "test", "16:9", 5, "4K", "frame", "", nil)
+	ray := BuildVideoPayload("luma", "test", "16:9", 5, "4K", "frame", "", VideoInputs{})
 	raySize := ray["size"].(map[string]any)
 	if raySize["width"] != 3840 || raySize["height"] != 2160 {
 		t.Fatalf("Ray 4K size = %#v", raySize)
+	}
+}
+
+func TestVideoMediaAndAudioPayloads(t *testing.T) {
+	veo := BuildVideoPayload("veo31-fast", "test", "16:9", 8, "1080p", "frame", "", VideoInputs{GenerateAudio: true})
+	if veo["generateAudio"] != true {
+		t.Fatalf("Veo generateAudio = %#v", veo["generateAudio"])
+	}
+
+	kling := BuildVideoPayload("kling-o3", "test", "16:9", 5, "1080p", "frame", "", VideoInputs{
+		ImageBlobIDs: []string{"image-1"}, VideoBlobIDs: []string{"video-1"}, GenerateAudio: true,
+	})
+	if kling["modelVersion"] != "kling_o3_pro_v2v_reference" {
+		t.Fatalf("Kling V2V modelVersion = %#v", kling["modelVersion"])
+	}
+	if kling["generateAudio"] != true {
+		t.Fatalf("Kling generateAudio = %#v", kling["generateAudio"])
+	}
+	refs := kling["referenceBlobs"].([]any)
+	if len(refs) != 2 || refs[0].(map[string]any)["usage"] != "source" {
+		t.Fatalf("Kling references = %#v", refs)
+	}
+
+	seedance := BuildVideoPayload("seedance20", "test", "9:16", 15, "1080p", "frame", "", VideoInputs{
+		VideoBlobIDs: []string{"video-1"}, AudioBlobIDs: []string{"audio-1"}, GenerateAudio: true,
+	})
+	seedRefs := seedance["referenceBlobs"].([]any)
+	if len(seedRefs) != 2 || seedance["generateAudio"] != true {
+		t.Fatalf("Seedance multimodal payload = %#v", seedance)
+	}
+	if seedRefs[0].(map[string]any)["mention"] == nil || seedRefs[1].(map[string]any)["mention"] == nil {
+		t.Fatalf("Seedance source mentions missing: %#v", seedRefs)
+	}
+	for _, ref := range seedRefs {
+		mention := ref.(map[string]any)["mention"].(map[string]any)
+		if len(mention["id"].(string)) < 21 {
+			t.Fatalf("Seedance mention id is too short: %#v", mention)
+		}
+	}
+}
+
+func TestSeedanceKeepsAllReferenceImagesWithinSharedLimit(t *testing.T) {
+	payload := BuildVideoPayload("seedance20-fast", "test", "16:9", 15, "1080p", "asset", "", VideoInputs{
+		ImageBlobIDs: []string{"image-1", "image-2", "image-3", "image-4"},
+		VideoBlobIDs: []string{"video-1", "video-2", "video-3"},
+		AudioBlobIDs: []string{"audio-1", "audio-2"},
+	})
+	refs := payload["referenceBlobs"].([]any)
+	if len(refs) != 9 {
+		t.Fatalf("Seedance references = %d, want 9: %#v", len(refs), refs)
+	}
+	for i, raw := range refs[:4] {
+		ref := raw.(map[string]any)
+		if ref["usage"] != "style" || ref["id"] != fmt.Sprintf("image-%d", i+1) {
+			t.Fatalf("Seedance image reference %d = %#v", i, ref)
+		}
 	}
 }

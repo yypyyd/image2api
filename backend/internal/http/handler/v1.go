@@ -218,16 +218,32 @@ func (h *V1Handler) CreateVideo(c *gin.Context) {
 	}
 	var modelID, prompt, seconds, size string
 	var refs []string
+	var videos, audios []service.MediaReference
+	var generateAudio bool
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxGenerateMultipartBytes)
 	if strings.HasPrefix(c.GetHeader("Content-Type"), "multipart/form-data") {
-		if err := c.Request.ParseMultipartForm(64 << 20); err != nil {
+		if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
 			openaiError(c, http.StatusBadRequest, "invalid_request_error", "", "invalid multipart form")
 			return
 		}
+		defer c.Request.MultipartForm.RemoveAll()
 		modelID = c.PostForm("model")
 		prompt = c.PostForm("prompt")
 		seconds = c.PostForm("seconds")
 		size = c.PostForm("size")
-		refs = readMultipartImages(c, "input_reference", "input_reference[]")
+		var readErr error
+		refs, readErr = readMultipartImagesStrict(c, "input_reference", "input_reference[]", "reference_images", "reference_images[]")
+		if readErr == nil {
+			videos, readErr = readMultipartMedia(c, 200<<20, "reference_videos", "reference_videos[]", "input_video")
+		}
+		if readErr == nil {
+			audios, readErr = readMultipartMedia(c, 50<<20, "reference_audios", "reference_audios[]", "input_audio")
+		}
+		if readErr != nil {
+			openaiError(c, http.StatusBadRequest, "invalid_request_error", "", readErr.Error())
+			return
+		}
+		generateAudio = parseFormBool(c.PostForm("generate_audio"))
 	} else {
 		var body struct {
 			Model   string          `json:"model"`
@@ -238,6 +254,9 @@ func (h *V1Handler) CreateVideo(c *gin.Context) {
 			// data-URI strings — the JSON equivalent of multipart input_reference.
 			InputReference  []string `json:"input_reference"`
 			ReferenceImages []string `json:"reference_images"`
+			ReferenceVideos []string `json:"reference_videos"`
+			ReferenceAudios []string `json:"reference_audios"`
+			GenerateAudio   bool     `json:"generate_audio"`
 		}
 		if err := c.ShouldBindJSON(&body); err != nil {
 			openaiError(c, http.StatusBadRequest, "invalid_request_error", "", "invalid request body")
@@ -246,6 +265,15 @@ func (h *V1Handler) CreateVideo(c *gin.Context) {
 		modelID, prompt, size = body.Model, body.Prompt, body.Size
 		seconds = rawToString(body.Seconds)
 		refs = append(body.InputReference, body.ReferenceImages...)
+		videos, err = decodeJSONMedia(body.ReferenceVideos, "video/mp4")
+		if err == nil {
+			audios, err = decodeJSONMedia(body.ReferenceAudios, "audio/mpeg")
+		}
+		if err != nil {
+			openaiError(c, http.StatusBadRequest, "invalid_request_error", "", err.Error())
+			return
+		}
+		generateAudio = body.GenerateAudio
 	}
 	duration := strings.TrimSpace(seconds)
 	if duration != "" && !strings.HasSuffix(duration, "s") {
@@ -259,6 +287,9 @@ func (h *V1Handler) CreateVideo(c *gin.Context) {
 		AspectRatio:     aspect,
 		Resolution:      resolution,
 		ReferenceImages: refs,
+		ReferenceVideos: videos,
+		ReferenceAudios: audios,
+		GenerateAudio:   generateAudio,
 		BaseURL:         requestBaseURL(c),
 	})
 	if err != nil {
@@ -439,6 +470,8 @@ func (h *V1Handler) writeV1Error(c *gin.Context, err error, payload map[string]a
 		openaiError(c, http.StatusNotFound, "invalid_request_error", "model_not_found", err.Error())
 	case errors.Is(err, service.ErrUnsupportedParams), errors.Is(err, service.ErrBannedPrompt):
 		openaiError(c, http.StatusBadRequest, "invalid_request_error", "", err.Error())
+	case errors.Is(err, service.ErrContentRejected):
+		openaiError(c, http.StatusBadRequest, "invalid_request_error", "content_policy_violation", err.Error())
 	case errors.Is(err, service.ErrInsufficientFunds):
 		openaiError(c, http.StatusPaymentRequired, "insufficient_quota", "insufficient_quota", err.Error())
 	case errors.Is(err, service.ErrReferenceTooLarge):

@@ -55,6 +55,33 @@ func seedDefaults(ctx context.Context, db *gorm.DB) error {
 			return err
 		}
 	}
+	// Built-in Adobe video capabilities are catalog-owned (the admin form shows
+	// them read-only). Backfill existing model rows after adding the media columns,
+	// so an upgrade behaves the same as adding the model on a fresh install.
+	if err := db.WithContext(ctx).Exec(`UPDATE model_configs SET
+		max_reference_images = CASE id
+			WHEN 'firefly-seedance-2' THEN 9 WHEN 'firefly-seedance-2-fast' THEN 9
+			ELSE max_reference_images END,
+		max_reference_videos = CASE id
+			WHEN 'firefly-kling-3' THEN 1 WHEN 'firefly-kling-o3' THEN 1
+			WHEN 'firefly-seedance-2' THEN 3 WHEN 'firefly-seedance-2-fast' THEN 3
+			WHEN 'firefly-ray' THEN 1 WHEN 'firefly-video' THEN 1 ELSE max_reference_videos END,
+		max_reference_audios = CASE id
+			WHEN 'firefly-seedance-2' THEN 3 WHEN 'firefly-seedance-2-fast' THEN 3 ELSE max_reference_audios END,
+		max_reference_media = CASE id
+			WHEN 'firefly-seedance-2' THEN 9 WHEN 'firefly-seedance-2-fast' THEN 9
+			ELSE max_reference_media END,
+		reference_mode = CASE id
+			WHEN 'firefly-seedance-2' THEN 'asset' WHEN 'firefly-seedance-2-fast' THEN 'asset'
+			ELSE reference_mode END,
+		supports_audio_output = CASE id
+			WHEN 'gemini-veo31' THEN true WHEN 'firefly-kling-3' THEN true
+			WHEN 'firefly-kling-o3' THEN true WHEN 'firefly-seedance-2' THEN true
+			WHEN 'firefly-seedance-2-fast' THEN true ELSE supports_audio_output END
+		WHERE id IN ('gemini-veo31','firefly-kling-3','firefly-kling-o3','firefly-seedance-2',
+			'firefly-seedance-2-fast','firefly-ray','firefly-video')`).Error; err != nil {
+		return err
+	}
 	// One-time backfill of the persistent per-model generation counter from
 	// historical success logs, so the admin "次数" keeps its running total when we
 	// switch it off the (retention-pruned) event_log. Only touches models still at

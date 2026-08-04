@@ -1,5 +1,29 @@
 # Design Notes
 
+### 2026-08-04 - Seedance shared reference limit and Adobe privacy refusals
+
+**Change**: Seedance 2 and Seedance 2 Fast now advertise 9 reference images, 3 reference videos, and 3 reference audios, with `max_reference_media: 9` enforcing Adobe's shared `referenceBlobs` limit. Their images use the upstream `style` asset mode and all validated image blob IDs are forwarded. Adobe's `reference_image_privacy_error` is classified as a request-level content rejection with a user-facing Chinese explanation.
+
+**Reason**: Adobe's resolved discovery schema declares both per-media limits and a lower shared total. Advertising only the old 2/1/1 limits hid supported inputs, while advertising 9/3/3 without the shared cap would incorrectly imply that 15 files can be combined. Privacy refusals are caused by a real face in the reference image, not by account health.
+
+**Impact**: Model discovery, admin catalog/model views, the playground, and admin test modal expose and enforce the shared total before charging. Content/privacy refusals fail immediately without account failover or failure penalties; generic Adobe 451 legal errors retain their existing upstream-failure classification.
+
+**Decision**: Keep per-type and aggregate limits as separate model fields. A zero aggregate limit means no additional shared cap, preserving existing custom and non-Seedance model behavior.
+
+### 2026-08-04 - Typed video reference media and generated audio
+
+**Change**: Video model capabilities now independently declare image, video, and audio reference limits plus generated-audio support. Session generation, admin tests, and `POST /v1/videos` accept multipart `reference_images`, `reference_videos`, and `reference_audios` fields and a `generate_audio` flag. Adobe media uploads use the matching `/v2/storage/{image|video|audio}` endpoint, and model-specific payloads map those blob IDs into Seedance multimodal, Kling/Luma video-modify, Firefly structure-reference, and Veo/Kling/Seedance audio-output requests.
+
+**Reason**: Treating every reference as a Base64 image made Adobe's video/audio inputs unusable and inflated large media by roughly one third. It also hid the upstream audio-output capability from clients.
+
+**Impact**: Multipart requests are buffered into owned byte slices before asynchronous jobs start; per-file limits are 20 MiB for images, 200 MiB for video, and 50 MiB for audio. MP4/MOV and a conservative audio MIME allowlist are enforced before charging. The reverse-proxy and request upload limit increases to 320 MiB. Existing JSON image-reference requests remain compatible; JSON video/audio references are accepted as raw Base64 or data URIs.
+
+**Decision**: Capabilities are model data and validation is fail-closed. Models whose video, audio, or generated-audio support is not confirmed retain zero/false fields and reject those inputs before debit. Known built-in Adobe rows are backfilled during startup migration.
+
+**Security boundary**: Media endpoints require the existing session or API-key authentication. The gateway bounds the whole request and every file before provider selection, ignores client filenames for filesystem access, and sends accepted bytes only to the configured Adobe storage endpoint. Model capability checks and MIME allowlists run before debit and upload.
+
+**Known risk**: MIME headers and filename extensions are format hints, not a full media decoder; Adobe remains responsible for parsing the actual container. A request near the 320 MiB ceiling is held in memory because asynchronous jobs cannot retain temporary multipart handles, so deployments should keep the existing user-concurrency controls and add edge rate limits when exposing large uploads publicly.
+
 ### 2026-07-26 - OpenAI-compatible text reverse proxy
 
 **Change**: Added `POST /v1/chat/completions` for both the existing ChatGPT Web account pool and custom OpenAI-compatible upstream accounts. Custom upstreams support ordinary JSON and live SSE pass-through; ChatGPT Web responses are normalized into OpenAI JSON or a compatible SSE sequence after the web turn completes. Managed models now accept `type: "text"` and use `prices.request` / `prices_agent.request` as a fixed per-request charge. The admin catalog exposes ChatGPT's real model slugs `gpt-5-5-mini` and `gpt-5-5-thinking`.

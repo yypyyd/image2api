@@ -83,7 +83,7 @@
 ## 🚀 核心功能
 
 #### 🎨 生成能力
-- 生图 + 生视频一站式,支持**图生图 / 参考图**(首帧、末帧、风格参考)
+- 生图 + 生视频一站式,支持**图生图 / 参考图**(首帧、末帧、风格参考)，以及按模型声明的参考视频、参考音频与同步音频生成
 - 多分辨率(图像 1K / 2K / 4K · 视频 720p / 1080p)、多宽高比、视频多时长,按模型独立配置与定价
 - 7 大供应商、十余模型,后台**动态启用 / 下架 / 改价**,无需改代码
 - **模型别名**:同一模型可配多个对外 id,API 调用任意别名均可命中
@@ -92,7 +92,7 @@
 #### 🔌 OpenAI 兼容
 - 文本对话 `/v1/chat/completions`(普通 JSON + SSE 流式,兼容 OpenAI SDK)
 - 可直接复用后台现有 ChatGPT 账号池并使用真实模型名(`gpt-5-5-mini` / `gpt-5-5-thinking`);Grok 账号既可运行 Web fast 对话,也会按需用 SSO 自动授权 Grok Build OAuth,通过真实 `grok-4.5` 模型对话;还可走自定义 OpenAI 兼容上游
-- 文生图 `/v1/images/generations` · 图生图 `/v1/images/edits`(multipart 上传参考图) · 视频 `/v1/videos`(Sora 式异步:创建→轮询→`/content` 下载) · `/v1/models`(默认严格 OpenAI 字段；`?extended=true` 可取能力元数据，包括 `max_reference_images`、`reference_mode`，比例统一为 `W:H`)
+- 文生图 `/v1/images/generations` · 图生图 `/v1/images/edits`(multipart 上传参考图) · 视频 `/v1/videos`(Sora 式异步:创建→轮询→`/content` 下载，支持按模型上传参考视频/音频及生成同步音频) · `/v1/models`(默认严格 OpenAI 字段；`?extended=true` 可取参考图片/视频/音频、三类素材合计上限 `max_reference_media` 与音频输出等能力元数据，比例统一为 `W:H`)
 - **严格 OpenAI 入参**:`size` **同时决定比例 + 分辨率档**(图像看长边 → 1K/2K/4K,视频看短边 → 720p/1080p),改个 `base_url` + `api_key` 即接现有 OpenAI SDK
 - 图片结果默认返回 **URL**,普通请求不下载、不做 base64 编码、不留存文件;显式传 `response_format=b64_json` 时才内联图片。携带 `Idempotency-Key` 的请求会把结果保存到账号私有存储,可在网关超时后通过任务查询恢复;站内 **/docs** 附「分辨率对照表」直接查 `size` 该传什么
 
@@ -105,7 +105,7 @@
 #### 🔗 自定义上游聚合(OpenAI 兼容)
 - 把任意 **OpenAI 兼容的 v1 端点**当成一个账号接入(填 `base_url` + `key`),无需写代码
 - **按 model id 自动路由**:上游声明支持哪些 id,生成该 id 时即走对应上游(可覆盖内置 provider);id 留空 = 全部
-- 模型管理里自由新建自定义模型(id / 文本·图像·视频类型 / 每请求价 / 分辨率·价 / 时长·价 / 参考图),按本地价计费
+- 模型管理里自由新建自定义模型(id / 文本·图像·视频类型 / 每请求价 / 分辨率·价 / 时长·价 / 多媒体参考能力),按本地价计费
 - 调用**直连不走代理**;上游可配权重与并发,与内置池统一调度
 
 #### 🔐 Token 自动保活
@@ -222,7 +222,7 @@ server {
     ssl_certificate_key /path/privkey.pem;
     root /path/to/frontend/dist;
     index index.html;
-    client_max_body_size 50m;
+    client_max_body_size 320m;
     proxy_read_timeout 600s;            # 视频生成耗时长
 
     location /assets/ { expires 1y; add_header Cache-Control "public, max-age=31536000, immutable"; }

@@ -403,6 +403,10 @@ func (s *AdminWriteService) CreateModel(ctx context.Context, body map[string]any
 		DurationPricesAgent: jsonMap(body["duration_prices_agent"]),
 		Durations:           jsonArray(body["durations"]),
 		MaxReferenceImages:  intValue(body["max_reference_images"]),
+		MaxReferenceVideos:  intValue(body["max_reference_videos"]),
+		MaxReferenceAudios:  intValue(body["max_reference_audios"]),
+		MaxReferenceMedia:   intValue(body["max_reference_media"]),
+		SupportsAudioOutput: boolValueWithDefault(body["supports_audio_output"], false),
 		ReferenceMode:       defaultString(strings.TrimSpace(stringValue(body["reference_mode"])), "none"),
 		Weight:              intValue(body["weight"]),
 		CreatedAt:           time.Now(),
@@ -478,6 +482,18 @@ func (s *AdminWriteService) UpdateModel(ctx context.Context, modelID string, bod
 	}
 	if _, ok := body["max_reference_images"]; ok {
 		patch["max_reference_images"] = intValue(body["max_reference_images"])
+	}
+	if _, ok := body["max_reference_videos"]; ok {
+		patch["max_reference_videos"] = intValue(body["max_reference_videos"])
+	}
+	if _, ok := body["max_reference_audios"]; ok {
+		patch["max_reference_audios"] = intValue(body["max_reference_audios"])
+	}
+	if _, ok := body["max_reference_media"]; ok {
+		patch["max_reference_media"] = intValue(body["max_reference_media"])
+	}
+	if _, ok := body["supports_audio_output"]; ok {
+		patch["supports_audio_output"] = boolValueWithDefault(body["supports_audio_output"], false)
 	}
 	if _, ok := body["reference_mode"]; ok {
 		patch["reference_mode"] = defaultString(strings.TrimSpace(stringValue(body["reference_mode"])), "none")

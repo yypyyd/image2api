@@ -25,11 +25,11 @@ const (
 	videoSubmitURL  = "https://firefly-3p.ff.adobe.io/v2/3p-videos/generate-async"
 	// Firefly-native video model (project id "firefly-video"): distinct host,
 	// submit path and storage host from the 3p (veo/luma) video flow.
-	fireflyVideoSubmitURL = "https://video-v1.ff.adobe.io/v2/videos/generate"
-	fireflyVideoUploadURL = "https://video-v1.ff.adobe.io/v2/storage/image"
-	uploadURL             = "https://firefly-3p.ff.adobe.io/v2/storage/image"
-	creditsURL            = "https://firefly.adobe.io/v1/credits/balance"
-	creditsAPIKey         = "SunbreakWebUI1"
+	fireflyVideoSubmitURL   = "https://video-v1.ff.adobe.io/v2/videos/generate"
+	fireflyVideoStorageBase = "https://video-v1.ff.adobe.io/v2/storage"
+	storageBase             = "https://firefly-3p.ff.adobe.io/v2/storage"
+	creditsURL              = "https://firefly.adobe.io/v1/credits/balance"
+	creditsAPIKey           = "SunbreakWebUI1"
 )
 
 var (
@@ -41,15 +41,29 @@ var (
 	// the generated image (HTTP 451 image_unsafe). It is the prompt's fault, not
 	// the account's — every account rejects the same content — so the caller must
 	// surface it as-is without penalizing/killing the account or failing over.
-	ErrContentRejected = errors.New("adobe content rejected")
+	ErrContentRejected = errors.New("Adobe 内容安全审核未通过，请修改提示词或参考素材后重试")
 )
 
 // isContentRejection reports whether an Adobe response (status + body) is a
 // content-safety refusal rather than a genuine upstream/account failure. Adobe
-// returns HTTP 451 with an "*_unsafe" error_code when moderation blocks the
-// prompt or the produced image.
+// returns HTTP 451 with an "*_unsafe" code for general moderation, and
+// reference_image_privacy_error when a reference contains a real person's face.
 func isContentRejection(status int, body string) bool {
-	return status == 451 && strings.Contains(body, "unsafe")
+	if status != 451 {
+		return false
+	}
+	body = strings.ToLower(body)
+	return strings.Contains(body, "unsafe") || strings.Contains(body, "reference_image_privacy_error")
+}
+
+func contentRejectionError(status int, body string) error {
+	if !isContentRejection(status, body) {
+		return nil
+	}
+	if strings.Contains(strings.ToLower(body), "reference_image_privacy_error") {
+		return fmt.Errorf("%w：参考图片包含真人面部，Adobe 不允许将其用于生成内容，请更换不含真人面部的图片", ErrContentRejected)
+	}
+	return ErrContentRejected
 }
 
 var profileURLs = []string{
@@ -91,10 +105,20 @@ const uploadMaxRetries = 5
 // its original (non-temporary) classification so the account is not penalized
 // for a network blip.
 func (c *Client) UploadImage(ctx context.Context, token string, content []byte, contentType, engine string) (string, error) {
+	return c.UploadMedia(ctx, token, content, contentType, engine, "image")
+}
+
+// UploadMedia stores an image, video, or audio reference and returns the blob
+// id used by the video-generation request.
+func (c *Client) UploadMedia(ctx context.Context, token string, content []byte, contentType, engine, kind string) (string, error) {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	if kind != "image" && kind != "video" && kind != "audio" {
+		return "", errors.New("unsupported adobe media kind")
+	}
 	// Reference-image upload runs on the local IP (not the proxy).
-	body, err, retryable := c.uploadImageOnce(ctx, token, content, contentType, engine)
+	body, err, retryable := c.uploadMediaOnce(ctx, token, content, contentType, engine, kind)
 	for attempt := 0; err != nil && retryable && attempt < uploadMaxRetries && ctx.Err() == nil; attempt++ {
-		body, err, retryable = c.uploadImageOnce(ctx, token, content, contentType, engine)
+		body, err, retryable = c.uploadMediaOnce(ctx, token, content, contentType, engine, kind)
 	}
 	if err != nil {
 		return "", err
@@ -104,32 +128,51 @@ func (c *Client) UploadImage(ctx context.Context, token string, content []byte, 
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return "", err
 	}
-	if images, ok := payload["images"].([]any); ok && len(images) > 0 {
-		if first, ok := images[0].(map[string]any); ok {
-			if id := strings.TrimSpace(stringValue(first["id"])); id != "" {
-				return id, nil
-			}
-		}
-	}
-	if id := strings.TrimSpace(stringValue(payload["id"])); id != "" {
+	if id := uploadedMediaID(payload); id != "" {
 		return id, nil
 	}
 	return "", errors.New("adobe upload missing blob id")
 }
 
+func uploadedMediaID(payload map[string]any) string {
+	for _, key := range []string{"id", "blobId", "blob_id"} {
+		if id := strings.TrimSpace(stringValue(payload[key])); id != "" {
+			return id
+		}
+	}
+	for _, key := range []string{"images", "assets", "videos", "audios", "data"} {
+		switch value := payload[key].(type) {
+		case []any:
+			for _, item := range value {
+				if child, ok := item.(map[string]any); ok {
+					if id := uploadedMediaID(child); id != "" {
+						return id
+					}
+				}
+			}
+		case map[string]any:
+			if id := uploadedMediaID(value); id != "" {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
 // uploadImageOnce performs a single upload attempt and returns the raw response
 // body plus whether a failure is retryable (transport error / 429/451/5xx).
 // Auth failures (401/403) and other non-200s are not retryable.
-func (c *Client) uploadImageOnce(ctx context.Context, token string, content []byte, contentType, engine string) ([]byte, error, bool) {
+func (c *Client) uploadMediaOnce(ctx context.Context, token string, content []byte, contentType, engine, kind string) ([]byte, error, bool) {
 	sess, err := c.newDirectTLSClient()
 	if err != nil {
 		return nil, err, false
 	}
 
-	endpoint := uploadURL
+	base := storageBase
 	if engine == "firefly-video" {
-		endpoint = fireflyVideoUploadURL
+		base = fireflyVideoStorageBase
 	}
+	endpoint := base + "/" + kind
 	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(content))
 	if err != nil {
 		return nil, err, false
@@ -138,7 +181,7 @@ func (c *Client) uploadImageOnce(ctx context.Context, token string, content []by
 	req.Header = http.Header{
 		"authorization": {"Bearer " + strings.TrimSpace(token)},
 		"x-api-key":     {c.apiKey},
-		"content-type":  {defaultString(contentType, "image/png")},
+		"content-type":  {defaultString(contentType, defaultMediaContentType(kind))},
 		"accept":        {"*/*"},
 		"user-agent":    {sess.fp.userAgent},
 		http.HeaderOrderKey: {
@@ -172,6 +215,17 @@ func (c *Client) uploadImageOnce(ctx context.Context, token string, content []by
 		return nil, fmt.Errorf("adobe upload failed: %d %s", resp.StatusCode, clip(body, 300)), false
 	}
 	return body, nil, true
+}
+
+func defaultMediaContentType(kind string) string {
+	switch kind {
+	case "video":
+		return "video/mp4"
+	case "audio":
+		return "audio/mpeg"
+	default:
+		return "image/png"
+	}
 }
 
 func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspectRatio, resolution string, blobIDs []string, downloadResult bool) ([]byte, map[string]any, error) {
@@ -233,7 +287,7 @@ func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspe
 // With downloadResult=false it returns nil bytes and the upstream presigned URL
 // in meta["video_url"] — used by the async /v1/videos job, which proxies that URL
 // on /content instead of persisting the file.
-func (c *Client) GenerateVideo(ctx context.Context, token, engine, prompt, aspectRatio string, durationSeconds int, resolution, referenceMode, upstreamModel string, blobIDs []string, downloadResult bool) ([]byte, map[string]any, error) {
+func (c *Client) GenerateVideo(ctx context.Context, token, engine, prompt, aspectRatio string, durationSeconds int, resolution, referenceMode, upstreamModel string, inputs VideoInputs, downloadResult bool) ([]byte, map[string]any, error) {
 	// Only the submit goes through the proxy; polling + download run on the local IP.
 	submitSess, err := c.newTLSClient()
 	if err != nil {
@@ -244,7 +298,7 @@ func (c *Client) GenerateVideo(ctx context.Context, token, engine, prompt, aspec
 		return nil, nil, err
 	}
 
-	payload := BuildVideoPayload(engine, prompt, aspectRatio, durationSeconds, resolution, referenceMode, upstreamModel, blobIDs)
+	payload := BuildVideoPayload(engine, prompt, aspectRatio, durationSeconds, resolution, referenceMode, upstreamModel, inputs)
 	endpoint := videoSubmitURL
 	if engine == "firefly-video" {
 		endpoint = fireflyVideoSubmitURL
@@ -501,8 +555,8 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 	if b := string(respBody); strings.Contains(b, "system under load") || strings.Contains(b, "timeout_error") {
 		return respBody, "", ErrTemporaryUpstream
 	}
-	if isContentRejection(resp.StatusCode, string(respBody)) {
-		return respBody, "", ErrContentRejected
+	if rejectErr := contentRejectionError(resp.StatusCode, string(respBody)); rejectErr != nil {
+		return respBody, "", rejectErr
 	}
 	if resp.StatusCode == 429 || resp.StatusCode == 451 || resp.StatusCode >= 500 {
 		return respBody, "", ErrDeadUpstream
@@ -569,11 +623,11 @@ func (c *Client) pollImage(ctx context.Context, sess *tlsSession, token, pollURL
 		if b := string(body); strings.Contains(b, "system under load") || strings.Contains(b, "timeout_error") {
 			return nil, nil, ErrTemporaryUpstream
 		}
-		if isContentRejection(resp.StatusCode, string(body)) {
-			return nil, nil, fmt.Errorf("%w: %s", ErrContentRejected, clip(body, 300))
+		if rejectErr := contentRejectionError(resp.StatusCode, string(body)); rejectErr != nil {
+			return nil, nil, rejectErr
 		}
 		if resp.StatusCode == 429 || resp.StatusCode == 451 || resp.StatusCode >= 500 {
-			return nil, nil, ErrDeadUpstream
+			return nil, nil, fmt.Errorf("%w (poll %d: %s)", ErrDeadUpstream, resp.StatusCode, clip(body, 300))
 		}
 		if resp.StatusCode != 200 {
 			return nil, nil, fmt.Errorf("adobe poll failed: %d %s", resp.StatusCode, clip(body, 300))
@@ -680,8 +734,8 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 		// it's a bad token, a missing scope, or a WAF/fingerprint block.
 		return respBody, "", fmt.Errorf("%w (%d %s: %s)", ErrAuth, resp.StatusCode, resp.Header.Get("x-access-error"), clip(respBody, 300))
 	}
-	if isContentRejection(resp.StatusCode, string(respBody)) {
-		return respBody, "", ErrContentRejected
+	if rejectErr := contentRejectionError(resp.StatusCode, string(respBody)); rejectErr != nil {
+		return respBody, "", rejectErr
 	}
 	if resp.StatusCode == 408 || resp.StatusCode == 429 || resp.StatusCode == 451 || resp.StatusCode >= 500 {
 		// Keep the status and clipped body while preserving errors.Is semantics.
@@ -760,11 +814,11 @@ func (c *Client) pollVideo(ctx context.Context, sess *tlsSession, token, pollURL
 		if b := string(body); strings.Contains(b, "system under load") || strings.Contains(b, "timeout_error") {
 			return nil, nil, ErrTemporaryUpstream
 		}
-		if isContentRejection(resp.StatusCode, string(body)) {
-			return nil, nil, fmt.Errorf("%w: %s", ErrContentRejected, clip(body, 300))
+		if rejectErr := contentRejectionError(resp.StatusCode, string(body)); rejectErr != nil {
+			return nil, nil, rejectErr
 		}
 		if resp.StatusCode == 429 || resp.StatusCode == 451 || resp.StatusCode >= 500 {
-			return nil, nil, ErrDeadUpstream
+			return nil, nil, fmt.Errorf("%w (poll %d: %s)", ErrDeadUpstream, resp.StatusCode, clip(body, 300))
 		}
 		if resp.StatusCode != 200 {
 			return nil, nil, fmt.Errorf("adobe video poll failed: %d %s", resp.StatusCode, clip(body, 300))

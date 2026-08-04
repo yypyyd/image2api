@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 
@@ -33,14 +34,18 @@ func TestV1ModelEntryStrictByDefault(t *testing.T) {
 
 func TestV1ModelEntryExtendedCapabilities(t *testing.T) {
 	item := model.ModelConfig{
-		ID:                 "video-model",
-		Provider:           "adobe",
-		Type:               "video",
-		Ratios:             datatypes.JSON([]byte(`["16:9"]`)),
-		Resolutions:        datatypes.JSON([]byte(`["1080p"]`)),
-		DurationPrices:     datatypes.JSONMap{"8s": 1, "5s": 1},
-		MaxReferenceImages: 2,
-		ReferenceMode:      "frame",
+		ID:                  "video-model",
+		Provider:            "adobe",
+		Type:                "video",
+		Ratios:              datatypes.JSON([]byte(`["16:9"]`)),
+		Resolutions:         datatypes.JSON([]byte(`["1080p"]`)),
+		DurationPrices:      datatypes.JSONMap{"8s": 1, "5s": 1},
+		MaxReferenceImages:  2,
+		MaxReferenceVideos:  1,
+		MaxReferenceAudios:  1,
+		MaxReferenceMedia:   3,
+		SupportsAudioOutput: true,
+		ReferenceMode:       "frame",
 	}
 
 	got := v1ModelEntry(item, 123, true)
@@ -59,8 +64,51 @@ func TestV1ModelEntryExtendedCapabilities(t *testing.T) {
 	if got["max_reference_images"] != 2 {
 		t.Fatalf("max_reference_images = %#v, want 2", got["max_reference_images"])
 	}
+	if got["max_reference_videos"] != 1 || got["max_reference_audios"] != 1 {
+		t.Fatalf("media capabilities = %#v/%#v", got["max_reference_videos"], got["max_reference_audios"])
+	}
+	if got["max_reference_media"] != 3 {
+		t.Fatalf("max_reference_media = %#v, want 3", got["max_reference_media"])
+	}
+	if got["supports_audio_output"] != true {
+		t.Fatalf("supports_audio_output = %#v", got["supports_audio_output"])
+	}
 	if got["reference_mode"] != "frame" {
 		t.Fatalf("reference_mode = %#v, want frame", got["reference_mode"])
+	}
+}
+
+func TestValidateMediaReferences(t *testing.T) {
+	if err := validateMediaReferences([]MediaReference{{Data: []byte("video"), ContentType: "video/mp4"}}, "video"); err != nil {
+		t.Fatalf("valid MP4 rejected: %v", err)
+	}
+	if err := validateMediaReferences([]MediaReference{{Data: []byte("video"), ContentType: "video/webm"}}, "video"); err == nil {
+		t.Fatal("WebM reference should be rejected")
+	}
+	if err := validateMediaReferences([]MediaReference{{Data: []byte("audio"), ContentType: "audio/mpeg"}}, "audio"); err != nil {
+		t.Fatalf("valid MP3 rejected: %v", err)
+	}
+}
+
+func TestValidateVideoReferenceLimitsSharedTotal(t *testing.T) {
+	item := &model.ModelConfig{
+		MaxReferenceImages: 9,
+		MaxReferenceVideos: 3,
+		MaxReferenceAudios: 3,
+		MaxReferenceMedia:  9,
+	}
+	withinLimit := V1VideoRequest{
+		ReferenceImages: make([]string, 3),
+		ReferenceVideos: make([]MediaReference, 3),
+		ReferenceAudios: make([]MediaReference, 3),
+	}
+	if err := validateVideoReferenceLimits(item, withinLimit); err != nil {
+		t.Fatalf("9 total references rejected: %v", err)
+	}
+	overLimit := withinLimit
+	overLimit.ReferenceImages = make([]string, 4)
+	if err := validateVideoReferenceLimits(item, overLimit); !errors.Is(err, ErrUnsupportedParams) {
+		t.Fatalf("10 total references error = %v, want ErrUnsupportedParams", err)
 	}
 }
 

@@ -2,6 +2,7 @@ package adobe
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -402,7 +403,14 @@ func SupportsVideoResolution(engine, resolution string) bool {
 	}
 }
 
-func BuildVideoPayload(engine, prompt, aspectRatio string, durationSeconds int, resolution, referenceMode, upstreamModel string, blobIDs []string) map[string]any {
+type VideoInputs struct {
+	ImageBlobIDs  []string
+	VideoBlobIDs  []string
+	AudioBlobIDs  []string
+	GenerateAudio bool
+}
+
+func BuildVideoPayload(engine, prompt, aspectRatio string, durationSeconds int, resolution, referenceMode, upstreamModel string, in VideoInputs) map[string]any {
 	seedVal := int(time.Now().Unix()) % 999999
 	engine = defaultString(engine, "sora2")
 	resolution = defaultString(resolution, "720p")
@@ -430,19 +438,24 @@ func BuildVideoPayload(engine, prompt, aspectRatio string, durationSeconds int, 
 			"generationMetadata":         map[string]any{"module": "text2video", "submodule": "ff-video-generate"},
 			"output":                     map[string]any{"storeInputs": true},
 		}
-		if len(blobIDs) > 0 {
+		if len(in.ImageBlobIDs) > 0 {
 			conds := make([]any, 0, 2)
 			conds = append(conds, map[string]any{
-				"source":    map[string]any{"id": blobIDs[0]},
+				"source":    map[string]any{"id": in.ImageBlobIDs[0]},
 				"placement": map[string]any{"start": 0},
 			})
-			if len(blobIDs) > 1 {
+			if len(in.ImageBlobIDs) > 1 {
 				conds = append(conds, map[string]any{
-					"source":    map[string]any{"id": blobIDs[1]},
+					"source":    map[string]any{"id": in.ImageBlobIDs[1]},
 					"placement": map[string]any{"start": 1},
 				})
 			}
 			payload["image"] = map[string]any{"conditions": conds}
+		}
+		if len(in.VideoBlobIDs) > 0 {
+			payload["controlData"] = map[string]any{
+				"structureData": map[string]any{"referenceVideo": map[string]any{"source": map[string]any{"id": in.VideoBlobIDs[0]}}},
+			}
 		}
 		return payload
 	case "veo31-fast", "veo31-standard", "veo31-lite":
@@ -463,7 +476,7 @@ func BuildVideoPayload(engine, prompt, aspectRatio string, durationSeconds int, 
 			"prompt":         prompt,
 			"negativePrompt": "",
 			"duration":       durationSeconds,
-			"generateAudio":  false,
+			"generateAudio":  in.GenerateAudio,
 			"generationMetadata": map[string]any{
 				"module":    "text2video",
 				"submodule": "ff-video-generate",
@@ -471,10 +484,10 @@ func BuildVideoPayload(engine, prompt, aspectRatio string, durationSeconds int, 
 			"output":         map[string]any{"storeInputs": true},
 			"referenceBlobs": []any{},
 		}
-		if len(blobIDs) > 0 {
+		if len(in.ImageBlobIDs) > 0 {
 			payload["generationMetadata"] = map[string]any{"module": "image2video", "submodule": "ff-video-generate"}
-			refs := make([]any, 0, min(len(blobIDs), 2))
-			for idx, id := range blobIDs[:min(len(blobIDs), 2)] {
+			refs := make([]any, 0, min(len(in.ImageBlobIDs), 2))
+			for idx, id := range in.ImageBlobIDs[:min(len(in.ImageBlobIDs), 2)] {
 				refs = append(refs, map[string]any{"id": id, "usage": "general", "promptReference": idx + 1})
 			}
 			payload["referenceBlobs"] = refs
@@ -482,7 +495,8 @@ func BuildVideoPayload(engine, prompt, aspectRatio string, durationSeconds int, 
 		return payload
 	case "kling-v3", "kling-o3":
 		isPro := strings.EqualFold(resolution, "1080p")
-		isImage := len(blobIDs) > 0
+		isImage := len(in.ImageBlobIDs) > 0
+		isVideo := len(in.VideoBlobIDs) > 0
 		prefix := "kling_v3"
 		if engine == "kling-o3" {
 			prefix = "kling_o3"
@@ -493,25 +507,48 @@ func BuildVideoPayload(engine, prompt, aspectRatio string, durationSeconds int, 
 		}
 		workflow := "t2v"
 		module := "text2video"
-		if isImage {
+		if isVideo {
+			workflow = "v2v"
+			module = "video2video"
+		} else if isImage {
 			workflow = "i2v"
 			module = "image2video"
 		}
+		modelVersion := prefix + "_" + tier + "_" + workflow
+		if isVideo {
+			if engine == "kling-v3" {
+				modelVersion = "kling_v3_omni_v2v_edit"
+				if isImage {
+					modelVersion = "kling_v3_omni_v2v_create"
+				}
+			} else if isImage {
+				modelVersion = prefix + "_" + tier + "_v2v_reference"
+			} else {
+				modelVersion = prefix + "_" + tier + "_v2v_edit"
+			}
+		}
 		payload := map[string]any{
 			"modelId":            "kling",
-			"modelVersion":       prefix + "_" + tier + "_" + workflow,
+			"modelVersion":       modelVersion,
 			"size":               videoSize(aspectRatio, resolution),
 			"duration":           durationSeconds,
 			"seeds":              []int{seedVal},
 			"prompt":             prompt,
 			"negativePrompt":     "",
+			"generateAudio":      in.GenerateAudio,
 			"generationSettings": map[string]any{"aspectRatio": aspectRatio},
 			"generationMetadata": map[string]any{"module": module, "submodule": "ff-video-generate"},
 			"output":             map[string]any{"storeInputs": true},
 			"referenceBlobs":     []any{},
 		}
-		if isImage {
-			payload["referenceBlobs"] = []any{map[string]any{"id": blobIDs[0], "usage": "frame", "order": 1}}
+		if isVideo {
+			refs := []any{map[string]any{"id": in.VideoBlobIDs[0], "usage": "source"}}
+			if isImage {
+				refs = append(refs, map[string]any{"id": in.ImageBlobIDs[0], "usage": "style"})
+			}
+			payload["referenceBlobs"] = refs
+		} else if isImage {
+			payload["referenceBlobs"] = []any{map[string]any{"id": in.ImageBlobIDs[0], "usage": "frame", "order": 1}}
 		}
 		return payload
 	case "runway45":
@@ -528,9 +565,9 @@ func BuildVideoPayload(engine, prompt, aspectRatio string, durationSeconds int, 
 			"output":               map[string]any{"storeInputs": true},
 			"referenceBlobs":       []any{},
 		}
-		if len(blobIDs) > 0 {
+		if len(in.ImageBlobIDs) > 0 {
 			payload["generationMetadata"] = map[string]any{"module": "image2video", "submodule": "ff-video-generate"}
-			payload["referenceBlobs"] = []any{map[string]any{"id": blobIDs[0], "usage": "frame", "order": 1}}
+			payload["referenceBlobs"] = []any{map[string]any{"id": in.ImageBlobIDs[0], "usage": "frame", "order": 1}}
 		}
 		return payload
 	case "seedance20", "seedance20-fast":
@@ -546,14 +583,24 @@ func BuildVideoPayload(engine, prompt, aspectRatio string, durationSeconds int, 
 			"seeds":              []int{seedVal},
 			"prompt":             prompt,
 			"negativePrompt":     "",
+			"generateAudio":      in.GenerateAudio,
 			"generationSettings": map[string]any{"aspectRatio": aspectRatio},
 			"generationMetadata": map[string]any{"module": "text2video", "submodule": "ff-video-generate"},
 			"output":             map[string]any{"storeInputs": true},
 			"referenceBlobs":     []any{},
 		}
-		if len(blobIDs) > 0 {
-			payload["generationMetadata"] = map[string]any{"module": "image2video", "submodule": "ff-video-generate"}
-			payload["referenceBlobs"] = blobRefs(blobIDs[:min(len(blobIDs), 2)], "style")
+		if len(in.ImageBlobIDs) > 0 || len(in.VideoBlobIDs) > 0 || len(in.AudioBlobIDs) > 0 {
+			if len(in.ImageBlobIDs) > 0 {
+				payload["generationMetadata"] = map[string]any{"module": "image2video", "submodule": "ff-video-generate"}
+			}
+			refs := blobRefs(in.ImageBlobIDs, "style")
+			for idx, id := range in.VideoBlobIDs {
+				refs = append(refs, map[string]any{"id": id, "usage": "source", "mention": map[string]any{"id": fmt.Sprintf("video%016d", idx+1), "label": fmt.Sprintf("Video %d", idx+1)}})
+			}
+			for idx, id := range in.AudioBlobIDs {
+				refs = append(refs, map[string]any{"id": id, "usage": "source", "mention": map[string]any{"id": fmt.Sprintf("audio%016d", idx+1), "label": fmt.Sprintf("Audio %d", idx+1)}})
+			}
+			payload["referenceBlobs"] = refs
 		}
 		return payload
 	case "luma":
@@ -575,13 +622,18 @@ func BuildVideoPayload(engine, prompt, aspectRatio string, durationSeconds int, 
 			},
 			"output": map[string]any{"storeInputs": true},
 		}
-		if len(blobIDs) > 0 {
+		if len(in.VideoBlobIDs) > 0 {
+			payload["generationType"] = "modify_video"
+			payload["generationMetadata"] = map[string]any{"module": "video2video", "submodule": "ff-video-generate"}
+			payload["referenceBlobs"] = []any{map[string]any{"id": in.VideoBlobIDs[0], "usage": "source"}}
+			payload["modelSpecificPayload"].(map[string]any)["generation_type"] = "modify_video"
+		} else if len(in.ImageBlobIDs) > 0 {
 			payload["generationMetadata"] = map[string]any{
 				"module":    "image2video",
 				"submodule": "ff-video-generate",
 			}
-			refs := make([]any, 0, min(len(blobIDs), 2))
-			for idx, id := range blobIDs[:min(len(blobIDs), 2)] {
+			refs := make([]any, 0, min(len(in.ImageBlobIDs), 2))
+			for idx, id := range in.ImageBlobIDs[:min(len(in.ImageBlobIDs), 2)] {
 				refs = append(refs, map[string]any{"id": id, "usage": "frame", "order": idx + 1})
 			}
 			payload["referenceBlobs"] = refs
@@ -617,8 +669,8 @@ func BuildVideoPayload(engine, prompt, aspectRatio string, durationSeconds int, 
 			"editReferenceVideo":         nil,
 			"output":                     map[string]any{"storeInputs": true},
 		}
-		if len(blobIDs) > 0 {
-			firstID := blobIDs[0]
+		if len(in.ImageBlobIDs) > 0 {
+			firstID := in.ImageBlobIDs[0]
 			payload["generationMetadata"] = map[string]any{"module": "image2video"}
 			payload["referenceBlobs"] = []any{
 				map[string]any{"id": firstID, "usage": "general", "promptReference": 1},

@@ -140,7 +140,8 @@ async function save() {
       type: 'text', provider: e.provider, alias: alias.value.trim(),
       prices: { request: normal }, prices_agent,
       ratios: [], resolutions: [], durations: [], duration_prices: {}, duration_prices_agent: {},
-      max_reference_images: 0, reference_mode: 'none', image_to_image: false,
+      max_reference_images: 0, max_reference_videos: 0, max_reference_audios: 0, max_reference_media: 0,
+      supports_audio_output: false, reference_mode: 'none', image_to_image: false,
       weight: Number(weight.value) || 0,
     }
   } else if (e.type === 'video') {
@@ -169,6 +170,10 @@ async function save() {
       duration_prices_agent,
       alias: alias.value.trim(),
       max_reference_images: e.max_reference_images || 0,
+      max_reference_videos: e.max_reference_videos || 0,
+      max_reference_audios: e.max_reference_audios || 0,
+      max_reference_media: e.max_reference_media || 0,
+      supports_audio_output: !!e.supports_audio_output,
       reference_mode: e.reference_mode || 'none',
       weight: Number(weight.value) || 0,
     }
@@ -187,6 +192,10 @@ async function save() {
       // 多参考图:把目录定义的张数(gpt=3/seedream=6/flux=4 …)写进模型,
       // 否则后端仍按旧值(默认 1)限制。
       max_reference_images: e.max_reference_images || 0,
+      max_reference_videos: e.max_reference_videos || 0,
+      max_reference_audios: e.max_reference_audios || 0,
+      max_reference_media: e.max_reference_media || 0,
+      supports_audio_output: !!e.supports_audio_output,
       reference_mode: e.reference_mode || 'none',
       weight: Number(weight.value) || 0,
     }
@@ -276,6 +285,14 @@ async function save() {
                       ? `${entry.max_reference_images} 张 · ${REF_MODE_LABEL[entry.reference_mode] || entry.reference_mode}`
                       : '不支持' }}
                 </div>
+                <span class="text-white/40">参考视频</span>
+                <div class="text-white/70">{{ entry.max_reference_videos > 0 ? `${entry.max_reference_videos} 个` : '不支持' }}</div>
+                <span class="text-white/40">参考音频</span>
+                <div class="text-white/70">{{ entry.max_reference_audios > 0 ? `${entry.max_reference_audios} 个` : '不支持' }}</div>
+                <span class="text-white/40">素材合计</span>
+                <div class="text-white/70">{{ entry.max_reference_media > 0 ? `${entry.max_reference_media} 个` : '分别计数' }}</div>
+                <span class="text-white/40">同步音频</span>
+                <div class="text-white/70">{{ entry.supports_audio_output ? '支持' : '不支持' }}</div>
               </template>
 
               <template v-else>

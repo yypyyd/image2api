@@ -90,7 +90,7 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 - **De-AI fingerprint** (optional): one-click toggle on the playground — generated images get anti-AI-detection post-processing (subtle detail jitter + metadata stripping), charged as a per-tier surcharge (defaults 1K+1 / 2K+2 / 4K+3 credits, admin-configurable, can be disabled globally); processed works carry a "de-AI" badge across the playground, gallery, logs and admin image manager
 
 #### 🔌 OpenAI Compatible
-- Text-to-image `/v1/images/generations` · image-to-image `/v1/images/edits` (multipart ref upload) · video `/v1/videos` (Sora-style async: create → poll → `/content`) · `/v1/models` (strict OpenAI fields by default; `?extended=true` opts into capability metadata, including `max_reference_images` and `reference_mode`, with ratios normalized as `W:H`)
+- Text-to-image `/v1/images/generations` · image-to-image `/v1/images/edits` (multipart ref upload) · video `/v1/videos` (Sora-style async: create → poll → `/content`, with model-gated video/audio references and generated audio) · `/v1/models` (strict OpenAI fields by default; `?extended=true` opts into image/video/audio reference limits and audio-output capability metadata, with ratios normalized as `W:H`)
 - **Strict OpenAI params**: `size` drives **both aspect ratio + resolution tier** (images by long edge → 1K/2K/4K, videos by short edge → 720p/1080p) — just swap `base_url` + `api_key` into an existing OpenAI SDK
 - Image results default to **URLs**. Ordinary API requests do not download, base64-encode, or store the upstream asset; explicitly request `response_format=b64_json` for inline bytes. The in-app **/docs** ships a size ↔ tier reference table
 
@@ -202,7 +202,7 @@ server {
     ssl_certificate_key /path/privkey.pem;
     root /path/to/frontend/dist;
     index index.html;
-    client_max_body_size 50m;
+    client_max_body_size 320m;
     proxy_read_timeout 600s;            # video generation can take a while
 
     location /assets/ { expires 1y; add_header Cache-Control "public, max-age=31536000, immutable"; }

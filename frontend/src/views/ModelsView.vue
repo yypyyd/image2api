@@ -241,6 +241,10 @@ onMounted(loadModels)
                       :title="REF_MODE_LABEL[m.reference_mode]">{{ m.reference_mode === 'frame' ? '首尾帧' : '参考图' }} {{ m.max_reference_images }}</span>
                 <span v-else-if="m.type === 'image' && m.image_to_image"
                       class="cap-chip cap-emerald">参考图</span>
+                <span v-if="m.type === 'video' && m.max_reference_videos > 0" class="cap-chip cap-emerald">参考视频 {{ m.max_reference_videos }}</span>
+                <span v-if="m.type === 'video' && m.max_reference_audios > 0" class="cap-chip cap-emerald">参考音频 {{ m.max_reference_audios }}</span>
+                <span v-if="m.type === 'video' && m.max_reference_media > 0" class="cap-chip cap-amber">合计 {{ m.max_reference_media }}</span>
+                <span v-if="m.type === 'video' && m.supports_audio_output" class="cap-chip cap-emerald">同步音频</span>
                 <span v-if="m.type === 'video'" v-for="r in (m.resolutions || [])" :key="'vr'+r"
                       class="cap-chip cap-slate">{{ r }}</span>
                 <span v-if="(m.type === 'image' && !(m.ratios || []).length && !m.image_to_image) ||

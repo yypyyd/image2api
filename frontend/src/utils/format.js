@@ -90,6 +90,18 @@ export function sortResolutions(list) {
   return [...(list || [])].sort((a, b) => resRank(a) - resRank(b))
 }
 
+/** Hide raw Adobe JSON/provider internals for request-level moderation errors. */
+export function friendlyGenerationError(value) {
+  const message = String(value || '').trim()
+  if (/reference_image_privacy_error|reference image contains a real person'?s face/i.test(message)) {
+    return '参考图片包含真人面部，Adobe 不允许将其用于生成内容，请更换不含真人面部的图片。'
+  }
+  if (/image_unsafe|prompt_unsafe|adobe content rejected/i.test(message)) {
+    return 'Adobe 内容安全审核未通过，请修改提示词或参考素材后重试。'
+  }
+  return message
+}
+
 export function nowTime() {
   return new Date().toLocaleTimeString(CN_LOCALE, CN_TZ_OPTS)
 }

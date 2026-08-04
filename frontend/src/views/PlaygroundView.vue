@@ -1,14 +1,14 @@
 <script setup>
 import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
-import { api, jsonBody, generatedUrl } from '../api'
+import { api, generatedUrl } from '../api'
 import { auth, refreshMe } from '../auth'
 import { draft } from '../playground'
 import Icon from '../components/Icon.vue'
 import SelectMenu from '../components/SelectMenu.vue'
 import MediaLightbox from '../components/MediaLightbox.vue'
 import { pointsLabel } from '../credits'
-import { sortResolutions } from '../utils/format'
+import { friendlyGenerationError, sortResolutions } from '../utils/format'
 import { copyText } from '../utils/clipboard'
 
 const route = useRoute()
@@ -40,6 +40,11 @@ watch(deai,       (v) => { draft.deai = v })
 
 const refImages = ref([])      // [{ name, dataUrl }]
 const fileInput = ref(null)
+const refVideos = ref([])      // [{ name, file, url }]
+const refAudios = ref([])      // [{ name, file }]
+const videoInput = ref(null)
+const audioInput = ref(null)
+const generateAudio = ref(false)
 
 // Concurrent generation: each 生成 click fires an INDEPENDENT /generate and adds
 // a card — the UI never locks, so several can run at once. `tasks` holds the
@@ -102,8 +107,11 @@ const durations = computed(() => {
   // ("10s" before "5s"). Re-sort by the numeric seconds so the shortest is first.
   const keys = Object.keys(model.value?.duration_prices || {})
     .sort((a, b) => parseFloat(a) - parseFloat(b))
-  if (keys.length) return keys
-  return familyPreset.value?.durations || ['5s']
+  const values = keys.length ? keys : (familyPreset.value?.durations || ['5s'])
+  if (refVideos.value.length && ['firefly-kling-3', 'firefly-kling-o3'].includes(modelId.value)) {
+    return values.filter((d) => parseFloat(d) <= 10)
+  }
+  return values
 })
 
 const maxRefs = computed(() => {
@@ -119,6 +127,25 @@ const maxRefs = computed(() => {
   if (m > 0) return m
   return model.value?.image_to_image ? 1 : 0
 })
+const maxVideoRefs = computed(() => Math.max(
+  Number(familyPreset.value?.max_reference_videos || 0),
+  Number(model.value?.max_reference_videos || 0),
+))
+const maxAudioRefs = computed(() => Math.max(
+  Number(familyPreset.value?.max_reference_audios || 0),
+  Number(model.value?.max_reference_audios || 0),
+))
+const maxMediaRefs = computed(() => Math.max(
+  Number(familyPreset.value?.max_reference_media || 0),
+  Number(model.value?.max_reference_media || 0),
+))
+const totalRefs = computed(() => refImages.value.length + refVideos.value.length + refAudios.value.length)
+const remainingMediaRefs = computed(() => maxMediaRefs.value > 0
+  ? Math.max(0, maxMediaRefs.value - totalRefs.value)
+  : Number.POSITIVE_INFINITY)
+const supportsAudioOutput = computed(() => !!(
+  familyPreset.value?.supports_audio_output || model.value?.supports_audio_output
+))
 const refMode = computed(() => familyPreset.value?.reference_mode || model.value?.reference_mode || 'none')
 // Most video models (veo31, luma) support pure text2video, so refs are optional.
 // A model can opt into strict image-to-video by declaring `requires_reference`
@@ -176,6 +203,24 @@ function applyModelDefaults() {
   if (refImages.value.length > maxRefs.value) {
     refImages.value = refImages.value.slice(0, maxRefs.value)
   }
+  refVideos.value = refVideos.value.slice(0, maxVideoRefs.value)
+  refAudios.value = refAudios.value.slice(0, maxAudioRefs.value)
+  if (maxMediaRefs.value > 0) {
+    let overflow = totalRefs.value - maxMediaRefs.value
+    if (overflow > 0) {
+      const drop = Math.min(overflow, refAudios.value.length)
+      refAudios.value = refAudios.value.slice(0, refAudios.value.length - drop)
+      overflow -= drop
+    }
+    if (overflow > 0) {
+      const keep = Math.max(0, refVideos.value.length - overflow)
+      for (const item of refVideos.value.slice(keep)) if (item?.url) URL.revokeObjectURL(item.url)
+      overflow -= refVideos.value.length - keep
+      refVideos.value = refVideos.value.slice(0, keep)
+    }
+    if (overflow > 0) refImages.value = refImages.value.slice(0, Math.max(0, refImages.value.length - overflow))
+  }
+  if (!supportsAudioOutput.value) generateAudio.value = false
 }
 function selectModel(id) {
   modelId.value = id
@@ -205,7 +250,7 @@ function onFiles(ev) {
 // the ORIGINAL file is kept untouched and is what gets uploaded at submit time.
 function addFiles(files) {
   files = files.filter((f) => f && f.type && f.type.startsWith('image/'))
-  const room = Math.max(0, maxRefs.value - refImages.value.length)
+  const room = Math.max(0, Math.min(maxRefs.value - refImages.value.length, remainingMediaRefs.value))
   const tooBig = []
   let added = 0
   for (const f of files) {
@@ -276,6 +321,33 @@ function onDragLeave(ev) {
   dragOver.value = false
 }
 function removeRef(i) { refImages.value.splice(i, 1) }
+
+function onVideoFiles(ev) {
+  const room = Math.max(0, Math.min(maxVideoRefs.value - refVideos.value.length, remainingMediaRefs.value))
+  const files = Array.from(ev.target.files || []).filter((f) => ['video/mp4', 'video/quicktime', 'video/mov'].includes(f.type) || /\.(mp4|mov)$/i.test(f.name)).slice(0, room)
+  const tooBig = files.filter((f) => f.size > 200 * 1024 * 1024)
+  refVideos.value.push(...files.filter((f) => f.size <= 200 * 1024 * 1024).map((file) => ({
+    name: file.name, file, url: URL.createObjectURL(file),
+  })))
+  if (['firefly-kling-3', 'firefly-kling-o3'].includes(modelId.value) && parseFloat(duration.value) > 10) duration.value = '10s'
+  if (tooBig.length) error.value = `视频超过 200MB 已跳过：${tooBig.map((f) => f.name).join('、')}`
+  if (ev.target) ev.target.value = ''
+}
+function removeVideoRef(i) {
+  const item = refVideos.value[i]
+  if (item?.url) URL.revokeObjectURL(item.url)
+  refVideos.value.splice(i, 1)
+}
+function onAudioFiles(ev) {
+  const room = Math.max(0, Math.min(maxAudioRefs.value - refAudios.value.length, remainingMediaRefs.value))
+  const allowed = ['audio/mpeg', 'audio/wav', 'audio/x-wav', 'audio/mp4', 'audio/aac', 'audio/x-m4a']
+  const files = Array.from(ev.target.files || []).filter((f) => allowed.includes(f.type)).slice(0, room)
+  const tooBig = files.filter((f) => f.size > 50 * 1024 * 1024)
+  refAudios.value.push(...files.filter((f) => f.size <= 50 * 1024 * 1024).map((file) => ({ name: file.name, file })))
+  if (tooBig.length) error.value = `音频超过 50MB 已跳过：${tooBig.map((f) => f.name).join('、')}`
+  if (ev.target) ev.target.value = ''
+}
+function removeAudioRef(i) { refAudios.value.splice(i, 1) }
 
 // Re-hydrate reference thumbnails from server URLs (after a reload). Fetches
 // each /images URL (same-origin, cookie-authed) and converts to a data URL so
@@ -376,6 +448,10 @@ async function run() {
     error.value = '该视频模型需要至少 1 张参考图 (首帧)'
     return
   }
+  if (maxMediaRefs.value > 0 && totalRefs.value > maxMediaRefs.value) {
+    error.value = `参考图片、视频和音频合计最多 ${maxMediaRefs.value} 个`
+    return
+  }
   if (price.value == null) {
     error.value = '该参数组合未定价 (留空 = 不支持)'
     return
@@ -404,6 +480,7 @@ async function fireOne() {
     resolution: resolution.value,
     duration: mode.value === 'video' ? duration.value : '',
     deai: mode.value === 'image' && deaiEnabled.value ? deai.value : false,
+    generateAudio: mode.value === 'video' && supportsAudioOutput.value ? generateAudio.value : false,
     status: 'pending',
     url: '',
     error: '',
@@ -412,6 +489,8 @@ async function fireOne() {
     ts: Date.now(),
   }
   const refsSnapshot = refImages.value.slice()
+  const videosSnapshot = refVideos.value.slice()
+  const audiosSnapshot = refAudios.value.slice()
   const chargedPrice = price.value
   tasks.value.unshift(task)
   if (tasks.value.length > 10) tasks.value = tasks.value.slice(0, 10)
@@ -422,18 +501,24 @@ async function fireOne() {
     auth.user.credits = Math.max(0, Number(auth.user.credits || 0) - chargedPrice)
   }
 
-  const payload = {
-    model: task.model, prompt: task.prompt, ratio: task.ratio, resolution: task.resolution,
+  const payload = new FormData()
+  payload.append('model', task.model)
+  payload.append('prompt', task.prompt)
+  payload.append('ratio', task.ratio)
+  payload.append('resolution', task.resolution)
+  if (task.kind === 'video') payload.append('duration', task.duration)
+  if (task.generateAudio) payload.append('generate_audio', 'true')
+  if (task.kind === 'image' && task.deai) payload.append('deai', 'true')
+  for (const ref of refsSnapshot) {
+    if (ref.file) payload.append('reference_images', ref.file, ref.name || 'reference.png')
+    else if (ref.dataUrl) payload.append('reference_images', await (await fetch(ref.dataUrl)).blob(), ref.name || 'reference.png')
+    else if (ref.url) payload.append('reference_images', await (await fetch(ref.url)).blob(), ref.name || 'reference.png')
   }
-  if (task.kind === 'video') payload.duration = task.duration
-  if (task.kind === 'image' && task.deai) payload.deai = true
-  if (refsSnapshot.length) {
-    const refs = await Promise.all(refsSnapshot.map(refToBase64))
-    payload.reference_images = refs.filter(Boolean)
-  }
+  for (const ref of videosSnapshot) payload.append('reference_videos', ref.file, ref.name)
+  for (const ref of audiosSnapshot) payload.append('reference_audios', ref.file, ref.name)
 
   try {
-    const r = await api('/generate', jsonBody('POST', payload))
+    const r = await api('/generate', { method: 'POST', body: payload })
     if (r.ok && r.data?.url) {
       task.status = 'done'
       task.url = r.data.url
@@ -447,12 +532,12 @@ async function fireOne() {
     } else {
       await refreshMe()
       task.status = 'failed'
-      task.error = r.data?.detail || `失败 (${r.status})`
+      task.error = friendlyGenerationError(r.data?.detail || `失败 (${r.status})`)
     }
   } catch (e) {
     await refreshMe()
     task.status = 'failed'
-    task.error = String(e)
+    task.error = friendlyGenerationError(e)
   }
   loadHistory()
 }
@@ -722,6 +807,10 @@ onUnmounted(() => {
         </div>
       </div>
 
+      <div v-if="mode === 'video' && maxMediaRefs > 0" class="text-xs text-slate-500">
+        参考素材合计最多 {{ maxMediaRefs }} 个，已选 {{ totalRefs }} 个
+      </div>
+
       <!-- reference images -->
       <div v-if="maxRefs > 0">
         <label class="block text-xs font-medium text-slate-500 mb-1.5">
@@ -746,13 +835,56 @@ onUnmounted(() => {
               {{ i === 0 ? '首帧' : (i === 1 ? '末帧' : '') }}
             </div>
           </div>
-          <button v-if="refImages.length < maxRefs" type="button" @click="openPicker"
+          <button v-if="refImages.length < maxRefs && remainingMediaRefs > 0" type="button" @click="openPicker"
                   class="w-20 h-20 rounded-lg border-2 border-dashed border-slate-200 text-slate-400 hover:bg-slate-50 hover:border-slate-300 grid place-items-center disabled:opacity-40 disabled:cursor-not-allowed"
                   :title="dragOver ? '松开以添加' : '点击或拖拽图片到此'">
             <Icon :name="dragOver ? 'download' : 'plus'" class="w-5 h-5" />
           </button>
         </div>
         <input ref="fileInput" type="file" accept="image/*" multiple class="hidden" @change="onFiles" />
+      </div>
+
+      <div v-if="mode === 'video' && maxVideoRefs > 0">
+        <label class="block text-xs font-medium text-slate-500 mb-1.5">
+          参考视频 <span class="text-slate-400 font-normal">(最多 {{ maxVideoRefs }} 个 · MP4/MOV · 单个 ≤200MB)</span>
+        </label>
+        <div class="flex gap-2 flex-wrap">
+          <div v-for="(item, i) in refVideos" :key="item.name + i" class="relative w-28 h-20 rounded-lg overflow-hidden border border-slate-200 bg-slate-950">
+            <video :src="item.url" muted preload="metadata" class="w-full h-full object-cover" />
+            <button type="button" @click="removeVideoRef(i)" class="absolute top-1 right-1 w-5 h-5 rounded-full bg-slate-900/70 text-white hover:bg-rose-500 grid place-items-center">
+              <Icon name="close" class="w-3 h-3" />
+            </button>
+          </div>
+          <button v-if="refVideos.length < maxVideoRefs && remainingMediaRefs > 0" type="button" @click="videoInput?.click()" class="w-28 h-20 rounded-lg border-2 border-dashed border-slate-200 text-slate-400 hover:bg-slate-50 grid place-items-center">
+            <span class="text-[11px]">+ 视频</span>
+          </button>
+        </div>
+        <input ref="videoInput" type="file" accept="video/mp4,video/quicktime,.mov" multiple class="hidden" @change="onVideoFiles" />
+      </div>
+
+      <div v-if="mode === 'video' && maxAudioRefs > 0">
+        <label class="block text-xs font-medium text-slate-500 mb-1.5">
+          参考音频 <span class="text-slate-400 font-normal">(最多 {{ maxAudioRefs }} 个 · 单个 ≤50MB)</span>
+        </label>
+        <div class="space-y-1.5">
+          <div v-for="(item, i) in refAudios" :key="item.name + i" class="flex items-center gap-2 rounded-lg bg-slate-100 px-3 py-2 text-xs text-slate-600">
+            <Icon name="files" class="w-4 h-4 shrink-0" />
+            <span class="truncate flex-1">{{ item.name }}</span>
+            <button type="button" @click="removeAudioRef(i)" class="text-slate-400 hover:text-rose-500"><Icon name="close" class="w-3.5 h-3.5" /></button>
+          </div>
+          <button v-if="refAudios.length < maxAudioRefs && remainingMediaRefs > 0" type="button" @click="audioInput?.click()" class="w-full rounded-lg border border-dashed border-slate-200 py-2 text-xs text-slate-400 hover:bg-slate-50">+ 音频</button>
+        </div>
+        <input ref="audioInput" type="file" accept="audio/mpeg,audio/wav,audio/mp4,audio/aac,.mp3,.wav,.m4a,.aac" multiple class="hidden" @change="onAudioFiles" />
+      </div>
+
+      <div v-if="mode === 'video' && supportsAudioOutput" class="flex items-center justify-between">
+        <label class="text-xs font-medium text-slate-500">生成同步音频</label>
+        <button type="button" role="switch" :aria-checked="generateAudio" @click="generateAudio = !generateAudio"
+                class="relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors"
+                :class="generateAudio ? 'bg-slate-900' : 'bg-slate-200'">
+          <span class="inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform"
+                :class="generateAudio ? 'translate-x-[18px]' : 'translate-x-0.5'"></span>
+        </button>
       </div>
 
       <!-- 生图张数 1–4 (image only) — each is a separate concurrent generation. -->

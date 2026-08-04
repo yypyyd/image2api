@@ -77,34 +77,20 @@ func (h *UserGenerationHandler) Generate(c *gin.Context) {
 		return
 	}
 
-	var body struct {
-		Model           string   `json:"model"`
-		Prompt          string   `json:"prompt"`
-		Ratio           string   `json:"ratio"`
-		Resolution      string   `json:"resolution"`
-		Duration        string   `json:"duration"`
-		ReferenceImages []string `json:"reference_images"`
-		DeAI            bool     `json:"deai"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
+	body, err := bindGenerateRequest(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 		return
 	}
 
-	resp, err := h.userGen.Generate(c.Request.Context(), user, service.UserGenerateRequest{
-		Model:           body.Model,
-		Prompt:          body.Prompt,
-		Ratio:           body.Ratio,
-		Resolution:      body.Resolution,
-		Duration:        body.Duration,
-		ReferenceImages: body.ReferenceImages,
-		DeAI:            body.DeAI,
-	})
+	resp, err := h.userGen.Generate(c.Request.Context(), user, body)
 	if err != nil {
 		switch {
 		case errors.Is(err, service.ErrUnknownModel):
 			c.JSON(http.StatusNotFound, gin.H{"detail": err.Error()})
 		case errors.Is(err, service.ErrUnsupportedParams), errors.Is(err, service.ErrBannedPrompt):
+			c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		case errors.Is(err, service.ErrContentRejected):
 			c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 		case errors.Is(err, service.ErrInsufficientFunds):
 			c.JSON(http.StatusPaymentRequired, gin.H{"detail": "积分不足"})
@@ -141,34 +127,20 @@ func (h *UserGenerationHandler) Test(c *gin.Context) {
 		return
 	}
 
-	var body struct {
-		Model           string   `json:"model"`
-		Prompt          string   `json:"prompt"`
-		Ratio           string   `json:"ratio"`
-		Resolution      string   `json:"resolution"`
-		Duration        string   `json:"duration"`
-		ReferenceImages []string `json:"reference_images"`
-		AccountID       string   `json:"account_id"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
+	body, err := bindGenerateRequest(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 		return
 	}
 
-	resp, err := h.userGen.AdminTest(c.Request.Context(), user, service.UserGenerateRequest{
-		Model:           body.Model,
-		Prompt:          body.Prompt,
-		Ratio:           body.Ratio,
-		Resolution:      body.Resolution,
-		Duration:        body.Duration,
-		ReferenceImages: body.ReferenceImages,
-		AccountID:       body.AccountID,
-	})
+	resp, err := h.userGen.AdminTest(c.Request.Context(), user, body)
 	if err != nil {
 		switch {
 		case errors.Is(err, service.ErrUnknownModel):
 			c.JSON(http.StatusNotFound, gin.H{"detail": err.Error()})
 		case errors.Is(err, service.ErrUnsupportedParams), errors.Is(err, service.ErrBannedPrompt):
+			c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		case errors.Is(err, service.ErrContentRejected):
 			c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
 		case errors.Is(err, service.ErrProviderQuota):
 			c.JSON(http.StatusTooManyRequests, gin.H{"detail": err.Error()})
@@ -354,15 +326,16 @@ func (h *UserGenerationHandler) VideoPresets(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"data": []gin.H{
 			{
-				"key":                  "gemini-veo31",
-				"label":                "Veo31",
-				"type":                 "video",
-				"provider":             "adobe",
-				"durations":            []string{"4s", "6s", "8s"},
-				"ratios":               []string{"16:9", "9:16"},
-				"resolutions":          []string{"720p", "1080p"},
-				"max_reference_images": 2,
-				"reference_mode":       "frame",
+				"key":                   "gemini-veo31",
+				"label":                 "Veo31",
+				"type":                  "video",
+				"provider":              "adobe",
+				"durations":             []string{"4s", "6s", "8s"},
+				"ratios":                []string{"16:9", "9:16"},
+				"resolutions":           []string{"720p", "1080p"},
+				"max_reference_images":  2,
+				"supports_audio_output": true,
+				"reference_mode":        "frame",
 			},
 			{
 				"key":                  "gemini-veo31-lite",
@@ -376,26 +349,30 @@ func (h *UserGenerationHandler) VideoPresets(c *gin.Context) {
 				"reference_mode":       "frame",
 			},
 			{
-				"key":                  "firefly-kling-3",
-				"label":                "Kling 3",
-				"type":                 "video",
-				"provider":             "adobe",
-				"durations":            durationRange(3, 15),
-				"ratios":               []string{"16:9", "9:16"},
-				"resolutions":          []string{"720p", "1080p"},
-				"max_reference_images": 1,
-				"reference_mode":       "frame",
+				"key":                   "firefly-kling-3",
+				"label":                 "Kling 3",
+				"type":                  "video",
+				"provider":              "adobe",
+				"durations":             durationRange(3, 15),
+				"ratios":                []string{"16:9", "9:16"},
+				"resolutions":           []string{"720p", "1080p"},
+				"max_reference_images":  1,
+				"max_reference_videos":  1,
+				"supports_audio_output": true,
+				"reference_mode":        "frame",
 			},
 			{
-				"key":                  "firefly-kling-o3",
-				"label":                "Kling O3",
-				"type":                 "video",
-				"provider":             "adobe",
-				"durations":            durationRange(3, 15),
-				"ratios":               []string{"16:9", "9:16"},
-				"resolutions":          []string{"720p", "1080p"},
-				"max_reference_images": 1,
-				"reference_mode":       "frame",
+				"key":                   "firefly-kling-o3",
+				"label":                 "Kling O3",
+				"type":                  "video",
+				"provider":              "adobe",
+				"durations":             durationRange(3, 15),
+				"ratios":                []string{"16:9", "9:16"},
+				"resolutions":           []string{"720p", "1080p"},
+				"max_reference_images":  1,
+				"max_reference_videos":  1,
+				"supports_audio_output": true,
+				"reference_mode":        "frame",
 			},
 			{
 				"key":                  "firefly-runway-4.5",
@@ -409,26 +386,34 @@ func (h *UserGenerationHandler) VideoPresets(c *gin.Context) {
 				"reference_mode":       "frame",
 			},
 			{
-				"key":                  "firefly-seedance-2",
-				"label":                "Seedance 2",
-				"type":                 "video",
-				"provider":             "adobe",
-				"durations":            durationRange(4, 15),
-				"ratios":               []string{"16:9", "9:16"},
-				"resolutions":          []string{"480p", "720p", "1080p"},
-				"max_reference_images": 2,
-				"reference_mode":       "frame",
+				"key":                   "firefly-seedance-2",
+				"label":                 "Seedance 2",
+				"type":                  "video",
+				"provider":              "adobe",
+				"durations":             durationRange(4, 15),
+				"ratios":                []string{"16:9", "9:16"},
+				"resolutions":           []string{"480p", "720p", "1080p"},
+				"max_reference_images":  9,
+				"max_reference_videos":  3,
+				"max_reference_audios":  3,
+				"max_reference_media":   9,
+				"supports_audio_output": true,
+				"reference_mode":        "asset",
 			},
 			{
-				"key":                  "firefly-seedance-2-fast",
-				"label":                "Seedance 2 Fast",
-				"type":                 "video",
-				"provider":             "adobe",
-				"durations":            durationRange(4, 15),
-				"ratios":               []string{"16:9", "9:16"},
-				"resolutions":          []string{"480p", "720p", "1080p"},
-				"max_reference_images": 2,
-				"reference_mode":       "frame",
+				"key":                   "firefly-seedance-2-fast",
+				"label":                 "Seedance 2 Fast",
+				"type":                  "video",
+				"provider":              "adobe",
+				"durations":             durationRange(4, 15),
+				"ratios":                []string{"16:9", "9:16"},
+				"resolutions":           []string{"480p", "720p", "1080p"},
+				"max_reference_images":  9,
+				"max_reference_videos":  3,
+				"max_reference_audios":  3,
+				"max_reference_media":   9,
+				"supports_audio_output": true,
+				"reference_mode":        "asset",
 			},
 			{
 				"key":                  "firefly-ray",
@@ -439,6 +424,7 @@ func (h *UserGenerationHandler) VideoPresets(c *gin.Context) {
 				"ratios":               []string{"21:9", "16:9", "4:3", "1:1", "3:4", "9:16", "9:21"},
 				"resolutions":          []string{"720p", "1080p", "4K"},
 				"max_reference_images": 2,
+				"max_reference_videos": 1,
 				"reference_mode":       "frame",
 			},
 			{
@@ -450,6 +436,7 @@ func (h *UserGenerationHandler) VideoPresets(c *gin.Context) {
 				"ratios":               []string{"16:9", "1:1", "9:16"},
 				"resolutions":          []string{"540p", "720p", "1080p"},
 				"max_reference_images": 2,
+				"max_reference_videos": 1,
 				"reference_mode":       "frame",
 			},
 			{
@@ -613,15 +600,16 @@ func (h *UserGenerationHandler) catalogEntries(c *gin.Context) ([]gin.H, error) 
 			"description":          "Runway Nano Banana Pro (图/参考图)",
 		},
 		{
-			"id":                   "gemini-veo31",
-			"provider":             "adobe",
-			"type":                 "video",
-			"ratios":               []string{"16:9", "9:16"},
-			"resolutions":          []string{"720p", "1080p"},
-			"durations":            []string{"4s", "6s", "8s"},
-			"max_reference_images": 2,
-			"reference_mode":       "frame",
-			"description":          "Veo31 video",
+			"id":                    "gemini-veo31",
+			"provider":              "adobe",
+			"type":                  "video",
+			"ratios":                []string{"16:9", "9:16"},
+			"resolutions":           []string{"720p", "1080p"},
+			"durations":             []string{"4s", "6s", "8s"},
+			"max_reference_images":  2,
+			"supports_audio_output": true,
+			"reference_mode":        "frame",
+			"description":           "Veo31 video",
 		},
 		{
 			"id":                   "gemini-veo31-lite",
@@ -635,26 +623,30 @@ func (h *UserGenerationHandler) catalogEntries(c *gin.Context) ([]gin.H, error) 
 			"description":          "Adobe Veo 3.1 Lite video (积分号)",
 		},
 		{
-			"id":                   "firefly-kling-3",
-			"provider":             "adobe",
-			"type":                 "video",
-			"ratios":               []string{"16:9", "9:16"},
-			"resolutions":          []string{"720p", "1080p"},
-			"durations":            durationRange(3, 15),
-			"max_reference_images": 1,
-			"reference_mode":       "frame",
-			"description":          "Adobe Kling 3 video (积分号)",
+			"id":                    "firefly-kling-3",
+			"provider":              "adobe",
+			"type":                  "video",
+			"ratios":                []string{"16:9", "9:16"},
+			"resolutions":           []string{"720p", "1080p"},
+			"durations":             durationRange(3, 15),
+			"max_reference_images":  1,
+			"max_reference_videos":  1,
+			"supports_audio_output": true,
+			"reference_mode":        "frame",
+			"description":           "Adobe Kling 3 video (积分号)",
 		},
 		{
-			"id":                   "firefly-kling-o3",
-			"provider":             "adobe",
-			"type":                 "video",
-			"ratios":               []string{"16:9", "9:16"},
-			"resolutions":          []string{"720p", "1080p"},
-			"durations":            durationRange(3, 15),
-			"max_reference_images": 1,
-			"reference_mode":       "frame",
-			"description":          "Adobe Kling O3 video (积分号)",
+			"id":                    "firefly-kling-o3",
+			"provider":              "adobe",
+			"type":                  "video",
+			"ratios":                []string{"16:9", "9:16"},
+			"resolutions":           []string{"720p", "1080p"},
+			"durations":             durationRange(3, 15),
+			"max_reference_images":  1,
+			"max_reference_videos":  1,
+			"supports_audio_output": true,
+			"reference_mode":        "frame",
+			"description":           "Adobe Kling O3 video (积分号)",
 		},
 		{
 			"id":                   "firefly-runway-4.5",
@@ -668,26 +660,34 @@ func (h *UserGenerationHandler) catalogEntries(c *gin.Context) ([]gin.H, error) 
 			"description":          "Adobe Runway Gen-4.5 video (积分号)",
 		},
 		{
-			"id":                   "firefly-seedance-2",
-			"provider":             "adobe",
-			"type":                 "video",
-			"ratios":               []string{"16:9", "9:16"},
-			"resolutions":          []string{"480p", "720p", "1080p"},
-			"durations":            durationRange(4, 15),
-			"max_reference_images": 2,
-			"reference_mode":       "frame",
-			"description":          "Adobe Seedance 2 video (积分号)",
+			"id":                    "firefly-seedance-2",
+			"provider":              "adobe",
+			"type":                  "video",
+			"ratios":                []string{"16:9", "9:16"},
+			"resolutions":           []string{"480p", "720p", "1080p"},
+			"durations":             durationRange(4, 15),
+			"max_reference_images":  9,
+			"max_reference_videos":  3,
+			"max_reference_audios":  3,
+			"max_reference_media":   9,
+			"supports_audio_output": true,
+			"reference_mode":        "asset",
+			"description":           "Adobe Seedance 2 video (积分号)",
 		},
 		{
-			"id":                   "firefly-seedance-2-fast",
-			"provider":             "adobe",
-			"type":                 "video",
-			"ratios":               []string{"16:9", "9:16"},
-			"resolutions":          []string{"480p", "720p", "1080p"},
-			"durations":            durationRange(4, 15),
-			"max_reference_images": 2,
-			"reference_mode":       "frame",
-			"description":          "Adobe Seedance 2 Fast video (积分号)",
+			"id":                    "firefly-seedance-2-fast",
+			"provider":              "adobe",
+			"type":                  "video",
+			"ratios":                []string{"16:9", "9:16"},
+			"resolutions":           []string{"480p", "720p", "1080p"},
+			"durations":             durationRange(4, 15),
+			"max_reference_images":  9,
+			"max_reference_videos":  3,
+			"max_reference_audios":  3,
+			"max_reference_media":   9,
+			"supports_audio_output": true,
+			"reference_mode":        "asset",
+			"description":           "Adobe Seedance 2 Fast video (积分号)",
 		},
 		{
 			"id":                   "firefly-ray",
@@ -697,6 +697,7 @@ func (h *UserGenerationHandler) catalogEntries(c *gin.Context) ([]gin.H, error) 
 			"resolutions":          []string{"720p", "1080p", "4K"},
 			"durations":            []string{"5s"},
 			"max_reference_images": 2,
+			"max_reference_videos": 1,
 			"reference_mode":       "frame",
 			"description":          "Luma Ray video",
 		},
@@ -708,6 +709,7 @@ func (h *UserGenerationHandler) catalogEntries(c *gin.Context) ([]gin.H, error) 
 			"resolutions":          []string{"540p", "720p", "1080p"},
 			"durations":            []string{"5s"},
 			"max_reference_images": 2,
+			"max_reference_videos": 1,
 			"reference_mode":       "frame",
 			"description":          "Adobe Firefly Video",
 		},

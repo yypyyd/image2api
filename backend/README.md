@@ -19,6 +19,8 @@ This is an in-progress rewrite. The current skeleton already includes:
 - public site endpoint: `/admin/api/site`
 - public showcase endpoint: `/admin/api/showcase`
 - session-based auth endpoint: `/admin/api/auth/me`
+- typed image/video/audio reference uploads for Adobe video generation, with
+  model capability checks and bounded multipart requests
 
 ## Environment
 
