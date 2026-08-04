@@ -12,9 +12,23 @@ const props = defineProps({
 })
 const emit = defineEmits(['close'])
 
-// 该账号所属 provider 的全部模型。
-const models = computed(() =>
-  props.allModels.filter((m) => (m.provider || '') === props.account.pool))
+// Partner image models are executable on ordinary 10-credit accounts. Video
+// entitlement is model-specific: Lite/Kling/Runway/Seedance are points-only,
+// while standard Veo 3.1, Luma Ray, and Firefly Video work on both.
+const ADOBE_VIDEO_POINTS_ONLY = new Set([
+  'gemini-veo31-lite',
+  'firefly-kling-3', 'firefly-kling-o3', 'firefly-runway-4.5',
+  'firefly-seedance-2', 'firefly-seedance-2-fast',
+])
+const isOrdinaryAdobe = computed(() =>
+  props.account.pool === 'adobe' && Number(props.account.quota_total ?? 0) < 10000)
+
+// 该账号所属 provider 的可实际调用模型。
+const models = computed(() => props.allModels.filter((m) => {
+  if ((m.provider || '') !== props.account.pool) return false
+  const id = m.alias || m.id
+  return !(isOrdinaryAdobe.value && ADOBE_VIDEO_POINTS_ONLY.has(id))
+}))
 const selectedModel = ref('')
 if (models.value.length) selectedModel.value = models.value[0].alias || models.value[0].id
 

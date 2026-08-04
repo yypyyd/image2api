@@ -48,15 +48,15 @@ var (
 	ErrProviderExecution   = errors.New("provider request failed")
 	ErrProviderUnsupported = errors.New("provider not implemented")
 	ErrReferenceTooLarge   = errors.New("reference image too large")
-	// ErrConcurrencyFull — every eligible account is busy (each account runs at
-	// most ONE generation at a time). English message: surfaced to API / UI.
-	ErrConcurrencyFull = errors.New("all accounts are busy (1 concurrent job each), please try again shortly")
+	// ErrConcurrencyFull — every eligible account remained at its configured
+	// concurrency limit after the bounded provider queue wait.
+	ErrConcurrencyFull = errors.New("all accounts are at their concurrency limit, please try again shortly")
 	// ErrUserConcurrencyFull — the caller already has their concurrency-group's max
 	// generations in flight (画图台 + API key combined). 0 = unlimited.
 	ErrUserConcurrencyFull = errors.New("too many generations in progress, please wait for one to finish")
 	// ErrVideoJobNotFound / ErrVideoNotReady — /v1/videos async job lookups.
-	ErrVideoJobNotFound = errors.New("video job not found")
-	ErrVideoNotReady    = errors.New("video is not ready yet")
+	ErrVideoJobNotFound  = errors.New("video job not found")
+	ErrVideoNotReady     = errors.New("video is not ready yet")
 	ErrImageTaskNotFound = errors.New("image task not found")
 )
 
@@ -192,10 +192,10 @@ type APIPrincipal struct {
 }
 
 type V1ImageRequest struct {
-	Model  string
-	Prompt string
+	Model     string
+	Prompt    string
 	RequestID string
-	Size   string
+	Size      string
 	// Quality is OpenAI's image quality (low|medium|high|auto). For our tiered
 	// models it selects the resolution (low→1K, medium→2K, high→4K, auto→default),
 	// clamped to whatever tiers the model actually prices. Only used when
@@ -1829,9 +1829,10 @@ func (s *V1Service) prepareVideo(ctx context.Context, principal *APIPrincipal, i
 		return nil, "", "", "", 0, ErrUnknownModel
 	}
 	// Fail fast before charging — effective provider (custom upstream by id, else native).
-	if eff := s.effectiveProvider(ctx, modelItem); eff == "custom" {
+	effectiveProvider := s.effectiveProvider(ctx, modelItem)
+	if effectiveProvider == "custom" {
 		// custom serves this id (effectiveProvider guaranteed it) — precheck ok
-	} else if ok, err := s.hasActiveProviderToken(ctx, eff, "video"); err != nil {
+	} else if ok, err := s.hasActiveProviderToken(ctx, effectiveProvider, "video"); err != nil {
 		return nil, "", "", "", 0, err
 	} else if !ok {
 		return nil, "", "", "", 0, ErrNoProviderAccount
@@ -1868,6 +1869,12 @@ func (s *V1Service) prepareVideo(ctx context.Context, principal *APIPrincipal, i
 	resolution := strings.TrimSpace(in.Resolution)
 	if resolution == "" {
 		resolution = "720p"
+	}
+	if effectiveProvider == "adobe" {
+		engine, _ := resolveAdobeVideoEngine(modelItem.ID)
+		if !adobe.SupportsVideoDuration(engine, parseDurationSeconds(duration)) || !adobe.SupportsVideoResolution(engine, resolution) {
+			return nil, "", "", "", 0, ErrUnsupportedParams
+		}
 	}
 	price, err := s.chargeForModel(ctx, principal, modelItem, "video", resolution, duration, 0, charge)
 	if err != nil {
@@ -2020,6 +2027,17 @@ func (s *V1Service) finishUnimplementedEvent(ctx context.Context, eventID string
 // may run (grok tolerates 10, unlike the 1-per-account default elsewhere).
 const grokConcurrencyPerAccount = 10
 
+// Adobe partner/points accounts can submit multiple asynchronous jobs. Keeping
+// them at the legacy built-in default of one caused burst workflows to reject
+// every request beyond the first two. Five per account covers the common 8-10
+// node batch while remaining bounded.
+const adobePointsConcurrencyPerAccount = 5
+
+// Absorb short bursts above the account pool capacity instead of rejecting them
+// immediately. The generation context owns the upper bound for the whole job.
+const providerAccountQueueWait = 90 * time.Second
+const providerAccountQueuePoll = 300 * time.Millisecond
+
 // maxTempDeadAccounts caps how many accounts the "temporary error = fail over"
 // policy may burn per request before giving up, so an upstream-wide blip
 // ("system under load") can't fan a single request out across the whole pool.
@@ -2052,48 +2070,60 @@ func (s *V1Service) runPoolWithFailover(ctx context.Context, eventID, pool strin
 	refreshOnAuth func(tokenID string) (model.TokenAccount, bool),
 	tempFailover bool,
 ) ([]byte, error) {
-	var lastErr error
-	busy := 0
 	tempDeadCount := 0
-	for _, token := range active {
-		// 1 concurrent job per account: skip any account already generating.
-		if !s.acctAcquire(ctx, token.ID, eventID, 1) {
-			busy++
-			continue
-		}
-		// release via defer so a panic in tryAccount can't leak the 1-job slot.
-		data, err, failover, tempDead := func() ([]byte, error, bool, bool) {
-			defer s.acctRelease(ctx, token.ID, eventID)
-			return s.tryAccount(ctx, eventID, pool, token, kind, attempt, classify, refreshOnAuth, tempFailover)
-		}()
-		if err == nil {
-			return data, nil
-		}
-		lastErr = err
-		if tempDead {
-			// temp-failover policy: this account hit a temporary upstream error.
-			// Cap how many accounts one request may burn before we stop, so an
-			// upstream-wide blip doesn't fan out across the whole pool.
-			tempDeadCount++
-			if tempDeadCount >= maxTempDeadAccounts {
-				return nil, lastErr
+	queueDeadline := time.Now().Add(providerAccountQueueWait)
+	for {
+		var lastErr error
+		busy := 0
+		for _, token := range active {
+			slots := poolAccountConcurrency(pool, token)
+			if !s.acctAcquire(ctx, token.ID, eventID, slots) {
+				busy++
+				continue
 			}
+			// release via defer so a panic in tryAccount can't leak the job slot.
+			data, err, failover, tempDead := func() ([]byte, error, bool, bool) {
+				defer s.acctRelease(ctx, token.ID, eventID)
+				return s.tryAccount(ctx, eventID, pool, token, kind, attempt, classify, refreshOnAuth, tempFailover)
+			}()
+			if err == nil {
+				return data, nil
+			}
+			lastErr = err
+			if tempDead {
+				// temp-failover policy: this account hit a temporary upstream error.
+				// Cap how many accounts one request may burn before we stop, so an
+				// upstream-wide blip doesn't fan out across the whole pool.
+				tempDeadCount++
+				if tempDeadCount >= maxTempDeadAccounts {
+					return nil, lastErr
+				}
+			}
+			if failover {
+				continue
+			}
+			// temporary exhausted or request-level error → surface it, no fan-out.
+			return nil, lastErr
 		}
-		if failover {
-			continue
+
+		if lastErr != nil {
+			return nil, lastErr
 		}
-		// temporary exhausted or request-level error → surface it, no fan-out.
-		return nil, lastErr
-	}
-	// Nothing ran. If accounts were skipped ONLY because they were all busy
-	// (no real failure), tell the caller the pool is at its concurrency cap.
-	if lastErr == nil {
-		if busy > 0 {
+		if busy == 0 {
+			return nil, ErrProviderExecution
+		}
+		if time.Now().After(queueDeadline) {
 			return nil, ErrConcurrencyFull
 		}
-		return nil, ErrProviderExecution
+
+		timer := time.NewTimer(providerAccountQueuePoll)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("%w: %v", ErrConcurrencyFull, ctx.Err())
+		case <-timer.C:
+		}
 	}
-	return nil, lastErr
 }
 
 // tryAccount runs one account's attempt with the pool's retry policy:
@@ -2191,7 +2221,7 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 		// quota is exhausted (VideoLimited) is still usable for image as long as
 		// its image quota remains. status=="quota" means BOTH kinds are limited
 		// (or a legacy/full quota mark), so it's excluded for either kind.
-		if item.Status == "active" && !item.Dead && !item.ImageLimited && strings.TrimSpace(item.Value) != "" {
+		if item.Status == "active" && !item.Dead && !item.ImageLimited && strings.TrimSpace(item.Value) != "" && adobeAccountSupportsModel(item, modelItem.ID, "image") {
 			active = append(active, item)
 		}
 	}
@@ -2252,7 +2282,7 @@ func (s *V1Service) generateAdobeVideo(ctx context.Context, eventID string, mode
 		// (ImageLimited) leaves the account usable for video. status=="quota"
 		// means BOTH kinds are limited (or a legacy/full quota mark), so it's
 		// excluded for either kind.
-		if item.Status == "active" && !item.Dead && !item.VideoLimited && strings.TrimSpace(item.Value) != "" {
+		if item.Status == "active" && !item.Dead && !item.VideoLimited && strings.TrimSpace(item.Value) != "" && adobeAccountSupportsModel(item, modelItem.ID, "video") {
 			active = append(active, item)
 		}
 	}
@@ -2446,11 +2476,23 @@ func (s *V1Service) customActive(ctx context.Context, modelID string) ([]model.T
 	return active, nil
 }
 
-// accountConcurrency is the per-account simultaneous-job cap. Custom accounts use
-// their configured Concurrency (default 1); built-in pools use the system value.
+// accountConcurrency is the configured per-account simultaneous-job cap, with a
+// default of one. Pool-specific defaults are applied by poolAccountConcurrency.
 func accountConcurrency(item model.TokenAccount) int {
 	if item.Concurrency > 0 {
 		return item.Concurrency
+	}
+	return 1
+}
+
+func poolAccountConcurrency(pool string, item model.TokenAccount) int {
+	if item.Concurrency > 0 {
+		return min(item.Concurrency, 20)
+	}
+	if pool == "adobe" {
+		if total, ok := jsonMapInt(item.Meta, "cached_quota_total"); ok && total >= 10000 {
+			return adobePointsConcurrencyPerAccount
+		}
 	}
 	return 1
 }
@@ -3831,6 +3873,18 @@ func resolveAdobeVideoEngine(modelID string) (string, string) {
 		// "firefly-veo31" is the legacy id, kept for back-compat with historical
 		// rows/logs; the model is branded "gemini-veo31" now.
 		return "veo31-fast", ""
+	case "gemini-veo31-lite":
+		return "veo31-lite", ""
+	case "firefly-kling-3":
+		return "kling-v3", ""
+	case "firefly-kling-o3":
+		return "kling-o3", ""
+	case "firefly-runway-4.5":
+		return "runway45", ""
+	case "firefly-seedance-2":
+		return "seedance20", ""
+	case "firefly-seedance-2-fast":
+		return "seedance20-fast", ""
 	case "firefly-ray":
 		return "luma", ""
 	case "firefly-video":
@@ -3970,6 +4024,24 @@ func pinTestAccount(items, active []model.TokenAccount, accountID string) []mode
 		}
 	}
 	return nil
+}
+
+// Ordinary 10-credit Adobe accounts can execute partner image models (verified
+// against GPT Image 2, Nano Banana 2, and Flux Kontext Max). Video entitlement
+// is model-specific: standard Veo 3.1, Luma Ray, and native Firefly Video work
+// on ordinary accounts; Lite/Kling/Runway/Seedance return user_not_entitled.
+// Admin-pinned tests bypass the normal active filters but still call this helper
+// only while constructing the non-pinned scheduler pool.
+func adobeAccountSupportsModel(item model.TokenAccount, modelID, kind string) bool {
+	if strings.EqualFold(strings.TrimSpace(kind), "image") {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(modelID)) {
+	case "firefly-video", "gemini-veo31", "firefly-veo31", "firefly-ray":
+		return true
+	}
+	total, ok := jsonMapInt(item.Meta, "cached_quota_total")
+	return ok && total >= 10000
 }
 
 func (s *V1Service) rotateRoundRobin(pool string, items []model.TokenAccount) {

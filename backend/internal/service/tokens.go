@@ -1236,6 +1236,23 @@ func (s *TokenService) Update(ctx context.Context, pool, id string, body map[str
 	if raw, ok := body["fails"]; ok {
 		patch["fails"] = intValue(raw)
 	}
+	if raw, ok := body["weight"]; ok {
+		weight := intValue(raw)
+		if weight < -1000 || weight > 1000 {
+			return nil, errors.New("weight must be between -1000 and 1000")
+		}
+		patch["weight"] = weight
+	}
+	if raw, ok := body["concurrency"]; ok {
+		if pool != "custom" && pool != "adobe" {
+			return nil, errors.New("concurrency is only configurable for custom or adobe accounts")
+		}
+		concurrency := intValue(raw)
+		if concurrency < 1 || concurrency > 20 {
+			return nil, errors.New("concurrency must be between 1 and 20")
+		}
+		patch["concurrency"] = concurrency
+	}
 	if len(patch) == 0 {
 		return s.tokens.Get(ctx, pool, id)
 	}
@@ -1753,6 +1770,7 @@ func (s *TokenService) createToken(ctx context.Context, pool, tokenID, value, st
 
 func accountRow(item model.TokenAccount, inFlight int64) map[string]any {
 	remaining, hasRemaining := jsonMapInt(item.Meta, "cached_quota_remaining")
+	total, hasTotal := jsonMapInt(item.Meta, "cached_quota_total")
 	quotaAt, _ := jsonMapInt(item.Meta, "cached_quota_at")
 	pending, _ := jsonMapBool(item.Meta, "pending_check")
 	// OpenAI email lives in the token's JWT (nested profile claim). Decode it at
@@ -1778,6 +1796,7 @@ func accountRow(item model.TokenAccount, inFlight int64) map[string]any {
 		"email":             emptyToNil(email),
 		"team_id":           emptyToNil(teamID),
 		"remaining":         valueOrNil(hasQuota && hasRemaining, remaining),
+		"quota_total":       valueOrNil(hasQuota && hasTotal, total),
 		"reset_after":       emptyToNil(item.CachedQuotaResetAfter),
 		"quota_cached_at":   valueOrNil(quotaAt != 0, quotaAt),
 		"created_at":        unixOrNil(item.AddedAt),

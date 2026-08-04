@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"math/big"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -82,12 +83,13 @@ func decodeJWTPayload(token string) map[string]any {
 }
 
 func buildARPSessionID() string {
-	// Every field is randomized per request: no embedded process pid or
-	// hardcoded constant suffix (those would make all requests from this
-	// install share a static feature — a cross-account correlation point).
+	// The partner-model gateway validates the ARP feature-token shape and its
+	// timestamp. Reusing sherlockToken from an imported cookie eventually yields
+	// a misleading HTTP 408 "system under load", so every submit gets a fresh
+	// browser-shaped session value.
 	raw := map[string]any{
 		"sid": uuid.NewString(),
-		"ftr": randomHex(16) + "_" + strconv.FormatInt(time.Now().UnixMilli(), 10) + "_" + strconv.Itoa(randomInt(1000, 999999)) + "_" + randomHex(8),
+		"ftr": randomHex(16) + "_" + strconv.FormatInt(time.Now().UnixMilli(), 10) + "_" + strconv.Itoa(os.Getpid()) + "_dUAL43-mnts-ants-d4_31ck__tt",
 	}
 	b, _ := json.Marshal(raw)
 	return base64.StdEncoding.EncodeToString(b)

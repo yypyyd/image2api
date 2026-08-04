@@ -200,9 +200,9 @@ type TokenAccount struct {
 	// Weight biases scheduling order for ANY account — higher weight is picked
 	// first within its pool (ties fall back to round-robin). Default 0.
 	Weight int `gorm:"not null;default:0"`
-	// Concurrency is the max simultaneous jobs for THIS account. Only custom
-	// (upstream) accounts honor it; built-in pools use their system default
-	// (1 per account, grok 10). 0 = use the system default.
+	// Concurrency is the max simultaneous jobs for THIS account. Custom upstreams
+	// and Adobe accounts honor it; other built-in pools use their system default.
+	// 0 = use the pool default (Adobe points 5, ordinary pools 1, Grok 10).
 	Concurrency int `gorm:"not null;default:0"`
 	CreatedAt   time.Time
 	UpdatedAt   time.Time

@@ -6,11 +6,20 @@ import Icon from './Icon.vue'
 const props = defineProps({ account: { type: Object, required: true } })
 const emit = defineEmits(['close', 'saved'])
 
-// concurrency is only adjustable for custom upstreams — others are system-fixed.
+function defaultConcurrency(account) {
+  if (Number(account.concurrency) > 0) return Number(account.concurrency)
+  if (account.type === 'grok') return 10
+  if (account.type === 'adobe' && Number(account.quota_total || 0) >= 10000) return 5
+  return 1
+}
+
+// Adobe points accounts use asynchronous partner endpoints and safely support a
+// bounded multi-job limit; ordinary Adobe accounts keep the system default 1.
 const canEditConcurrency = props.account.type === 'custom'
+  || (props.account.type === 'adobe' && Number(props.account.quota_total || 0) >= 10000)
 
 const weight = ref(Number(props.account.weight) || 0)
-const concurrency = ref(Number(props.account.concurrency) || 1)
+const concurrency = ref(defaultConcurrency(props.account))
 const status = ref('')
 const isError = ref(false)
 const submitting = ref(false)
@@ -60,8 +69,8 @@ async function submit() {
         </div>
         <div>
           <label class="lbl">并发数 <span class="text-white/35">{{ canEditConcurrency ? '(单账号)' : '(系统固定,不可调整)' }}</span></label>
-          <input v-if="canEditConcurrency" v-model.number="concurrency" type="number" min="1" class="field" placeholder="1" />
-          <input v-else :value="account.type === 'grok' ? 10 : 1" disabled class="field" />
+          <input v-if="canEditConcurrency" v-model.number="concurrency" type="number" min="1" max="20" class="field" placeholder="1" />
+          <input v-else :value="defaultConcurrency(account)" disabled class="field" />
         </div>
         <p v-if="status" class="text-xs" :class="isError ? 'text-rose-400' : 'text-emerald-400'">{{ status }}</p>
         <div class="flex justify-end gap-2 pt-2">

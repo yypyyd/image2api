@@ -684,7 +684,11 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 		return respBody, "", ErrContentRejected
 	}
 	if resp.StatusCode == 408 || resp.StatusCode == 429 || resp.StatusCode == 451 || resp.StatusCode >= 500 {
-		return respBody, "", ErrDeadUpstream
+		// Keep the status and clipped body while preserving errors.Is semantics.
+		// Partner-model discovery can report DEGRADED versions whose submit path
+		// fails with the same broad status family as malformed model payloads; the
+		// response detail is required to tell those cases apart safely.
+		return respBody, "", fmt.Errorf("%w (submit %d: %s)", ErrDeadUpstream, resp.StatusCode, clip(respBody, 300))
 	}
 	// "system under load" / timeout_error = adobe overload — treat as a temporary
 	// error so the tempFailover policy moves to the next account (same as the image path).

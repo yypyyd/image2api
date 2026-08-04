@@ -70,6 +70,13 @@ function typePill(t) {
     imagine: 'bg-teal-500/10 text-teal-300 ring-teal-400/30',
   }[t] || 'bg-white/[0.06] text-white/70 ring-white/15'
 }
+
+function accountConcurrency(a) {
+  if (Number(a.concurrency) > 0) return Number(a.concurrency)
+  if (a.type === 'grok') return 10
+  if (a.type === 'adobe' && Number(a.quota_total || 0) >= 10000) return 5
+  return 1
+}
 const STATUS_LABEL = { active: '正常', quota: '额度耗尽', disabled: '已禁用', pending: '检测中' }
 
 // Server-side pagination: rows IS the current page, already filtered/sorted
@@ -189,8 +196,7 @@ async function reconcile() {
         row._unknown = true
         updates++
       } else if (result && result.unchanged === false) {
-        if (row.type === 'adobe') row.reset_after = result.reset_after
-        else applyQuota(row, result)
+        applyQuota(row, result)
         updates++
       }
       bump()
@@ -247,6 +253,8 @@ function applyQuota(row, result) {
   if (result.unknown && result.remaining === null) { row.remaining = null; row._unknown = true; return }
   row._unknown = false
   row.remaining = result.remaining
+  if (result.used != null) row.quota_used = result.used
+  if (result.total != null) row.quota_total = result.total
   row.reset_after = result.reset_after
 }
 
@@ -468,19 +476,19 @@ onMounted(() => { loadAccounts(); loadModelList() })
             <td class="px-3 py-3.5 align-middle text-right text-sm tabular-nums whitespace-nowrap">
               <!-- quota column: 数字 / —  (never "未知"/"失败"/"检测中") -->
               <!-- remaining === -1 is the provider "unlimited" sentinel → show — not a scary red -1 -->
-              <span v-if="(a.type === 'openai' || a.type === 'runway' || a.type === 'leonardo' || a.type === 'krea' || a.type === 'imagine' || a.type === 'grok') && a.remaining != null && a.remaining !== -1"
+              <span v-if="(a.type === 'openai' || a.type === 'adobe' || a.type === 'runway' || a.type === 'leonardo' || a.type === 'krea' || a.type === 'imagine' || a.type === 'grok') && a.remaining != null && a.remaining !== -1"
                     class="font-mono font-semibold"
-                    :class="a.remaining > 0 ? 'text-emerald-300' : 'text-rose-300'">{{ a.remaining }}{{ a.type === 'grok' ? '%' : '' }}</span>
+                    :class="a.remaining > 0 ? 'text-emerald-300' : 'text-rose-300'"
+                    :title="a.type === 'adobe' && a.quota_total != null ? `剩余 ${a.remaining} / 总额 ${a.quota_total}` : ''">{{ a.remaining }}{{ a.type === 'grok' ? '%' : '' }}</span>
               <span v-else class="text-white/25" :title="a._quotaError || ''">—</span>
             </td>
             <!-- weight (edit via modal) -->
             <td class="px-3 py-3.5 align-middle text-center whitespace-nowrap text-xs tabular-nums text-white/70">
               {{ a.weight ?? 0 }}
             </td>
-            <!-- concurrency (custom = configured value; others = system fixed) -->
+            <!-- Per-account concurrency; Adobe points accounts default to 5. -->
             <td class="px-3 py-3.5 align-middle text-center whitespace-nowrap text-xs tabular-nums">
-              <span v-if="a.type === 'custom'" class="text-white/70">{{ a.concurrency || 1 }}</span>
-              <span v-else class="text-white/25" title="系统固定">{{ a.type === 'grok' ? 10 : 1 }}</span>
+              <span class="text-white/70">{{ accountConcurrency(a) }}</span>
             </td>
             <!-- reset_after -->
             <td class="px-3 py-3.5 align-middle text-xs whitespace-nowrap">

@@ -32,6 +32,40 @@ var gptImageSize = map[string]map[string][2]int{
 	"4K": {"1:1": {2880, 2880}, "5:4": {3200, 2560}, "9:16": {2160, 3840}, "21:9": {3696, 1584}, "16:9": {3840, 2160}, "4:3": {3264, 2448}, "3:2": {3504, 2336}, "4:5": {2560, 3200}, "3:4": {2448, 3264}, "2:3": {2336, 3504}},
 }
 
+var gptImage15Size = map[string][2]int{
+	"1:1": {1024, 1024},
+	"3:2": {1536, 1024},
+	"2:3": {1024, 1536},
+}
+
+var nanoBananaSize = map[string][2]int{
+	"1:1": {1024, 1024}, "3:2": {1248, 832}, "2:3": {832, 1248},
+	"4:3": {1152, 896}, "3:4": {896, 1152}, "5:4": {1184, 864},
+	"4:5": {864, 1184}, "9:16": {768, 1344}, "16:9": {1344, 768},
+	"21:9": {1536, 672},
+}
+
+var nanoBananaProSize = map[string]map[string][2]int{
+	"1K": {
+		"1:1": {1024, 1024}, "3:2": {1264, 848}, "2:3": {848, 1264},
+		"4:3": {1200, 896}, "3:4": {896, 1200}, "5:4": {1152, 928},
+		"4:5": {928, 1152}, "9:16": {768, 1376}, "16:9": {1376, 768},
+		"21:9": {1584, 672},
+	},
+	"2K": {
+		"1:1": {2048, 2048}, "3:2": {2528, 1696}, "2:3": {1696, 2528},
+		"4:3": {2400, 1792}, "3:4": {1792, 2400}, "5:4": {2304, 1856},
+		"4:5": {1856, 2304}, "9:16": {1536, 2752}, "16:9": {2752, 1536},
+		"21:9": {3168, 1344},
+	},
+	"4K": {
+		"1:1": {4096, 4096}, "3:2": {5056, 3392}, "2:3": {3392, 5056},
+		"4:3": {4800, 3584}, "3:4": {3584, 4800}, "5:4": {4608, 3712},
+		"4:5": {3712, 4608}, "9:16": {3072, 5504}, "16:9": {5504, 3072},
+		"21:9": {6336, 2688},
+	},
+}
+
 var fluxSize = map[string][2]int{
 	"1:1":  {1024, 1024},
 	"16:9": {1408, 768},
@@ -50,6 +84,14 @@ func ResolveModelSpec(modelID string) modelSpec {
 	switch modelID {
 	case "firefly-gpt-image", "firefly-gpt-image-2":
 		return modelSpec{UpstreamModelID: "gpt-image", UpstreamModelVersion: "2"}
+	case "firefly-gpt-image-1.5":
+		return modelSpec{UpstreamModelID: "gpt-image", UpstreamModelVersion: "1.5"}
+	case "firefly-nano-banana":
+		return modelSpec{UpstreamModelID: "gemini-flash", UpstreamModelVersion: "nano-banana"}
+	case "firefly-nano-banana-pro":
+		return modelSpec{UpstreamModelID: "gemini-flash", UpstreamModelVersion: "nano-banana-2"}
+	case "firefly-nano-banana-2":
+		return modelSpec{UpstreamModelID: "gemini-flash", UpstreamModelVersion: "nano-banana-3"}
 	case "flux-kontext-max":
 		return modelSpec{UpstreamModelID: "flux", UpstreamModelVersion: "fluxKontextMax"}
 	default:
@@ -102,12 +144,78 @@ func BuildImagePayloadCandidates(modelID, prompt, aspectRatio, outputResolution 
 
 	switch spec.UpstreamModelID {
 	case "gpt-image":
+		if spec.UpstreamModelVersion == "1.5" {
+			return buildGPTImage15Payloads(spec, prompt, ratio, blobIDs)
+		}
 		return buildGPTImagePayloads(spec, prompt, ratio, resolution, blobIDs)
+	case "gemini-flash":
+		return buildGeminiPayloads(spec, prompt, ratio, resolution, blobIDs)
 	case "flux":
 		return buildFluxPayloads(spec, prompt, ratio, blobIDs)
 	default:
 		return buildDefaultPayloads(spec, prompt, ratio, resolution, blobIDs)
 	}
+}
+
+func buildGPTImage15Payloads(spec modelSpec, prompt, ratio string, blobIDs []string) []map[string]any {
+	size, ok := gptImage15Size[ratio]
+	if !ok {
+		size = gptImage15Size["1:1"]
+	}
+	base := map[string]any{
+		"modelId":            spec.UpstreamModelID,
+		"modelVersion":       spec.UpstreamModelVersion,
+		"n":                  1,
+		"prompt":             prompt,
+		"size":               map[string]any{"width": size[0], "height": size[1]},
+		"output":             map[string]any{"storeInputs": true},
+		"referenceBlobs":     []any{},
+		"generationMetadata": map[string]any{"module": "text2image", "submodule": "ff-image-generate"},
+		"generationSettings": map[string]any{"detailLevel": 3},
+	}
+	if len(blobIDs) == 0 {
+		return []map[string]any{base}
+	}
+	edited := cloneMap(base)
+	edited["referenceBlobs"] = blobRefs(blobIDs, "subject")
+	return []map[string]any{edited}
+}
+
+func buildGeminiPayloads(spec modelSpec, prompt, ratio, resolution string, blobIDs []string) []map[string]any {
+	var size [2]int
+	if spec.UpstreamModelVersion == "nano-banana" {
+		size = nanoBananaSize[ratio]
+		if size == [2]int{} {
+			size = nanoBananaSize["1:1"]
+		}
+	} else {
+		size = getSize(nanoBananaProSize, resolution, ratio, "1:1")
+	}
+	base := map[string]any{
+		"modelId":      spec.UpstreamModelID,
+		"modelVersion": spec.UpstreamModelVersion,
+		"n":            1,
+		"prompt":       prompt,
+		"size":         map[string]any{"width": size[0], "height": size[1]},
+		"seeds":        []int{int(time.Now().Unix()) % 999999},
+		"groundSearch": false,
+		"output":       map[string]any{"storeInputs": true},
+		"generationMetadata": map[string]any{
+			"module":    "text2image",
+			"submodule": "ff-image-generate",
+		},
+		"generationSettings": map[string]any{"aspectRatio": ratio},
+		"modelSpecificPayload": map[string]any{
+			"parameters": map[string]any{"addWatermark": false},
+		},
+		"referenceBlobs": []any{},
+	}
+	if len(blobIDs) == 0 {
+		return []map[string]any{base}
+	}
+	edited := cloneMap(base)
+	edited["referenceBlobs"] = blobRefs(blobIDs, "general")
+	return []map[string]any{edited}
 }
 
 func buildGPTImagePayloads(spec modelSpec, prompt, ratio, resolution string, blobIDs []string) []map[string]any {
@@ -247,6 +355,53 @@ func cloneMap(in map[string]any) map[string]any {
 	return out
 }
 
+// SupportsVideoDuration mirrors the duration controls currently exposed by
+// Adobe Firefly for each upstream engine. Keep this validation at the provider
+// boundary as a second line of defence: a stale/admin-edited model price table
+// must not make us submit a duration Adobe will reject.
+func SupportsVideoDuration(engine string, durationSeconds int) bool {
+	switch strings.ToLower(strings.TrimSpace(engine)) {
+	case "veo31-fast", "veo31-standard", "veo31-lite":
+		return durationSeconds == 4 || durationSeconds == 6 || durationSeconds == 8
+	case "kling-v3", "kling-o3":
+		return durationSeconds >= 3 && durationSeconds <= 15
+	case "runway45":
+		return durationSeconds == 5 || durationSeconds == 8 || durationSeconds == 10
+	case "seedance20", "seedance20-fast":
+		return durationSeconds >= 4 && durationSeconds <= 15
+	case "luma", "firefly-video":
+		// This integration uses Ray 3.14 (modelVersion 3.14-ray), whose current
+		// Firefly duration is fixed at 5 seconds. Native Firefly Video is also 5s.
+		return durationSeconds == 5
+	default:
+		// Preserve legacy/custom Adobe engines whose capability is not described
+		// here; their configured duration_prices table remains the support gate.
+		return durationSeconds > 0
+	}
+}
+
+// SupportsVideoResolution mirrors Adobe Firefly's Generate video resolution
+// controls for the engines integrated here. This deliberately follows Adobe's
+// route (which can differ from the same model on another API provider).
+func SupportsVideoResolution(engine, resolution string) bool {
+	resolution = strings.ToLower(strings.TrimSpace(resolution))
+	switch strings.ToLower(strings.TrimSpace(engine)) {
+	case "veo31-fast", "veo31-standard", "veo31-lite", "kling-v3", "kling-o3":
+		return resolution == "720p" || resolution == "1080p"
+	case "runway45":
+		return resolution == "720p"
+	case "seedance20", "seedance20-fast":
+		return resolution == "480p" || resolution == "720p" || resolution == "1080p"
+	case "luma":
+		// firefly-ray maps to Ray 3.14 Generate video (not Modify/HDR).
+		return resolution == "720p" || resolution == "1080p" || resolution == "4k"
+	case "firefly-video":
+		return resolution == "540p" || resolution == "720p" || resolution == "1080p"
+	default:
+		return resolution != ""
+	}
+}
+
 func BuildVideoPayload(engine, prompt, aspectRatio string, durationSeconds int, resolution, referenceMode, upstreamModel string, blobIDs []string) map[string]any {
 	seedVal := int(time.Now().Unix()) % 999999
 	engine = defaultString(engine, "sora2")
@@ -270,10 +425,10 @@ func BuildVideoPayload(engine, prompt, aspectRatio string, durationSeconds int, 
 			"prompt":                     prompt,
 			"seeds":                      []int{seedVal},
 			"sizes":                      []any{map[string]any{"width": w, "height": h, "numFrames": frames}},
-			"videoSettings":             map[string]any{},
-			"locale":                    "en-US",
-			"generationMetadata":        map[string]any{"module": "text2video", "submodule": "ff-video-generate"},
-			"output":                    map[string]any{"storeInputs": true},
+			"videoSettings":              map[string]any{},
+			"locale":                     "en-US",
+			"generationMetadata":         map[string]any{"module": "text2video", "submodule": "ff-video-generate"},
+			"output":                     map[string]any{"storeInputs": true},
 		}
 		if len(blobIDs) > 0 {
 			conds := make([]any, 0, 2)
@@ -290,10 +445,12 @@ func BuildVideoPayload(engine, prompt, aspectRatio string, durationSeconds int, 
 			payload["image"] = map[string]any{"conditions": conds}
 		}
 		return payload
-	case "veo31-fast", "veo31-standard":
+	case "veo31-fast", "veo31-standard", "veo31-lite":
 		modelVersion := "3.1-fast-generate"
 		if engine == "veo31-standard" {
 			modelVersion = "3.1-generate"
+		} else if engine == "veo31-lite" {
+			modelVersion = "3.1-lite-generate"
 		}
 		// Shape mirrors a captured working firefly.adobe.com video request: flat
 		// top-level duration / negativePrompt / generateAudio, submodule set, and
@@ -321,6 +478,82 @@ func BuildVideoPayload(engine, prompt, aspectRatio string, durationSeconds int, 
 				refs = append(refs, map[string]any{"id": id, "usage": "general", "promptReference": idx + 1})
 			}
 			payload["referenceBlobs"] = refs
+		}
+		return payload
+	case "kling-v3", "kling-o3":
+		isPro := strings.EqualFold(resolution, "1080p")
+		isImage := len(blobIDs) > 0
+		prefix := "kling_v3"
+		if engine == "kling-o3" {
+			prefix = "kling_o3"
+		}
+		tier := "standard"
+		if isPro {
+			tier = "pro"
+		}
+		workflow := "t2v"
+		module := "text2video"
+		if isImage {
+			workflow = "i2v"
+			module = "image2video"
+		}
+		payload := map[string]any{
+			"modelId":            "kling",
+			"modelVersion":       prefix + "_" + tier + "_" + workflow,
+			"size":               videoSize(aspectRatio, resolution),
+			"duration":           durationSeconds,
+			"seeds":              []int{seedVal},
+			"prompt":             prompt,
+			"negativePrompt":     "",
+			"generationSettings": map[string]any{"aspectRatio": aspectRatio},
+			"generationMetadata": map[string]any{"module": module, "submodule": "ff-video-generate"},
+			"output":             map[string]any{"storeInputs": true},
+			"referenceBlobs":     []any{},
+		}
+		if isImage {
+			payload["referenceBlobs"] = []any{map[string]any{"id": blobIDs[0], "usage": "frame", "order": 1}}
+		}
+		return payload
+	case "runway45":
+		payload := map[string]any{
+			"modelId":              "runway",
+			"modelVersion":         "gen4.5",
+			"size":                 videoSize(aspectRatio, "720p"),
+			"duration":             durationSeconds,
+			"seeds":                []int{seedVal},
+			"prompt":               prompt,
+			"negativePrompt":       "",
+			"generationMetadata":   map[string]any{"module": "text2video", "submodule": "ff-video-generate"},
+			"modelSpecificPayload": map[string]any{"duration": durationSeconds},
+			"output":               map[string]any{"storeInputs": true},
+			"referenceBlobs":       []any{},
+		}
+		if len(blobIDs) > 0 {
+			payload["generationMetadata"] = map[string]any{"module": "image2video", "submodule": "ff-video-generate"}
+			payload["referenceBlobs"] = []any{map[string]any{"id": blobIDs[0], "usage": "frame", "order": 1}}
+		}
+		return payload
+	case "seedance20", "seedance20-fast":
+		version := "seedance_2.0"
+		if engine == "seedance20-fast" {
+			version = "seedance_2.0_fast"
+		}
+		payload := map[string]any{
+			"modelId":            "seedance",
+			"modelVersion":       version,
+			"size":               videoSize(aspectRatio, resolution),
+			"duration":           durationSeconds,
+			"seeds":              []int{seedVal},
+			"prompt":             prompt,
+			"negativePrompt":     "",
+			"generationSettings": map[string]any{"aspectRatio": aspectRatio},
+			"generationMetadata": map[string]any{"module": "text2video", "submodule": "ff-video-generate"},
+			"output":             map[string]any{"storeInputs": true},
+			"referenceBlobs":     []any{},
+		}
+		if len(blobIDs) > 0 {
+			payload["generationMetadata"] = map[string]any{"module": "image2video", "submodule": "ff-video-generate"}
+			payload["referenceBlobs"] = blobRefs(blobIDs[:min(len(blobIDs), 2)], "style")
 		}
 		return payload
 	case "luma":
@@ -424,6 +657,12 @@ func fireflyVideoSize(aspectRatio, resolution string, durationSeconds int) (int,
 }
 
 func videoSize(aspectRatio, resolution string) map[string]any {
+	if strings.EqualFold(resolution, "480p") {
+		if aspectRatio == "16:9" {
+			return map[string]any{"width": 854, "height": 480}
+		}
+		return map[string]any{"width": 480, "height": 854}
+	}
 	if strings.EqualFold(resolution, "1080p") {
 		if aspectRatio == "16:9" {
 			return map[string]any{"width": 1920, "height": 1080}
