@@ -40,6 +40,21 @@ func TestNewPartnerPayloadShapes(t *testing.T) {
 	}
 }
 
+func TestImagePayloadSeedsChangeBetweenImmediateAttempts(t *testing.T) {
+	seen := make(map[int]bool)
+	for i := 0; i < 10; i++ {
+		payload := BuildImagePayloadCandidates("firefly-gpt-image-2", "test", "1:1", "1K", nil)[0]
+		seeds := payload["seeds"].([]int)
+		if len(seeds) != 1 || seeds[0] < 0 || seeds[0] >= 999999 {
+			t.Fatalf("invalid image seed: %#v", seeds)
+		}
+		if seen[seeds[0]] {
+			t.Fatalf("duplicate image seed on immediate payload rebuild: %d", seeds[0])
+		}
+		seen[seeds[0]] = true
+	}
+}
+
 func TestVeo31LitePayload(t *testing.T) {
 	payload := BuildVideoPayload("veo31-lite", "test", "16:9", 4, "720p", "frame", "", VideoInputs{})
 	if payload["modelId"] != "veo" || payload["modelVersion"] != "3.1-lite-generate" {

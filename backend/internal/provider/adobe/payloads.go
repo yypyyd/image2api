@@ -4,8 +4,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 )
+
+var imageSeedCounter atomic.Uint64
+
+func init() {
+	imageSeedCounter.Store(uint64(time.Now().UnixNano()))
+}
+
+// nextImageSeed is process-unique for 999,999 consecutive calls. Adobe accepts
+// seeds in this range; a monotonic atomic counter avoids the duplicate seeds
+// produced by the old second-resolution timestamp during immediate retries.
+func nextImageSeed() int {
+	return int(imageSeedCounter.Add(1) % 999999)
+}
 
 type modelSpec struct {
 	UpstreamModelID      string
@@ -107,7 +121,7 @@ func ResolveModelSpec(modelID string) modelSpec {
 func buildImage5Payload(prompt, aspectRatio, resolution string, blobIDs []string) map[string]any {
 	p := map[string]any{
 		"n":                    1,
-		"seeds":                []int{int(time.Now().Unix()) % 999999},
+		"seeds":                []int{nextImageSeed()},
 		"output":               map[string]any{"storeInputs": true},
 		"prompt":               prompt,
 		"referenceBlobs":       []any{},
@@ -198,7 +212,7 @@ func buildGeminiPayloads(spec modelSpec, prompt, ratio, resolution string, blobI
 		"n":            1,
 		"prompt":       prompt,
 		"size":         map[string]any{"width": size[0], "height": size[1]},
-		"seeds":        []int{int(time.Now().Unix()) % 999999},
+		"seeds":        []int{nextImageSeed()},
 		"groundSearch": false,
 		"output":       map[string]any{"storeInputs": true},
 		"generationMetadata": map[string]any{
@@ -230,7 +244,7 @@ func buildGPTImagePayloads(spec modelSpec, prompt, ratio, resolution string, blo
 		"modelVersion":         spec.UpstreamModelVersion,
 		"n":                    1,
 		"prompt":               prompt,
-		"seeds":                []int{int(time.Now().Unix()) % 999999},
+		"seeds":                []int{nextImageSeed()},
 		"output":               map[string]any{"storeInputs": true},
 		"referenceBlobs":       []any{},
 		"generationMetadata":   map[string]any{"module": "text2image", "submodule": "ff-image-generate"},
@@ -256,7 +270,7 @@ func buildFluxPayloads(spec modelSpec, prompt, ratio string, blobIDs []string) [
 		"n":              1,
 		"prompt":         prompt,
 		"size":           map[string]any{"width": size[0], "height": size[1]},
-		"seeds":          []int{int(time.Now().Unix()) % 999999},
+		"seeds":          []int{nextImageSeed()},
 		"output":         map[string]any{"storeInputs": true},
 		"referenceBlobs": []any{},
 		"modelSpecificPayload": map[string]any{
@@ -287,7 +301,7 @@ func buildDefaultPayloads(spec modelSpec, prompt, ratio, resolution string, blob
 		"n":            1,
 		"prompt":       prompt,
 		"size":         map[string]any{"width": size[0], "height": size[1]},
-		"seeds":        []int{int(time.Now().Unix()) % 999999},
+		"seeds":        []int{nextImageSeed()},
 		"groundSearch": false,
 		"output":       map[string]any{"storeInputs": true},
 		"generationMetadata": map[string]any{

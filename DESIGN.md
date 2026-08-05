@@ -1,5 +1,15 @@
 # Design Notes
 
+### 2026-08-05 - Retry randomly unsafe Adobe image outputs
+
+**Change**: Adobe moderation responses now retain their upstream error code. Image generation retries `image_unsafe` on the same account up to two additional times (three total attempts), rebuilding the payload with a unique seed each time. `prompt_unsafe`, `reference_image_privacy_error`, and generic `legal_error` responses are not retried.
+
+**Reason**: Identical short prompts can succeed and fail across calls because Adobe evaluates both the request and each randomly generated output. Treating the first unsafe output as a permanently blocked prompt caused downstream clients to see avoidable `content_policy_violation` failures.
+
+**Impact**: Recoverable output moderation failures are absorbed inside one provider call and one gateway billing event, so they neither charge downstream users multiple times nor trigger account failover/health penalties. Three consecutive unsafe outputs still return a content-policy error with guidance to specify an adult subject, clothing, and scene.
+
+**Decision**: Retry only the explicit `image_unsafe` code. Prompt and reference privacy refusals remain deterministic request errors, while region/legal errors remain upstream failures.
+
 ### 2026-08-04 - Seedance shared reference limit and Adobe privacy refusals
 
 **Change**: Seedance 2 and Seedance 2 Fast now advertise 9 reference images, 3 reference videos, and 3 reference audios, with `max_reference_media: 9` enforcing Adobe's shared `referenceBlobs` limit. Their images use the upstream `style` asset mode and all validated image blob IDs are forwarded. Adobe's `reference_image_privacy_error` is classified as a request-level content rejection with a user-facing Chinese explanation.

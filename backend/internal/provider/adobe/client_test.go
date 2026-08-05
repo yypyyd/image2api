@@ -18,6 +18,19 @@ func TestContentRejectionClassification(t *testing.T) {
 	if !isContentRejection(451, `{"error_code":"image_unsafe"}`) {
 		t.Fatal("image_unsafe should be classified as content rejection")
 	}
+	imageErr := contentRejectionError(451, `{"error_code":"image_unsafe"}`)
+	var imageRejection *ContentRejectionError
+	if !errors.As(imageErr, &imageRejection) || imageRejection.Code != "image_unsafe" || !isRetryableGeneratedImageRejection(imageErr) {
+		t.Fatalf("image refusal = %#v, want retryable typed image_unsafe", imageErr)
+	}
+	promptErr := contentRejectionError(451, `{"error":{"error_code":"prompt_unsafe"}}`)
+	var promptRejection *ContentRejectionError
+	if !errors.As(promptErr, &promptRejection) || promptRejection.Code != "prompt_unsafe" || isRetryableGeneratedImageRejection(promptErr) {
+		t.Fatalf("prompt refusal = %#v, want non-retryable typed prompt_unsafe", promptErr)
+	}
+	if isRetryableGeneratedImageRejection(err) {
+		t.Fatal("reference image privacy refusal must not retry")
+	}
 	if isContentRejection(451, `{"error_code":"legal_error","message":"{}"}`) {
 		t.Fatal("generic legal_error must remain an upstream/legal failure")
 	}

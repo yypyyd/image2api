@@ -44,26 +44,97 @@ var (
 	ErrContentRejected = errors.New("Adobe 内容安全审核未通过，请修改提示词或参考素材后重试")
 )
 
+// ContentRejectionError preserves Adobe's moderation code so callers can
+// distinguish a blocked prompt/reference from a randomly unsafe generated
+// image. All variants unwrap to ErrContentRejected and therefore never affect
+// account health or trigger account failover.
+type ContentRejectionError struct {
+	Code string
+}
+
+func (e *ContentRejectionError) Error() string {
+	switch e.Code {
+	case "image_unsafe":
+		return "Adobe 生成结果未通过安全审核"
+	case "prompt_unsafe":
+		return "Adobe 提示词未通过内容安全审核，请修改提示词后重试"
+	case "reference_image_privacy_error":
+		return "Adobe 内容安全审核未通过：参考图片包含真人面部，Adobe 不允许将其用于生成内容，请更换不含真人面部的图片"
+	default:
+		return ErrContentRejected.Error()
+	}
+}
+
+func (e *ContentRejectionError) Unwrap() error { return ErrContentRejected }
+
 // isContentRejection reports whether an Adobe response (status + body) is a
 // content-safety refusal rather than a genuine upstream/account failure. Adobe
 // returns HTTP 451 with an "*_unsafe" code for general moderation, and
 // reference_image_privacy_error when a reference contains a real person's face.
 func isContentRejection(status int, body string) bool {
-	if status != 451 {
-		return false
-	}
-	body = strings.ToLower(body)
-	return strings.Contains(body, "unsafe") || strings.Contains(body, "reference_image_privacy_error")
+	return contentRejectionCode(status, body) != ""
 }
 
 func contentRejectionError(status int, body string) error {
-	if !isContentRejection(status, body) {
+	code := contentRejectionCode(status, body)
+	if code == "" {
 		return nil
 	}
-	if strings.Contains(strings.ToLower(body), "reference_image_privacy_error") {
-		return fmt.Errorf("%w：参考图片包含真人面部，Adobe 不允许将其用于生成内容，请更换不含真人面部的图片", ErrContentRejected)
+	return &ContentRejectionError{Code: code}
+}
+
+func contentRejectionCode(status int, body string) string {
+	if status != 451 {
+		return ""
 	}
-	return ErrContentRejected
+	var payload any
+	if json.Unmarshal([]byte(body), &payload) == nil {
+		if code := findAdobeErrorCode(payload); code != "" {
+			code = strings.ToLower(strings.TrimSpace(code))
+			if strings.HasSuffix(code, "_unsafe") || code == "reference_image_privacy_error" {
+				return code
+			}
+			return ""
+		}
+	}
+	lowerBody := strings.ToLower(body)
+	for _, code := range []string{"reference_image_privacy_error", "prompt_unsafe", "image_unsafe"} {
+		if strings.Contains(lowerBody, code) {
+			return code
+		}
+	}
+	if strings.Contains(lowerBody, "unsafe") {
+		return "unsafe"
+	}
+	return ""
+}
+
+func findAdobeErrorCode(value any) string {
+	switch typed := value.(type) {
+	case map[string]any:
+		for _, key := range []string{"error_code", "errorCode", "code"} {
+			if code, ok := typed[key].(string); ok && strings.TrimSpace(code) != "" {
+				return code
+			}
+		}
+		for _, child := range typed {
+			if code := findAdobeErrorCode(child); code != "" {
+				return code
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if code := findAdobeErrorCode(child); code != "" {
+				return code
+			}
+		}
+	}
+	return ""
+}
+
+func isRetryableGeneratedImageRejection(err error) bool {
+	var rejection *ContentRejectionError
+	return errors.As(err, &rejection) && rejection.Code == "image_unsafe"
 }
 
 var profileURLs = []string{
@@ -228,6 +299,8 @@ func defaultMediaContentType(kind string) string {
 	}
 }
 
+const generatedImageSafetyMaxAttempts = 3
+
 func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspectRatio, resolution string, blobIDs []string, downloadResult bool) ([]byte, map[string]any, error) {
 	// Only the generate submit goes through the proxy; polling + download run on
 	// the local IP.
@@ -242,35 +315,44 @@ func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspe
 
 	var lastBody []byte
 	var lastErr error
-	// Firefly Image 5 uses a different endpoint + request schema (modelVersion
-	// "image5", resolutionLevel, top-level aspectRatio label, no modelId/size).
-	endpoint := submitURL
-	var candidates []map[string]any
-	if modelID == "firefly-image-5" {
-		endpoint = image5SubmitURL
-		candidates = []map[string]any{buildImage5Payload(prompt, aspectRatio, resolution, blobIDs)}
-	} else {
-		candidates = BuildImagePayloadCandidates(modelID, prompt, aspectRatio, resolution, blobIDs)
-	}
-	for _, payload := range candidates {
-		respBody, pollURL, err := c.submitImage(ctx, submitSess, token, prompt, endpoint, payload)
-		if err == nil {
-			meta, data, pollErr := c.pollImage(ctx, pollSess, token, pollURL, downloadResult)
-			if pollErr != nil {
-				return nil, nil, pollErr
+generationAttempts:
+	for attempt := 0; attempt < generatedImageSafetyMaxAttempts; attempt++ {
+		// Rebuild payloads on every output-safety retry so seed-bearing models get
+		// a genuinely different sample. Firefly Image 5 uses a separate schema.
+		endpoint := submitURL
+		var candidates []map[string]any
+		if modelID == "firefly-image-5" {
+			endpoint = image5SubmitURL
+			candidates = []map[string]any{buildImage5Payload(prompt, aspectRatio, resolution, blobIDs)}
+		} else {
+			candidates = BuildImagePayloadCandidates(modelID, prompt, aspectRatio, resolution, blobIDs)
+		}
+		for _, payload := range candidates {
+			respBody, pollURL, submitErr := c.submitImage(ctx, submitSess, token, prompt, endpoint, payload)
+			if submitErr == nil {
+				meta, data, pollErr := c.pollImage(ctx, pollSess, token, pollURL, downloadResult)
+				if isRetryableGeneratedImageRejection(pollErr) {
+					lastErr = pollErr
+					continue generationAttempts
+				}
+				if pollErr != nil {
+					return nil, nil, pollErr
+				}
+				return data, meta, nil
 			}
-			return data, meta, nil
+			lastBody = respBody
+			lastErr = submitErr
+			if isRetryableGeneratedImageRejection(submitErr) {
+				continue generationAttempts
+			}
+			if errors.Is(submitErr, ErrAuth) || errors.Is(submitErr, ErrQuotaExhausted) || errors.Is(submitErr, ErrContentRejected) {
+				return nil, nil, submitErr
+			}
 		}
-		lastBody = respBody
-		lastErr = err
-		if errors.Is(err, ErrAuth) || errors.Is(err, ErrQuotaExhausted) || errors.Is(err, ErrContentRejected) {
-			return nil, nil, err
-		}
+		break
 	}
-	// Content-safety refusal: the prompt/image is blocked, retrying other payloads
-	// or accounts is pointless — surface it as-is so the pool doesn't fail over.
-	if errors.Is(lastErr, ErrContentRejected) {
-		return nil, nil, fmt.Errorf("%w: adobe submit: %s", ErrContentRejected, clip(lastBody, 300))
+	if isRetryableGeneratedImageRejection(lastErr) {
+		return nil, nil, fmt.Errorf("%w：Adobe 生成结果连续 %d 次未通过安全审核，请补充成年人、着装和场景描述后重试", ErrContentRejected, generatedImageSafetyMaxAttempts)
 	}
 	// Preserve the temporary classification so the pool retries (overload / 5xx /
 	// rate-limit) instead of failing the request outright.
