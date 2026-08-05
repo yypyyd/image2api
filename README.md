@@ -185,7 +185,7 @@ curl https://你的域名/v1/images/edits \
 
 > 域名 + HTTPS 由你自己的反向代理处理(本项目不内置证书签发)。
 
-**Docker(推荐)**:`docker compose up -d --build` 一条命令拉起 PostgreSQL + Redis + RustFS + 后端 + 前端(nginx **HTTP 监听容器 2000 端口**),把你的反向代理指到 `http://<本机>:2000`(端口用 `WEB_PORT` 改;要改密码 / 密钥 / `CORS_ORIGINS`(反代走 HTTPS 时把 `COOKIE_SECURE` 设为 `true`),直接改 `docker-compose.yml` 里对应值即可)。服务器无法直连 Grok/xAI 时可设置 `GROK_PROXY_URL=http://proxy:port`;该代理仅用于 Grok，并覆盖 Web 账号校验、Statsig、生成、媒体下载以及 Build OAuth/对话链路。Web 链路仍兼容原有 SOCKS 配置,Build OAuth/对话使用 HTTP(S) 代理。
+**Docker(推荐)**:`docker compose up -d --build` 一条命令拉起 PostgreSQL + Redis + RustFS + 后端 + 前端(nginx **HTTP 监听容器 2000 端口**),把你的反向代理指到 `http://<本机>:2000`(端口用 `WEB_PORT` 改;要改密码 / 密钥 / `CORS_ORIGINS`(反代走 HTTPS 时把 `COOKIE_SECURE` 设为 `true`),直接改 `docker-compose.yml` 里对应值即可)。服务器无法稳定直连 ChatGPT 时可设置专用 `CHATGPT_PROXY_URL=http://user:password@proxy:port`,它覆盖 ChatGPT 的 bootstrap、额度查询、上传、生成、轮询和媒体下载，但不影响 Adobe 等其他供应商。服务器无法直连 Grok/xAI 时可设置 `GROK_PROXY_URL=http://proxy:port`;该代理仅用于 Grok，并覆盖 Web 账号校验、Statsig、生成、媒体下载以及 Build OAuth/对话链路。Web 链路仍兼容原有 SOCKS 配置,Build OAuth/对话使用 HTTP(S) 代理。
 
 也可**从源码手动构建**,自备 **PostgreSQL · Redis · RustFS(或任意 S3)· 反向代理**:
 

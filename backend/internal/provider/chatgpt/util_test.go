@@ -2,11 +2,36 @@ package chatgpt
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestChatGPT403Classification(t *testing.T) {
+	edgeErr := ensureOK(403, []byte("<html><body>edge challenge</body></html>"), "bootstrap")
+	if !errors.Is(edgeErr, ErrTemporaryUpstream) || errors.Is(edgeErr, ErrAuth) {
+		t.Fatalf("bootstrap HTML 403 = %v, want temporary upstream", edgeErr)
+	}
+	jsonErr := ensureOK(403, []byte(`{"error":{"code":"invalid_access_token"}}`), "chat_requirements_prepare")
+	if !errors.Is(jsonErr, ErrAuth) || errors.Is(jsonErr, ErrTemporaryUpstream) {
+		t.Fatalf("authenticated JSON 403 = %v, want auth error", jsonErr)
+	}
+}
+
+func TestDedicatedChatGPTProxyOverridesSharedProxy(t *testing.T) {
+	client := NewClient("http://dedicated.example:8118")
+	client.SetProxy("http://shared.example:8080")
+	if client.proxy != "http://dedicated.example:8118" {
+		t.Fatalf("proxy = %q, want dedicated proxy", client.proxy)
+	}
+	fallback := NewClient("")
+	fallback.SetProxy("http://shared.example:8080")
+	if fallback.proxy != "http://shared.example:8080" {
+		t.Fatalf("fallback proxy = %q, want shared proxy", fallback.proxy)
+	}
+}
 
 func TestAssistantTextFromEvent(t *testing.T) {
 	raw := []byte(`{"message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":["hello","world"]}}}`)

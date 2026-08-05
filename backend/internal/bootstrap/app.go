@@ -117,7 +117,7 @@ func NewApp(ctx context.Context) (*App, error) {
 	appSettingsSvc := service.NewAppSettingsService(siteRepo, eventRepo, smtpSvc, rustfsClient)
 	imageAccessSvc := service.NewImageAccessService(cfg.GeneratedRoot, showcaseRepo, authSvc)
 	adobeClient := adobe.NewClient("clio-playground-web", "")
-	chatGPTClient := chatgpt.NewClient("")
+	chatGPTClient := chatgpt.NewClient(cfg.ChatGPTProxyURL)
 	runwayClient := runway.NewClient("")
 	leonardoClient := leonardo.NewClient("")
 	kreaClient := krea.NewClient("")

@@ -36,9 +36,10 @@ var (
 )
 
 type Client struct {
-	proxy     string
-	deviceID  string
-	sessionID string
+	proxy          string
+	dedicatedProxy string
+	deviceID       string
+	sessionID      string
 }
 
 type fileEntry struct {
@@ -57,14 +58,22 @@ type uploadedReference struct {
 }
 
 func NewClient(proxy string) *Client {
+	proxy = strings.TrimSpace(proxy)
 	return &Client{
-		proxy:     strings.TrimSpace(proxy),
-		deviceID:  newUUID(),
-		sessionID: newUUID(),
+		proxy:          proxy,
+		dedicatedProxy: proxy,
+		deviceID:       newUUID(),
+		sessionID:      newUUID(),
 	}
 }
 
 func (c *Client) SetProxy(proxy string) {
+	// A provider-specific environment proxy is authoritative. The shared
+	// site-wide proxy remains the fallback only when no dedicated route exists.
+	if c.dedicatedProxy != "" {
+		c.proxy = c.dedicatedProxy
+		return
+	}
 	c.proxy = strings.TrimSpace(proxy)
 }
 
@@ -363,10 +372,8 @@ func applyAssistantEvent(raw []byte, current string, active bool) (string, bool,
 }
 
 func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, aspectRatio, resolution string, refs [][]byte, downloadResult bool) ([]byte, map[string]any, error) {
-	// Everything except the generation submit egresses on the local IP. Only
-	// startImageGeneration (the /backend-api/f/conversation POST) goes through
-	// the proxy; the bootstrap / chat-requirements / reference upload / prepare
-	// handshake and the poll / resolve / download run direct.
+	// With CHATGPT_PROXY_URL configured, every phase uses the same egress. This
+	// prevents Cloudflare from seeing an impossible mid-session region change.
 	session, err := c.newDirectSession(accessToken)
 	if err != nil {
 		return nil, nil, err
@@ -398,7 +405,6 @@ func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, 
 	if err != nil {
 		return nil, nil, err
 	}
-	// The generation submit is the only request that egresses via the proxy.
 	submitSession, err := c.newSession(accessToken)
 	if err != nil {
 		return nil, nil, err
@@ -557,11 +563,10 @@ func (c *Client) newSession(accessToken string) (tlsclient.HttpClient, error) {
 	return c.newSessionP(accessToken, true)
 }
 
-// newDirectSession egresses on the local IP (never the proxy). Used for
-// everything except the generation submit (the /backend-api/f/conversation
-// POST), which is the only request that uses the proxy.
+// newDirectSession preserves the historical call sites but uses the dedicated
+// ChatGPT proxy when configured. Without one it remains a direct session.
 func (c *Client) newDirectSession(accessToken string) (tlsclient.HttpClient, error) {
-	return c.newSessionP(accessToken, false)
+	return c.newSessionP(accessToken, c.proxy != "")
 }
 
 func (c *Client) newSessionP(accessToken string, useProxy bool) (tlsclient.HttpClient, error) {
@@ -1515,7 +1520,15 @@ func ensureOK(statusCode int, body []byte, context string) error {
 		return nil
 	}
 	switch statusCode {
-	case 401, 403:
+	case 401:
+		return fmt.Errorf("%w: %s %d %s", ErrAuth, context, statusCode, clip(body, 400))
+	case 403:
+		// Bootstrap is account-neutral. An HTML 403 is an edge/challenge response,
+		// not proof that the credential is invalid, so it must not poison the pool.
+		lowerBody := strings.ToLower(strings.TrimSpace(string(body)))
+		if context == "bootstrap" || strings.HasPrefix(lowerBody, "<!doctype html") || strings.HasPrefix(lowerBody, "<html") {
+			return fmt.Errorf("%w: %s %d edge rejection", ErrTemporaryUpstream, context, statusCode)
+		}
 		return fmt.Errorf("%w: %s %d %s", ErrAuth, context, statusCode, clip(body, 400))
 	case 429:
 		return fmt.Errorf("%w: %s 429 %s", ErrQuotaExhausted, context, clip(body, 400))

@@ -1,5 +1,17 @@
 # Design Notes
 
+### 2026-08-06 - Dedicated full-path ChatGPT egress
+
+**Change**: `CHATGPT_PROXY_URL` now pins every ChatGPT Web phase—bootstrap, quota, requirements, reference uploads, prepare/submit, polling, URL resolution, and protected asset downloads—to a provider-specific proxy. An HTML/edge 403, and any 403 on the unauthenticated bootstrap page, is classified as a temporary upstream failure rather than account authentication failure.
+
+**Reason**: The Hong Kong application host receives a Cloudflare HTML 403 from ChatGPT while the former host remains a viable egress. The previous split path proxied only generation submit, and interpreted the account-neutral bootstrap 403 as invalid credentials; one failover loop consequently disabled the entire ChatGPT pool.
+
+**Impact**: User authentication, API keys, billing, logs, account scheduling, and all non-ChatGPT providers remain on the primary application/database. Only encrypted ChatGPT upstream traffic exits through the dedicated host. A true 401 or authenticated non-HTML 403 still disables the affected credential.
+
+**Security boundary**: The egress proxy must require authentication and/or allowlist only the application server IP. Its URL is deployment configuration, never returned by APIs or written to event logs. The proxy sees CONNECT destinations but ChatGPT payloads and bearer tokens remain inside end-to-end TLS.
+
+**Known risk**: The dedicated egress host is now a single point of failure for ChatGPT only. Its outage produces temporary upstream errors without poisoning account health; Adobe and other providers are unaffected.
+
 ### 2026-08-05 - Retry randomly unsafe Adobe image outputs
 
 **Change**: Adobe moderation responses now retain their upstream error code. Image generation retries `image_unsafe` on the same account up to two additional times (three total attempts), rebuilding the payload with a unique seed each time. `prompt_unsafe`, `reference_image_privacy_error`, and generic `legal_error` responses are not retried.
