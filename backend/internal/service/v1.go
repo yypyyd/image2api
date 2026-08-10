@@ -218,6 +218,10 @@ type V1ImageRequest struct {
 	Resolution      string
 	N               int
 	ReferenceImages []string
+	// ReferenceGrid is the legacy request flag for local face swapping. Adobe
+	// references are processed automatically; the flag enables it for other
+	// providers too.
+	ReferenceGrid bool
 	// DeAI applies 去AI特征 post-processing (crop / noise / tone jitter +
 	// re-encode) to the output and charges the per-tier surcharge on top of
 	// the model price. Playground-only; the /v1 OpenAI path never sets it.
@@ -300,6 +304,7 @@ type V1VideoRequest struct {
 	AspectRatio     string
 	Resolution      string
 	ReferenceImages []string
+	ReferenceGrid   bool
 	ReferenceVideos []MediaReference
 	ReferenceAudios []MediaReference
 	GenerateAudio   bool
@@ -887,6 +892,13 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	// generation from running on for minutes and surfacing a late "success" on an
 	// already-abandoned event.
 	ctx = context.WithoutCancel(ctx)
+	if len(in.ReferenceImages) > 0 && s.shouldApplyReferenceGrid(ctx, in.Model, in.ReferenceGrid) {
+		gridded, err := applyReferenceFaceSwap(in.ReferenceImages)
+		if err != nil {
+			return nil, err
+		}
+		in.ReferenceImages = gridded
+	}
 	in.RequestID = strings.TrimSpace(in.RequestID)
 	if len(in.RequestID) > 191 {
 		return nil, fmt.Errorf("%w: idempotency key is too long", ErrUnsupportedParams)
@@ -1286,6 +1298,13 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 	// context (12-min backstop — video polls up to 10 min — and registered so the
 	// maintenance sweep can cancel a stuck render when it abandons the row).
 	ctx = context.WithoutCancel(ctx)
+	if len(in.ReferenceImages) > 0 && s.shouldApplyReferenceGrid(ctx, in.Model, in.ReferenceGrid) {
+		gridded, err := applyReferenceFaceSwap(in.ReferenceImages)
+		if err != nil {
+			return nil, err
+		}
+		in.ReferenceImages = gridded
+	}
 	if source != "admin" {
 		if err := s.checkBannedPrompt(ctx, principal, in.Prompt); err != nil {
 			s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, source, err.Error())
@@ -1456,6 +1475,13 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 // the background, and returns the OpenAI video object (status "queued").
 func (s *V1Service) StartVideoJob(ctx context.Context, principal *APIPrincipal, in V1VideoRequest) (map[string]any, error) {
 	ctx = context.WithoutCancel(ctx)
+	if len(in.ReferenceImages) > 0 && s.shouldApplyReferenceGrid(ctx, in.Model, in.ReferenceGrid) {
+		gridded, err := applyReferenceFaceSwap(in.ReferenceImages)
+		if err != nil {
+			return nil, err
+		}
+		in.ReferenceImages = gridded
+	}
 	if err := s.checkBannedPrompt(ctx, principal, in.Prompt); err != nil {
 		s.logRejectedEvent(ctx, "video", in.Model, principal, in.Prompt, "v1", err.Error())
 		return nil, err

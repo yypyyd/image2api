@@ -184,3 +184,5 @@ gorm.io/driver/sqlserver v1.6.0/go.mod h1:WQzt4IJo/WHKnckU9jXBLMJIVNMVeTu25dnOze
 gorm.io/gorm v1.25.7/go.mod h1:hbnx/Oo0ChWMn1BIhpy1oYozzpM15i4YPuHDmfYtwg8=
 gorm.io/gorm v1.31.0 h1:0VlycGreVhK7RF/Bwt51Fk8v0xLiiiFdbGDPIZQ7mJY=
 gorm.io/gorm v1.31.0/go.mod h1:XyQVbO2k6YkOis7C2437jSit3SsDK72s7n7rsSHd+Gs=
+github.com/esimov/pigo v1.4.6 h1:wpB9FstbqeGP/CZP+nTR52tUJe7XErq8buG+k4xCXlw=
+github.com/esimov/pigo v1.4.6/go.mod h1:uqj9Y3+3IRYhFK071rxz1QYq0ePhA6+R9jrUZavi46M=

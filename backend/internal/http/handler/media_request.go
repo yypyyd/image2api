@@ -40,6 +40,7 @@ func bindGenerateRequest(c *gin.Context) (service.UserGenerateRequest, error) {
 		Model: c.PostForm("model"), Prompt: c.PostForm("prompt"), Ratio: c.PostForm("ratio"),
 		Resolution: c.PostForm("resolution"), Duration: c.PostForm("duration"),
 		ReferenceImages: images, ReferenceVideos: videos, ReferenceAudios: audios,
+		ReferenceGrid: parseFormBool(c.PostForm("reference_grid")),
 		GenerateAudio: parseFormBool(c.PostForm("generate_audio")),
 		DeAI:          parseFormBool(c.PostForm("deai")), AccountID: c.PostForm("account_id"),
 	}, nil
@@ -49,6 +50,7 @@ func bindJSONGenerateRequest(c *gin.Context) (service.UserGenerateRequest, error
 	var body struct {
 		Model, Prompt, Ratio, Resolution, Duration string
 		ReferenceImages                            []string `json:"reference_images"`
+		ReferenceGrid                              bool     `json:"reference_grid"`
 		ReferenceVideos                            []string `json:"reference_videos"`
 		ReferenceAudios                            []string `json:"reference_audios"`
 		GenerateAudio                              bool     `json:"generate_audio"`
@@ -71,7 +73,8 @@ func bindJSONGenerateRequest(c *gin.Context) (service.UserGenerateRequest, error
 		Resolution: body.Resolution, Duration: body.Duration,
 		ReferenceImages: body.ReferenceImages, ReferenceVideos: videos,
 		ReferenceAudios: audios, GenerateAudio: body.GenerateAudio,
-		DeAI: body.DeAI, AccountID: body.AccountID,
+		ReferenceGrid: body.ReferenceGrid,
+		DeAI:          body.DeAI, AccountID: body.AccountID,
 	}, nil
 }
 

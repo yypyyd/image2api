@@ -173,6 +173,8 @@ urllib.request.urlretrieve(resp.data[0].url, "out.png")`,
   -F prompt="把这张图改成赛博朋克风格" \\
   -F size="2048x2048" \\
   -F image=@input.png
+# Adobe 参考图中检测到人脸时会由网关在上传副本上左右互换脸框面板并加轻微网格遮罩
+# 非 Adobe 模型如需同样处理,可额外传 -F reference_grid=true（兼容旧字段名）
 # 多张参考图:重复 -F image=@a.png -F image=@b.png`,
   },
   {
@@ -202,7 +204,8 @@ curl ${base.value}/v1/videos \\
     "model": "${sampleVideo.value}",
     "prompt": "a paper boat sailing down a rainy street, cinematic",
     "seconds": "${sampleSeconds.value}",
-    "size": "1280x720"
+    "size": "1280x720",
+    "reference_grid": true
   }'
 
 # 2) 轮询状态,直到 status=completed

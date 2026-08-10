@@ -820,6 +820,7 @@ onUnmounted(() => {
           </span>
           <span v-if="refsRequired" class="text-rose-500">*</span>
         </label>
+        <div class="mb-2 text-xs text-slate-400">Pigo 检测到人脸后，会左右交换两个竖向面板并加轻微网格遮罩；未可靠检测到人脸时保持原图</div>
         <div class="flex gap-2 flex-wrap items-start rounded-lg transition-colors"
              :class="dragOver ? 'ring-2 ring-indigo-400 ring-offset-2 bg-indigo-50/40' : ''"
              @drop="onDrop" @dragover="onDragOver" @dragleave="onDragLeave">

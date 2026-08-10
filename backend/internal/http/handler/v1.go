@@ -176,6 +176,7 @@ func (h *V1Handler) ImageEdits(c *gin.Context) {
 		Quality:         c.PostForm("quality"),
 		ResponseFormat:  c.PostForm("response_format"),
 		ReferenceImages: refs,
+		ReferenceGrid:   parseFormBool(c.PostForm("reference_grid")),
 		BaseURL:         requestBaseURL(c),
 	})
 	if err != nil {
@@ -220,6 +221,7 @@ func (h *V1Handler) CreateVideo(c *gin.Context) {
 	var refs []string
 	var videos, audios []service.MediaReference
 	var generateAudio bool
+	var referenceGrid bool
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxGenerateMultipartBytes)
 	if strings.HasPrefix(c.GetHeader("Content-Type"), "multipart/form-data") {
 		if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
@@ -244,6 +246,7 @@ func (h *V1Handler) CreateVideo(c *gin.Context) {
 			return
 		}
 		generateAudio = parseFormBool(c.PostForm("generate_audio"))
+		referenceGrid = parseFormBool(c.PostForm("reference_grid"))
 	} else {
 		var body struct {
 			Model   string          `json:"model"`
@@ -257,6 +260,7 @@ func (h *V1Handler) CreateVideo(c *gin.Context) {
 			ReferenceVideos []string `json:"reference_videos"`
 			ReferenceAudios []string `json:"reference_audios"`
 			GenerateAudio   bool     `json:"generate_audio"`
+			ReferenceGrid   bool     `json:"reference_grid"`
 		}
 		if err := c.ShouldBindJSON(&body); err != nil {
 			openaiError(c, http.StatusBadRequest, "invalid_request_error", "", "invalid request body")
@@ -274,6 +278,7 @@ func (h *V1Handler) CreateVideo(c *gin.Context) {
 			return
 		}
 		generateAudio = body.GenerateAudio
+		referenceGrid = body.ReferenceGrid
 	}
 	duration := strings.TrimSpace(seconds)
 	if duration != "" && !strings.HasSuffix(duration, "s") {
@@ -289,6 +294,7 @@ func (h *V1Handler) CreateVideo(c *gin.Context) {
 		ReferenceImages: refs,
 		ReferenceVideos: videos,
 		ReferenceAudios: audios,
+		ReferenceGrid:   referenceGrid,
 		GenerateAudio:   generateAudio,
 		BaseURL:         requestBaseURL(c),
 	})

@@ -273,6 +273,7 @@ async function recover() {
             {{ refsLabel }}
             <span v-if="refsRequired" class="text-rose-300">*</span>
           </label>
+          <div class="mb-2 text-xs text-white/40">同一张图检测到两张以上人脸时交换位置；单人脸图片保持不变（原图不修改）</div>
           <div class="flex gap-2 flex-wrap items-start">
             <div v-for="(img, i) in refImages" :key="i"
                  class="relative w-20 h-20 rounded-lg overflow-hidden ring-1 ring-white/10 bg-white/[0.04]">

@@ -34,6 +34,7 @@ type UserGenerateRequest struct {
 	Resolution      string
 	Duration        string
 	ReferenceImages []string
+	ReferenceGrid   bool
 	ReferenceVideos []MediaReference
 	ReferenceAudios []MediaReference
 	GenerateAudio   bool
@@ -70,6 +71,7 @@ func (s *UserGenerationService) Generate(ctx context.Context, user *model.User, 
 			AspectRatio:     in.Ratio,
 			Resolution:      in.Resolution,
 			ReferenceImages: in.ReferenceImages,
+			ReferenceGrid:   in.ReferenceGrid,
 			ReferenceVideos: in.ReferenceVideos,
 			ReferenceAudios: in.ReferenceAudios,
 			GenerateAudio:   in.GenerateAudio,
@@ -85,6 +87,7 @@ func (s *UserGenerationService) Generate(ctx context.Context, user *model.User, 
 			AspectRatio:     in.Ratio,
 			Resolution:      in.Resolution,
 			ReferenceImages: in.ReferenceImages,
+			ReferenceGrid:   in.ReferenceGrid,
 			DeAI:            in.DeAI,
 		})
 		if err != nil {
@@ -125,6 +128,7 @@ func (s *UserGenerationService) AdminTest(ctx context.Context, user *model.User,
 			AspectRatio:     in.Ratio,
 			Resolution:      in.Resolution,
 			ReferenceImages: in.ReferenceImages,
+			ReferenceGrid:   in.ReferenceGrid,
 			ReferenceVideos: in.ReferenceVideos,
 			ReferenceAudios: in.ReferenceAudios,
 			GenerateAudio:   in.GenerateAudio,
@@ -137,6 +141,7 @@ func (s *UserGenerationService) AdminTest(ctx context.Context, user *model.User,
 			AspectRatio:     in.Ratio,
 			Resolution:      in.Resolution,
 			ReferenceImages: in.ReferenceImages,
+			ReferenceGrid:   in.ReferenceGrid,
 			AccountID:       in.AccountID,
 		})
 	}

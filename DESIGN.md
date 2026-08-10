@@ -1,5 +1,13 @@
 # Design Notes
 
+### 2026-08-06 - Optional reference-image face swapping
+
+**Change**: Adobe reference images now run a local Pigo face-panel transform on the gateway for `/generate`, `/v1/images/edits`, and `/v1/videos` when an individual image contains a reliable face. The detected face rectangle is expanded horizontally and upward (to include hair), two near-opaque black bars are applied only over the estimated eye/glasses regions, then the two vertical panels exchange positions. A dark, semi-transparent grid covers the complete expanded panel area, including hair and surrounding context; no external face is introduced. Images without a reliable face remain unchanged. `reference_grid=true` (JSON or form field) remains as a backwards-compatible opt-in for other providers. The gateway sends only the generated PNG copy upstream; originals are not modified or persisted.
+
+**Reason**: Pigo provides a small pure-Go face detector, allowing the gateway to break the original face identity before an upstream reference-image check while keeping the target composition.
+
+**Impact**: Only images with a reliable detected face are transformed; all other references pass through unchanged. Processing is bounded by the existing 20 MiB reference limit and a 100-megapixel decode guard; invalid or oversized transformed images fail before charging.
+
 ### 2026-08-06 - Dedicated full-path ChatGPT egress
 
 **Change**: `CHATGPT_PROXY_URL` now pins every ChatGPT Web phase—bootstrap, quota, requirements, reference uploads, prepare/submit, polling, URL resolution, and protected asset downloads—to a provider-specific proxy. An HTML/edge 403, and any 403 on the unauthenticated bootstrap page, is classified as a temporary upstream failure rather than account authentication failure.
