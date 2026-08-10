@@ -183,11 +183,37 @@ const qGetTokens = `query GetUserTokensFromSub($sub: String) {
   }
 }`
 
+// FreeDailyTokens is the free tier's (普通号) daily allowance. A subscription
+// balance above it can only come from a paid plan.
+const FreeDailyTokens = 150
+
+// paidPlanPrefixes are Leonardo's paid subscription tiers (annual variants carry a
+// suffix, hence prefix matching). The free tier reports BASIC.
+var paidPlanPrefixes = []string{"APPRENTICE", "ARTISAN", "MAESTRO"}
+
+// IsPaidPlan reports whether an account is a 积分号 —— 余额是买来的点数 / 订阅点数,
+// 按 tokenRenewalDate 月度续期而不是每日重置。只在有明确证据时才判为积分号(购买/
+// 结转点数、已知付费 plan、或订阅点数超过免费号每日上限);其余一律当普通号,
+// 保持原有每日重置逻辑不变。
+func IsPaidPlan(plan string, subscriptionTokens, paidTokens, rolloverTokens int) bool {
+	if paidTokens > 0 || rolloverTokens > 0 || subscriptionTokens > FreeDailyTokens {
+		return true
+	}
+	p := strings.ToUpper(strings.TrimSpace(plan))
+	for _, prefix := range paidPlanPrefixes {
+		if strings.HasPrefix(p, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // FetchCreditsBalance derives a JWT from the cookie then reads the account's image
 // token balance. Returns a normalized map mirroring the other providers so the
 // TokenService quota plumbing is uniform. remaining = subscription+paid+rollover
-// (the spendable image tokens); available_until carries the daily renewal time so
-// the maintenance sweep can auto-recover a 限额 account.
+// (the spendable image tokens); available_until carries the renewal time so
+// the maintenance sweep can auto-recover a 限额 account. paid marks a 积分号 so the
+// callers don't apply the free tier's daily-reset handling to it.
 func (c *Client) FetchCreditsBalance(ctx context.Context, cookie string) (map[string]any, error) {
 	sess, err := c.GetSession(ctx, cookie)
 	if err != nil {
@@ -241,6 +267,7 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, cookie string) (map[st
 		"unknown":         false,
 		"error":           nil,
 		"plan":            ud.Plan,
+		"paid":            IsPaidPlan(ud.Plan, ud.SubscriptionTokens, ud.PaidTokens, ud.RolloverTokens),
 		"available_until": strings.TrimSpace(ud.TokenRenewalDate),
 		"email":           emptyStringNil(sess.Email),
 		"display_name":    emptyStringNil(sess.Name),

@@ -2,6 +2,23 @@ package grok
 
 import "testing"
 
+func TestNormalizeImageAspectRatio(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"2:3", "2:3"},
+		{"3x2", "3:2"},
+		{"16:9", "16:9"},
+		{"unsupported", "1:1"},
+	}
+	for _, tc := range tests {
+		if got := normalizeImageAspectRatio(tc.input); got != tc.want {
+			t.Fatalf("normalizeImageAspectRatio(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
 // A Lite stream delivers the rendered image as a generated_image_card: a preview
 // chunk ("-part-0", progress 50) followed by the finished one (progress 100).
 const liteImageStream = `{"result":{"conversation":{"conversationId":"c1"}}}

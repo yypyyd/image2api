@@ -19,7 +19,7 @@ import (
 // always renders imageGenerationCount images per submit while charging one Fast
 // unit; we return the first one. When downloadResult is false, returns nil bytes
 // and the artifact URL in meta["image_url"]; otherwise downloads the image.
-func (c *Client) GenerateImage(ctx context.Context, token, prompt string, downloadResult bool) ([]byte, map[string]any, error) {
+func (c *Client) GenerateImage(ctx context.Context, token, prompt, aspectRatio string, downloadResult bool) ([]byte, map[string]any, error) {
 	token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
 	if token == "" {
 		return nil, nil, ErrAuth
@@ -27,6 +27,7 @@ func (c *Client) GenerateImage(ctx context.Context, token, prompt string, downlo
 	if strings.TrimSpace(prompt) == "" {
 		return nil, nil, fmt.Errorf("grok: prompt required")
 	}
+	aspectRatio = normalizeImageAspectRatio(aspectRatio)
 
 	// Separate clients keep the submit/download lifecycles independent. With a
 	// Grok proxy configured, both clients use it so the full flow has one egress.
@@ -42,6 +43,10 @@ func (c *Client) GenerateImage(ctx context.Context, token, prompt string, downlo
 
 	// The web client's own conversation payload; modeId "fast" is Lite.
 	payload := map[string]any{
+		// The current Grok Imagine API reads image generation options from
+		// mediaGenInput.  Keeping the explicit modelName is important: the older
+		// enableImageGeneration flag alone silently falls back to a square image.
+		"modelName": "imagine-image-gen",
 		"collectionIds":        []any{},
 		"disabledConnectorIds": []any{},
 		"deviceEnvInfo": map[string]any{
@@ -63,8 +68,25 @@ func (c *Client) GenerateImage(ctx context.Context, token, prompt string, downlo
 		"imageGenerationCount":        2,
 		"isAsyncChat":                 false,
 		"message":                     "Drawing: " + prompt,
+		"mediaGenInput": map[string]any{
+			"textToImage": map[string]any{
+				"prompt":      prompt,
+				"numOfImages": 2,
+				// conversations/new declares aspectRatio as a protobuf string.
+				// Do not pass the UI/catalog ratio pair (e.g. [16, 9]) here: the
+				// upstream parser rejects it with "invalid value for string field
+				// aspectRatio: [".
+				"aspectRatio": aspectRatio,
+				"resolutionName": "1k",
+				"mode":        "fast",
+			},
+		},
 		"modeId":                      "fast",
-		"responseMetadata":            map[string]any{},
+		"responseMetadata": map[string]any{
+			"modelConfigOverride": map[string]any{
+				"modelMap": map[string]any{"imageEditModel": "imagine"},
+			},
+		},
 		"returnImageBytes":            false,
 		"returnRawGrokInXaiRequest":   false,
 		"sendFinalMetadata":           true,
@@ -106,6 +128,20 @@ func (c *Client) GenerateImage(ctx context.Context, token, prompt string, downlo
 		return nil, nil, err
 	}
 	return data, meta, nil
+}
+
+// normalizeImageAspectRatio mirrors Grok Imagine's fast-mode v1 set.  The
+// service clamps user-facing sizes against the model catalog before calling
+// this method; this final guard prevents an invalid value from reaching Grok
+// when the provider is used directly.
+func normalizeImageAspectRatio(value string) string {
+	value = strings.TrimSpace(strings.ReplaceAll(value, "x", ":"))
+	for _, allowed := range []string{"2:3", "3:2", "1:1", "9:16", "16:9"} {
+		if value == allowed {
+			return value
+		}
+	}
+	return "1:1"
 }
 
 // firstGeneratedImage picks the finished image path out of a Lite chat stream.

@@ -35,9 +35,9 @@ type detectedFace struct {
 	score float32
 }
 
-// applyReferenceFaceSwap crops the first face detected by Pigo and exchanges
-// its left and right vertical panels in the same image. No external face is
-// ever introduced. References without a reliable face remain unchanged.
+// applyReferenceFaceSwap covers the detected face region of the first face
+// found by Pigo with a light red-silk mesh. No external face is ever introduced.
+// References without a reliable face remain unchanged.
 func applyReferenceFaceSwap(inputs []string) ([]string, error) {
 	out := make([]string, 0, len(inputs))
 	for _, raw := range inputs {
@@ -57,13 +57,13 @@ func applyReferenceFaceSwap(inputs []string) ([]string, error) {
 			}
 			return nil, fmt.Errorf("%w: %v", ErrUnsupportedParams, err)
 		}
-		composite, err := swapFaceHalvesWithinImage(src, faces[0])
+		composite, err := veilFaceWithinImage(src, faces[0])
 		if err != nil {
 			return nil, err
 		}
 		var encoded bytes.Buffer
 		if err := png.Encode(&encoded, composite); err != nil {
-			return nil, fmt.Errorf("%w: encode face-panel swap: %v", ErrUnsupportedParams, err)
+			return nil, fmt.Errorf("%w: encode face veil: %v", ErrUnsupportedParams, err)
 		}
 		if encoded.Len() > maxReferenceImageBytes {
 			return nil, ErrReferenceTooLarge
@@ -73,145 +73,60 @@ func applyReferenceFaceSwap(inputs []string) ([]string, error) {
 	return out, nil
 }
 
-// swapFaceHalvesWithinImage keeps the Pigo face rectangle fixed, splits it at
-// the vertical midpoint, and moves the right panel to the left and the left
-// panel to the right. This is deliberately a hard rectangular operation: the
-// result is the vertical-panel face transformation requested by the client.
-func swapFaceHalvesWithinImage(src image.Image, face detectedFace) (*image.RGBA, error) {
-	// Mask the eye/glasses band on the detected face before exchanging panels.
-	// This keeps the black strip tied to the original facial landmarks instead
-	// of stretching it across the surrounding hair and background.
-	prepared := image.NewRGBA(src.Bounds())
-	draw.Draw(prepared, prepared.Bounds(), src, src.Bounds().Min, draw.Src)
-	applyEyeBars(prepared, face.box)
-	dst, panelBox, err := swapFaceHalvesRaw(prepared, face)
-	if err != nil {
-		return nil, err
-	}
-	// Veil the complete exchanged panel, including the expanded hair and
-	// surrounding context, so no recognizable face fragment remains outside
-	// the grid.
-	applyFaceGrid(dst, panelBox)
-	return dst, nil
-}
-
-func swapFaceHalvesRaw(src image.Image, face detectedFace) (*image.RGBA, image.Rectangle, error) {
+// veilFaceWithinImage keeps the surrounding composition intact and lays a
+// light red-silk mesh only over the detected face region.
+func veilFaceWithinImage(src image.Image, face detectedFace) (*image.RGBA, error) {
 	bounds := src.Bounds()
 	if bounds.Dx() <= 0 || bounds.Dy() <= 0 || int64(bounds.Dx())*int64(bounds.Dy()) > maxReferencePixels {
-		return nil, image.Rectangle{}, ErrReferenceTooLarge
+		return nil, ErrReferenceTooLarge
 	}
 	box := expandFacePanelBox(face.box.Intersect(image.Rect(0, 0, bounds.Dx(), bounds.Dy())), image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
 	if box.Dx() < 4 || box.Dy() < 2 {
-		return nil, image.Rectangle{}, fmt.Errorf("%w: detected face is too small", ErrUnsupportedParams)
+		return nil, fmt.Errorf("%w: detected face is too small", ErrUnsupportedParams)
 	}
-
 	dst := image.NewRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
 	draw.Draw(dst, dst.Bounds(), src, bounds.Min, draw.Src)
-	crop := image.NewRGBA(image.Rect(0, 0, box.Dx(), box.Dy()))
-	draw.Draw(crop, crop.Bounds(), src, box.Min, draw.Src)
-
-	leftWidth := crop.Bounds().Dx() / 2
-	left := crop.SubImage(image.Rect(0, 0, leftWidth, crop.Bounds().Dy()))
-	right := crop.SubImage(image.Rect(leftWidth, 0, crop.Bounds().Dx(), crop.Bounds().Dy()))
-
-	leftTarget := image.Rect(box.Min.X, box.Min.Y, box.Min.X+leftWidth, box.Max.Y)
-	rightTarget := image.Rect(box.Min.X+leftWidth, box.Min.Y, box.Max.X, box.Max.Y)
-	leftPanel := image.NewRGBA(image.Rect(0, 0, leftTarget.Dx(), leftTarget.Dy()))
-	rightPanel := image.NewRGBA(image.Rect(0, 0, rightTarget.Dx(), rightTarget.Dy()))
-	// The odd-pixel case has different half widths, so scale each source panel
-	// into the other panel's exact rectangle while preserving the hard seam.
-	xdraw.CatmullRom.Scale(leftPanel, leftPanel.Bounds(), right, right.Bounds(), xdraw.Src, nil)
-	xdraw.CatmullRom.Scale(rightPanel, rightPanel.Bounds(), left, left.Bounds(), xdraw.Src, nil)
-	draw.Draw(dst, leftTarget, leftPanel, image.Point{}, draw.Src)
-	draw.Draw(dst, rightTarget, rightPanel, image.Point{}, draw.Src)
-	return dst, box, nil
+	drawFaceVeil(dst, box)
+	return dst, nil
 }
 
-// expandFacePanelBox makes the exchanged panels larger than the tight Pigo
-// face square. The upward expansion deliberately includes hair while the
-// smaller side/bottom expansion keeps the surrounding composition stable.
+// drawFaceVeil weaves red strands across the box in both directions. The
+// strands are kept distinct while a moderately tighter gap increases density
+// without turning the whole region into a solid rectangle.
+func drawFaceVeil(dst *image.RGBA, box image.Rectangle) {
+	box = box.Intersect(dst.Bounds())
+	if box.Dx() <= 0 || box.Dy() <= 0 {
+		return
+	}
+	red := image.NewUniform(color.RGBA{R: 255, A: 255})
+	// Use a slightly heavier strand so the mesh remains visible after the
+	// reference image is resized by the upstream video model.
+	strand := max(1, min(box.Dx(), box.Dy())/100)
+	gap := max(3, min(box.Dx(), box.Dy())/70)
+	for y := box.Min.Y; y < box.Max.Y; y += strand + gap {
+		draw.Draw(dst, image.Rect(box.Min.X, y, box.Max.X, min(box.Max.Y, y+strand)), red, image.Point{}, draw.Src)
+	}
+	for x := box.Min.X; x < box.Max.X; x += strand + gap {
+		draw.Draw(dst, image.Rect(x, box.Min.Y, min(box.Max.X, x+strand), box.Max.Y), red, image.Point{}, draw.Src)
+	}
+}
+
+// expandFacePanelBox keeps the mask inside the Pigo rectangle. Pigo's square
+// includes a little hair and ear padding, so trim those edges before veiling.
 func expandFacePanelBox(box, bounds image.Rectangle) image.Rectangle {
+	box = box.Intersect(bounds)
 	if box.Dx() <= 0 || box.Dy() <= 0 {
 		return box
 	}
-	padX := max(1, int(float64(box.Dx())*0.18))
-	padTop := max(1, int(float64(box.Dy())*0.55))
-	padBottom := max(1, int(float64(box.Dy())*0.12))
+	padX := max(1, int(float64(box.Dx())*0.08))
+	padTop := max(1, int(float64(box.Dy())*0.14))
+	padBottom := max(1, int(float64(box.Dy())*0.06))
 	return image.Rect(
-		max(bounds.Min.X, box.Min.X-padX),
-		max(bounds.Min.Y, box.Min.Y-padTop),
-		min(bounds.Max.X, box.Max.X+padX),
-		min(bounds.Max.Y, box.Max.Y+padBottom),
+		box.Min.X+padX,
+		box.Min.Y+padTop,
+		box.Max.X-padX,
+		box.Max.Y-padBottom,
 	)
-}
-
-// applyFaceGrid draws a dark, regular grid over the complete exchanged panel
-// after the two vertical panels have exchanged positions. The lines are
-// translucent enough to preserve the panel composition while breaking up
-// facial landmarks across the whole hair-inclusive crop.
-func applyFaceGrid(dst *image.RGBA, box image.Rectangle) {
-	box = box.Intersect(dst.Bounds())
-	if box.Dx() < 2 || box.Dy() < 2 {
-		return
-	}
-	cell := max(18, min(box.Dx(), box.Dy())/10)
-	lineWidth := max(3, cell/10)
-	const overlayAlpha = 220
-	for y := box.Min.Y; y < box.Max.Y; y += cell {
-		for yy := y; yy < min(box.Max.Y, y+lineWidth); yy++ {
-			for x := box.Min.X; x < box.Max.X; x++ {
-				darkenPixel(dst, x, yy, overlayAlpha)
-			}
-		}
-	}
-	for x := box.Min.X; x < box.Max.X; x += cell {
-		for xx := x; xx < min(box.Max.X, x+lineWidth); xx++ {
-			for y := box.Min.Y; y < box.Max.Y; y++ {
-				darkenPixel(dst, xx, y, overlayAlpha)
-			}
-		}
-	}
-}
-
-func darkenPixel(dst *image.RGBA, x, y, alpha int) {
-	p := dst.RGBAAt(x, y)
-	inv := 255 - alpha
-	dst.SetRGBA(x, y, color.RGBA{
-		R: uint8((int(p.R) * inv) / 255),
-		G: uint8((int(p.G) * inv) / 255),
-		B: uint8((int(p.B) * inv) / 255),
-		A: p.A,
-	})
-}
-
-// applyEyeBars draws two nearly opaque horizontal black strips over the
-// estimated left and right eye regions. Keeping each strip inside one half of
-// the original face prevents it from spilling across the exchanged panels.
-func applyEyeBars(dst *image.RGBA, faceBox image.Rectangle) {
-	faceBox = faceBox.Intersect(dst.Bounds())
-	if faceBox.Dx() < 2 || faceBox.Dy() < 2 {
-		return
-	}
-	centerY := faceBox.Min.Y + int(float64(faceBox.Dy())*0.36)
-	barHeight := max(8, int(float64(faceBox.Dy())*0.15))
-	barWidth := max(10, int(float64(faceBox.Dx())*0.27))
-	leftCenter := faceBox.Min.X + int(float64(faceBox.Dx())*0.32)
-	rightCenter := faceBox.Min.X + int(float64(faceBox.Dx())*0.68)
-	drawEyeBar(dst, faceBox, leftCenter, centerY, barWidth, barHeight)
-	drawEyeBar(dst, faceBox, rightCenter, centerY, barWidth, barHeight)
-}
-
-func drawEyeBar(dst *image.RGBA, faceBox image.Rectangle, centerX, centerY, width, height int) {
-	startX := max(faceBox.Min.X, centerX-width/2)
-	endX := min(faceBox.Max.X, startX+width)
-	startY := max(faceBox.Min.Y, centerY-height/2)
-	endY := min(faceBox.Max.Y, startY+height)
-	const barAlpha = 245
-	for y := startY; y < endY; y++ {
-		for x := startX; x < endX; x++ {
-			darkenPixel(dst, x, y, barAlpha)
-		}
-	}
 }
 
 func decodeReferenceImage(raw string) ([]byte, error) {
@@ -230,100 +145,6 @@ func decodeReferenceImage(raw string) ([]byte, error) {
 		return nil, ErrReferenceTooLarge
 	}
 	return data, nil
-}
-
-func swapFacesWithinImage(src image.Image, first, second detectedFace) (*image.RGBA, error) {
-	bounds := src.Bounds()
-	if bounds.Dx() <= 0 || bounds.Dy() <= 0 || int64(bounds.Dx())*int64(bounds.Dy()) > maxReferencePixels {
-		return nil, ErrReferenceTooLarge
-	}
-	dst := image.NewRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
-	draw.Draw(dst, dst.Bounds(), src, bounds.Min, draw.Src)
-	base := image.NewRGBA(dst.Bounds())
-	draw.Draw(base, base.Bounds(), dst, image.Point{}, draw.Src)
-
-	// Keep Pigo's rectangle exactly. Do not synthesize a new face, enlarge the
-	// crop, or feather it into an oval: callers use this preprocessing to break
-	// the identity in the reference image, and the detector's crop is the only
-	// source region that may be copied.
-	firstBox := first.box
-	secondBox := second.box
-	if err := pasteFace(dst, base, src, secondBox, firstBox); err != nil {
-		return nil, err
-	}
-	if err := pasteFace(dst, base, src, firstBox, secondBox); err != nil {
-		return nil, err
-	}
-	return dst, nil
-}
-
-func pasteFace(dst, toneTarget *image.RGBA, src image.Image, sourceBox, targetBox image.Rectangle) error {
-	if sourceBox.Dx() < 2 || sourceBox.Dy() < 2 || targetBox.Dx() < 2 || targetBox.Dy() < 2 {
-		return fmt.Errorf("%w: detected face is too small", ErrUnsupportedParams)
-	}
-	srcCrop := image.NewRGBA(sourceBox)
-	draw.Draw(srcCrop, srcCrop.Bounds(), src, sourceBox.Min, draw.Src)
-	face := image.NewRGBA(image.Rect(0, 0, targetBox.Dx(), targetBox.Dy()))
-	xdraw.CatmullRom.Scale(face, face.Bounds(), srcCrop, srcCrop.Bounds(), xdraw.Over, nil)
-	correctFaceTone(face, toneTarget, targetBox)
-
-	// Pigo returns a rectangular crop. Copy that crop as a rectangle, preserving
-	// the hard panel boundaries in references such as split/strip artwork.
-	draw.Draw(dst, targetBox, face, image.Point{}, draw.Src)
-	return nil
-}
-
-// correctFaceTone applies a restrained per-channel offset so swapped faces
-// keep the target's lighting instead of looking like pasted foreign pixels.
-func correctFaceTone(face, toneTarget *image.RGBA, targetBox image.Rectangle) {
-	var sourceSum, targetSum [3]uint64
-	var count uint64
-	for y := 0; y < face.Bounds().Dy(); y++ {
-		for x := 0; x < face.Bounds().Dx(); x++ {
-			nx := (float64(x)+0.5)/float64(face.Bounds().Dx())*2 - 1
-			ny := (float64(y)+0.5)/float64(face.Bounds().Dy())*2 - 1
-			if nx*nx+ny*ny > 0.42 {
-				continue
-			}
-			r, g, b, _ := face.At(x, y).RGBA()
-			tr, tg, tb, _ := toneTarget.At(targetBox.Min.X+x, targetBox.Min.Y+y).RGBA()
-			sourceSum[0] += uint64(r >> 8)
-			sourceSum[1] += uint64(g >> 8)
-			sourceSum[2] += uint64(b >> 8)
-			targetSum[0] += uint64(tr >> 8)
-			targetSum[1] += uint64(tg >> 8)
-			targetSum[2] += uint64(tb >> 8)
-			count++
-		}
-	}
-	if count == 0 {
-		return
-	}
-	var delta [3]int
-	for i := range delta {
-		delta[i] = int(float64(int64(targetSum[i]/count)-int64(sourceSum[i]/count)) * 0.72)
-	}
-	for y := 0; y < face.Bounds().Dy(); y++ {
-		for x := 0; x < face.Bounds().Dx(); x++ {
-			r, g, b, a := face.At(x, y).RGBA()
-			face.SetRGBA(x, y, color.RGBA{
-				R: clampByte(int(r>>8) + delta[0]),
-				G: clampByte(int(g>>8) + delta[1]),
-				B: clampByte(int(b>>8) + delta[2]),
-				A: uint8(a >> 8),
-			})
-		}
-	}
-}
-
-func clampByte(v int) uint8 {
-	if v < 0 {
-		return 0
-	}
-	if v > 255 {
-		return 255
-	}
-	return uint8(v)
 }
 
 func detectFaces(src image.Image) ([]detectedFace, error) {

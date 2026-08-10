@@ -65,6 +65,33 @@ func TestVeo31LitePayload(t *testing.T) {
 	}
 }
 
+func TestFireflyVideoPayloadForwardsAllSupportedInputs(t *testing.T) {
+	payload := BuildVideoPayload("firefly-video", "test", "9:16", 5, "720p", "frame", "", VideoInputs{
+		ImageBlobIDs: []string{"first-frame", "last-frame"},
+		VideoBlobIDs: []string{"control-video"},
+	})
+	if payload["prompt"] != "test" || payload["locale"] != "en-US" {
+		t.Fatalf("Firefly payload basics = %#v", payload)
+	}
+	sizes := payload["sizes"].([]any)
+	if len(sizes) != 1 {
+		t.Fatalf("Firefly sizes = %#v", sizes)
+	}
+	size := sizes[0].(map[string]any)
+	if size["width"] != 720 || size["height"] != 1280 || size["numFrames"] != 128 {
+		t.Fatalf("Firefly size/duration = %#v", size)
+	}
+	conditions := payload["image"].(map[string]any)["conditions"].([]any)
+	if len(conditions) != 2 || conditions[0].(map[string]any)["placement"].(map[string]any)["start"] != 0 ||
+		conditions[1].(map[string]any)["placement"].(map[string]any)["start"] != 1 {
+		t.Fatalf("Firefly image conditions = %#v", conditions)
+	}
+	control := payload["controlData"].(map[string]any)["structureData"].(map[string]any)["referenceVideo"].(map[string]any)
+	if control["source"].(map[string]any)["id"] != "control-video" {
+		t.Fatalf("Firefly control video = %#v", control)
+	}
+}
+
 func TestNewPartnerVideoPayloads(t *testing.T) {
 	tests := []struct {
 		engine, modelID, version string

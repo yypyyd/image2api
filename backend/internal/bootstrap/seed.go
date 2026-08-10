@@ -61,6 +61,7 @@ func seedDefaults(ctx context.Context, db *gorm.DB) error {
 	if err := db.WithContext(ctx).Exec(`UPDATE model_configs SET
 		max_reference_images = CASE id
 			WHEN 'firefly-seedance-2' THEN 9 WHEN 'firefly-seedance-2-fast' THEN 9
+			WHEN 'firefly-video' THEN 2
 			ELSE max_reference_images END,
 		max_reference_videos = CASE id
 			WHEN 'firefly-kling-3' THEN 1 WHEN 'firefly-kling-o3' THEN 1
@@ -80,6 +81,42 @@ func seedDefaults(ctx context.Context, db *gorm.DB) error {
 			WHEN 'firefly-seedance-2-fast' THEN true ELSE supports_audio_output END
 		WHERE id IN ('gemini-veo31','firefly-kling-3','firefly-kling-o3','firefly-seedance-2',
 			'firefly-seedance-2-fast','firefly-ray','firefly-video')`).Error; err != nil {
+		return err
+	}
+	// Grok Imagine fast mode supports the same five aspect ratios exposed by
+	// the current web client. Older installs advertised only 1:1, which caused
+	// the gateway to snap every downstream size to a square and omit the ratio
+	// from the upstream mediaGenInput payload.
+	if err := db.WithContext(ctx).Exec(`UPDATE model_configs
+		SET ratios = '["2:3","3:2","1:1","9:16","16:9"]'::jsonb,
+			resolutions = '["1K"]'::jsonb
+		WHERE id = 'grok-imagine-image' AND provider = 'grok'`).Error; err != nil {
+		return err
+	}
+	// Grok video is a built-in provider capability. Older installations had the
+	// entry only in the HTTP catalog, which meant /managed-models, the API model
+	// list, and the account test dialog could not use it. Insert it once while
+	// preserving any administrator-customized row/pricing on subsequent starts.
+	if err := db.WithContext(ctx).Exec(`INSERT INTO model_configs
+		(id, type, name, alias, provider, enabled, ratios, prices, resolutions,
+		 image_to_image, duration_prices, prices_agent, duration_prices_agent,
+		 durations, max_reference_images, max_reference_videos, max_reference_audios,
+		 max_reference_media, supports_audio_output, reference_mode, upstream_model,
+		 weight, generation_count, created_at, updated_at)
+		VALUES ('grok-video', 'video', 'Grok Imagine video', '', 'grok', true,
+		 '["2:3","3:2","1:1","9:16","16:9"]'::jsonb,
+		 '{"720p":0}'::jsonb, '["720p"]'::jsonb, false,
+		 '{"6s":10,"10s":15}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+		 '["6s","10s"]'::jsonb, 6, 0, 0, 0, false, 'asset', '',
+		 0, 0, now(), now()) ON CONFLICT (id) DO NOTHING`).Error; err != nil {
+		return err
+	}
+	// Older releases incorrectly treated a missing ACTIVE subscription as a
+	// permanent Grok video restriction. Grok now exposes video to these sessions
+	// as long as the media credit endpoint allows it; clear only that obsolete
+	// provider-wide marker (the current liveness probe no longer writes it).
+	if err := db.WithContext(ctx).Exec(`UPDATE token_accounts SET video_limited = false
+		WHERE pool = 'grok' AND video_limited = true`).Error; err != nil {
 		return err
 	}
 	// One-time backfill of the persistent per-model generation counter from

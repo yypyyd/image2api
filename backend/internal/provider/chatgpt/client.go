@@ -502,6 +502,17 @@ func (c *Client) FetchImageQuota(ctx context.Context, accessToken string) (map[s
 	return c.fetchImageQuota(ctx, session, accessToken)
 }
 
+// FetchImageQuotaDirect performs the best-effort quota read from the gateway's
+// own egress, deliberately bypassing the provider's dedicated generation proxy.
+// A proxy/region challenge must never be mistaken for a dead imported JWT.
+func (c *Client) FetchImageQuotaDirect(ctx context.Context, accessToken string) (map[string]any, error) {
+	session, err := c.newSessionP(accessToken, false)
+	if err != nil {
+		return nil, err
+	}
+	return c.fetchImageQuota(ctx, session, accessToken)
+}
+
 func (c *Client) fetchImageQuota(ctx context.Context, session tlsclient.HttpClient, accessToken string) (map[string]any, error) {
 	path := "/backend-api/conversation/init"
 	body, _ := json.Marshal(map[string]any{

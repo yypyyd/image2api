@@ -71,6 +71,24 @@ function typePill(t) {
   }[t] || 'bg-white/[0.06] text-white/70 ring-white/15'
 }
 
+const CAPABILITY_LABEL = { chat: '对话', image: '图片', video: '视频' }
+function grokCapabilities(a) {
+  // Older rows do not have the new server field yet; Grok's routing policy is
+  // still deterministic from the account flags, so render a safe compatibility
+  // view until the next account refresh fills it in.
+  if (Array.isArray(a.capabilities) && a.capabilities.length) return a.capabilities
+  if (a.type !== 'grok') return []
+  // Grok's quota marker is media-only; chat remains routable while a media
+  // credit pool is paused.
+  const identityOK = a.status !== 'pending' && a.status !== 'disabled' && !a.dead
+  const mediaOK = identityOK && a.status === 'active'
+  return [
+    { kind: 'chat', available: identityOK, limited: false },
+    { kind: 'image', available: mediaOK && !a.image_limited, limited: !!a.image_limited },
+    { kind: 'video', available: mediaOK && !a.video_limited, limited: !!a.video_limited },
+  ]
+}
+
 function accountConcurrency(a) {
   if (Number(a.concurrency) > 0) return Number(a.concurrency)
   if (a.type === 'grok') return 10
@@ -459,6 +477,15 @@ onMounted(() => { loadAccounts(); loadModelList() })
                    case. -->
               <div class="flex items-center gap-2 min-w-0">
                 <span class="text-sm text-white/90 truncate" :title="a.email || '-'">{{ a.email || '-' }}</span>
+                <span v-for="cap in grokCapabilities(a)" :key="cap.kind"
+                      class="shrink-0 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ring-1"
+                      :class="cap.available ? 'bg-emerald-500/10 text-emerald-300 ring-emerald-400/20' : 'bg-rose-500/10 text-rose-300 ring-rose-400/20'"
+                      :title="cap.available ? `可用${CAPABILITY_LABEL[cap.kind]}` : `${CAPABILITY_LABEL[cap.kind]}额度/权限不可用`">
+                  {{ CAPABILITY_LABEL[cap.kind] }}
+                </span>
+                <span v-if="a.type === 'leonardo' && a.paid_plan"
+                      class="shrink-0 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium bg-violet-500/15 text-violet-300 ring-1 ring-violet-400/20"
+                      :title="a.plan ? `积分号 · ${a.plan}，点数按月续期` : '积分号，点数按月续期，不参与每日重置'">积分号</span>
                 <span v-if="a.image_limited && a.status !== 'quota'"
                       class="shrink-0 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium bg-amber-500/15 text-amber-300 ring-1 ring-amber-400/20"
                       title="图片额度耗尽，仅视频可用">图片限额</span>

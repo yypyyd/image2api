@@ -1,8 +1,32 @@
 # Design Notes
 
+### 2026-08-08 - API-key image URL passthrough
+
+**Change**: API-key image requests using `response_format=url` now return the provider artifact URL directly when the provider supplies one, even when an idempotency key also causes a private recovery copy to be stored. The session-gated `/images/...` URL is only a fallback when no provider URL exists; ChatGPT/Grok account-gated assets continue using the authenticated `/v1/images/{id}/content` proxy.
+
+**Reason**: `/images/<owner>/<file>` is protected by a browser session cookie and cannot be fetched by ordinary downstream API clients. Returning it as an API-key URL made a successful generation appear broken with “需要登录后访问”.
+
+**Impact**: Existing private gallery access and idempotency recovery remain unchanged. Downstream clients receive the upstream URL for ordinary public provider assets; upstream URLs that expire or require provider login remain subject to provider-side availability and use the dedicated proxy path when supported.
+
+### 2026-08-07 - Adobe points-account concurrency safety
+
+**Change**: Adobe points accounts now default to four simultaneous generations per account. Existing points accounts are normalized to an explicit concurrency of four during deployment; newly imported accounts inherit the same effective limit when no override is stored.
+
+**Reason**: High same-account concurrency increases provider throttling and account-risk exposure. A bounded per-account limit of four balances throughput and account stability; pool-level throughput still scales by adding accounts.
+
+**Impact**: Concurrent Adobe jobs are distributed across distinct eligible accounts or queued until an account slot is released. Other provider pools and user concurrency groups are unchanged.
+
+### 2026-08-08 - Face-only thin red-silk reference veil
+
+**Change**: Seedance 2 and Seedance 2 Fast reference images now apply a light, medium-weight red mesh with extreme density only inside an inward-trimmed Pigo face rectangle. The previous hair-inclusive expansion and dense near-black mesh were removed; no 3x3 grid, external face, or heavy strands are added.
+
+**Reason**: The previous face veil was too sparse in its reduced version and black lines were harder to distinguish from dark hair. Thin red strands improve visibility while preserving the face-only, non-solid treatment.
+
+**Impact**: Hair, shoulders, clothing, and background remain unchanged. Images without a reliable face remain unchanged, and other models still receive original reference bytes.
+
 ### 2026-08-06 - Optional reference-image face swapping
 
-**Change**: Adobe reference images now run a local Pigo face-panel transform on the gateway for `/generate`, `/v1/images/edits`, and `/v1/videos` when an individual image contains a reliable face. The detected face rectangle is expanded horizontally and upward (to include hair), two near-opaque black bars are applied only over the estimated eye/glasses regions, then the two vertical panels exchange positions. A dark, semi-transparent grid covers the complete expanded panel area, including hair and surrounding context; no external face is introduced. Images without a reliable face remain unchanged. `reference_grid=true` (JSON or form field) remains as a backwards-compatible opt-in for other providers. The gateway sends only the generated PNG copy upstream; originals are not modified or persisted.
+**Change**: Seedance 2 and Seedance 2 Fast reference images run a local Pigo face transform on the gateway for `/generate`, `/v1/images/edits`, and `/v1/videos` when an individual image contains a reliable face. This entry records the earlier experimental 3x3 grid version; it was superseded by the face-only veil above.
 
 **Reason**: Pigo provides a small pure-Go face detector, allowing the gateway to break the original face identity before an upstream reference-image check while keeping the target composition.
 

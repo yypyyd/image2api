@@ -243,7 +243,7 @@ func (s *TokenService) ImportChatGPTToken(ctx context.Context, accessToken, toke
 	if err != nil {
 		if errors.Is(err, gorm.ErrDuplicatedKey) {
 			if item, err = s.tokens.Update(ctx, "chatgpt", tokenID, map[string]any{
-				"value": accessToken, "status": "pending", "meta": meta,
+				"value": accessToken, "status": "pending", "dead": false, "fails": 0, "meta": meta,
 			}); err != nil {
 				return nil, err
 			}
@@ -422,6 +422,8 @@ func (s *TokenService) checkPendingLeonardo(tokenID, cookie string) {
 	if uid := strings.TrimSpace(stringValue(data["user_id"])); uid != "" {
 		quotaMeta["user_id"] = uid
 	}
+	// 普通号 / 积分号 的区分,决定重置逻辑(积分号不参与每日重置)。
+	applyLeonardoPlanMeta(quotaMeta, data)
 	s.finishPending(ctx, "leonardo", tokenID, "active", false, quotaMeta)
 }
 
@@ -775,7 +777,10 @@ func (s *TokenService) probeAndFinishChatGPT(ctx context.Context, tokenID, acces
 	var data map[string]any
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
-		data, err = s.chatgpt.FetchImageQuota(ctx, accessToken)
+		// This diagnostic read must not inherit CHATGPT_PROXY_URL: the dedicated
+		// proxy may be region-bound and a challenge/401 there is not proof that the
+		// JWT is dead. Generation keeps its configured proxy and handles auth at use.
+		data, err = s.chatgpt.FetchImageQuotaDirect(ctx, accessToken)
 		if err != nil {
 			break
 		}
@@ -798,7 +803,14 @@ func (s *TokenService) probeAndFinishChatGPT(ctx context.Context, tokenID, acces
 		return
 	}
 	if boolValueWithDefault(data["auth_failed"], false) {
-		s.finishPending(ctx, "chatgpt", tokenID, "disabled", true, nil)
+		// A quota probe is not a liveness proof. OpenAI can return 401/403 here
+		// when the shared egress is challenged or region-bound, while the JWT is
+		// still usable for the actual Web conversation. Keep the account active;
+		// generation-time auth handling is the authority for permanently dead JWTs.
+		s.finishPending(ctx, "chatgpt", tokenID, "active", false, map[string]any{
+			"quota_probe_unknown": true,
+			"quota_probe_error":   data["error"],
+		})
 		return
 	}
 	// Still unknown after retries — don't trust it as 0; activate so the account
@@ -1054,12 +1066,10 @@ func (s *TokenService) checkPendingGrok(tokenID, ssoToken string) {
 // RefreshGrokLiveness re-validates every live grok account each maintenance tick.
 // Grok sso can't be renewed and has no reset-based death deadline (billingPeriodEnd
 // is only a credits-renewal date — the sso keeps working past it), so liveness is
-// probed directly: GET /rest/subscriptions. Only a genuinely dead session (3x
-// 401/403) kills the account: a missing ACTIVE entry just means the account is on
-// the free Basic tier, which can still run Lite 生图 — it's flagged video_limited
-// (imagine video needs SuperGrok) and stays usable for image. The credits balance
-// is re-synced and 恢复时间 refreshed from the credits' own weekly reset (NOT the
-// subscription's billing-period end).
+// probed directly through the authenticated credits endpoint. A missing
+// subscription is not an entitlement signal: current Grok accounts can expose
+// video without an ACTIVE subscription, so it must never become video_limited.
+// The credits balance is re-synced and 恢复时间 refreshed from its weekly reset.
 func (s *TokenService) RefreshGrokLiveness(ctx context.Context) {
 	if s.grok == nil {
 		return
@@ -1074,36 +1084,19 @@ func (s *TokenService) RefreshGrokLiveness(ctx context.Context) {
 		if it.Pool != "grok" || it.Dead || it.Status == "disabled" || strings.TrimSpace(it.Value) == "" {
 			continue
 		}
-		// A grok sso can momentarily 401 (upstream blip / proxy hiccup / anti-bot)
-		// while still being fully valid, so a single auth failure must never kill a
-		// live account. Retry the subscription probe up to 3 times on 401/403; only
-		// if all 3 attempts still return ErrAuth do we treat the session as dead.
-		var sub *grok.Subscription
-		var serr error
-		for attempt := 1; attempt <= 3; attempt++ {
-			sub, serr = s.grok.FetchSubscription(ctx, it.Value)
-			if serr == nil || !errors.Is(serr, grok.ErrAuth) {
-				break
-			}
-			if attempt < 3 {
-				time.Sleep(2 * time.Second)
-			}
-		}
-		if serr != nil {
-			if errors.Is(serr, grok.ErrAuth) {
-				// 3 consecutive 401/403 → the sso session is genuinely dead.
-				_, _ = s.tokens.Update(ctx, "grok", it.ID, map[string]any{"status": "disabled", "dead": true})
-			}
-			continue // other transient upstream error → leave as-is, retry next tick
-		}
-		// Basic (no ACTIVE subscription): image-only. Super: both kinds.
-		if member := sub != nil && sub.Member; member == it.VideoLimited {
-			_, _ = s.tokens.Update(ctx, "grok", it.ID, map[string]any{"video_limited": !member})
-		}
+		// The credits endpoint is both the useful media balance and an authenticated
+		// liveness check. Avoid a second subscription request per account: apart from
+		// no longer being an entitlement signal, probing both endpoints for a large
+		// pool exhausts the clearance proxy's connection budget.
 		data, derr := s.grok.FetchCreditsBalance(ctx, it.Value)
+		if derr != nil && errors.Is(derr, grok.ErrAuth) {
+			// A single 401/403 can be an upstream blip or anti-bot response; leave the
+			// account alive and let the next tick retry it. Generation-time auth
+			// handling remains the final authority for disabling a dead SSO.
+			continue
+		}
 		if derr != nil {
-			// Same policy as the subscription probe: a credits-balance 401/403 is
-			// transient, never a reason to kill a live account. Skip and retry.
+			// Other transient/network errors: keep the cached balance and retry later.
 			continue
 		}
 		meta := cloneJSONMap(it.Meta)
@@ -1202,6 +1195,11 @@ func (s *TokenService) finishPending(ctx context.Context, pool, id, status strin
 	patch := map[string]any{"status": status, "meta": meta}
 	if dead {
 		patch["dead"] = true
+	} else if status == "active" {
+		// Re-importing an email can reuse a previously dead row. An active
+		// terminal probe must clear that stale marker, otherwise the UI and
+		// scheduler continue treating the freshly supplied token as dead.
+		patch["dead"] = false
 	}
 	_, _ = s.tokens.Update(ctx, pool, id, patch)
 }
@@ -1338,13 +1336,9 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 			return nil, err
 		}
 		authFailed := boolValueWithDefault(data["auth_failed"], false)
-		if authFailed {
-			_, _ = s.tokens.Update(ctx, item.Pool, item.ID, map[string]any{
-				"status": "disabled",
-				"dead":   true,
-				"fails":  gorm.Expr("fails + 1"),
-			})
-		}
+		// The quota endpoint is best-effort and may be challenged independently of
+		// the conversation endpoint. Never permanently kill an account from this
+		// admin refresh path; a real generation 401 remains the final authority.
 		patch := map[string]any{}
 		meta := cloneJSONMap(item.Meta)
 		meta["cached_quota_at"] = int(time.Now().Unix())
@@ -1363,7 +1357,8 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 		patch["cached_quota_reset_after"] = resetAfter
 		item.CachedQuotaResetAfter = resetAfter
 		// remaining<=0(负数/0)→ 限额;>0 且当前是 quota → 恢复 active。unknown 时
-		// 不动状态(疑罪从无)。auth 失效已在上面置死,这里不再改它的状态。
+		// 不动状态(疑罪从无)。auth_failed 与其它 unknown 一样只表示本次读数
+		// 不可信，不能据此把账号置死。
 		if !authFailed && !unknown {
 			if exhausted {
 				patch["status"] = "quota"
@@ -1557,6 +1552,7 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 		if uid := strings.TrimSpace(stringValue(data["user_id"])); uid != "" {
 			meta["user_id"] = uid
 		}
+		applyLeonardoPlanMeta(meta, data)
 		patch["meta"] = meta
 		// Daily reset (08:00 Beijing == next UTC midnight) unless upstream gives an
 		// explicit renewal time. Drives RecoverQuota.
@@ -1784,11 +1780,13 @@ func accountRow(item model.TokenAccount, inFlight int64) map[string]any {
 		}
 	}
 	typeLabel := poolToType(item.Pool)
+	capabilities := accountCapabilities(item, typeLabel)
 	teamID := ""
 	if item.Meta != nil {
 		teamID = strings.TrimSpace(stringValue(item.Meta["team_id"]))
 	}
 	hasQuota := typeLabel == "openai" || typeLabel == "adobe" || typeLabel == "runway" || typeLabel == "leonardo" || typeLabel == "krea" || typeLabel == "imagine" || typeLabel == "grok"
+	paidPlan, _ := jsonMapBool(item.Meta, "paid_account")
 	return map[string]any{
 		"id":                item.ID,
 		"pool":              item.Pool,
@@ -1810,13 +1808,39 @@ func accountRow(item model.TokenAccount, inFlight int64) map[string]any {
 		"dead":              item.Dead,
 		"image_limited":     item.ImageLimited,
 		"video_limited":     item.VideoLimited,
+		// Capability state is deliberately separate from the shared media-credit
+		// balance. Grok has independent chat/image/video product surfaces; callers
+		// must not infer chat availability from the media quota number.
+		"capabilities":      capabilities,
 		"pending":           pending,
 		"quota_supported":   hasQuota,
 		"needs_reset_fetch": typeLabel == "adobe" && item.Status == "active" && strings.TrimSpace(item.CachedQuotaResetAfter) == "",
 		"weight":            item.Weight,
 		"concurrency":       item.Concurrency,
+		// Leonardo 积分号 (paid credits, monthly renewal) vs 普通号 (daily free tokens)
+		// — surfaced so the accounts table can label them; nil for other providers.
+		"plan":              emptyToNil(strings.TrimSpace(stringValue(item.Meta["plan"]))),
+		"paid_plan":         paidPlan,
 		"base_url":          emptyToNil(strings.TrimSpace(stringValue(item.Meta["base_url"]))),
 		"models":            strings.TrimSpace(stringValue(item.Meta["models"])),
+	}
+}
+
+// accountCapabilities describes the provider surfaces an account can be used
+// for. It is returned as data (rather than only inferred in the UI) so the
+// account test dialog and API consumers agree on routing capabilities.
+func accountCapabilities(item model.TokenAccount, typeLabel string) []map[string]any {
+	if typeLabel != "grok" {
+		return nil
+	}
+	// Grok's shared quota marker is media-only; a quota-paused row can still
+	// serve Web/Build chat. Pending/disabled/dead rows are not callable.
+	identityOK := item.Status != "pending" && item.Status != "disabled" && !item.Dead && strings.TrimSpace(item.Value) != ""
+	mediaOK := identityOK && item.Status == "active"
+	return []map[string]any{
+		{"kind": "chat", "available": identityOK, "limited": false},
+		{"kind": "image", "available": mediaOK && !item.ImageLimited, "limited": item.ImageLimited},
+		{"kind": "video", "available": mediaOK && !item.VideoLimited, "limited": item.VideoLimited},
 	}
 }
 

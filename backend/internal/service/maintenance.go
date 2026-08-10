@@ -157,9 +157,9 @@ func (m *MaintenanceService) tick(ctx context.Context) {
 		//     always-active account (never went 限额) would otherwise read 0 / 402
 		//     after each reset. Self-guarded + background; no-op once all are done.
 		m.tokenSvc.ActivateKreaDue(ctx)
-		// 1e. Re-validate grok accounts: an empty /rest/subscriptions (or 401)
-		//     means the membership lapsed → disable+dead; otherwise re-sync the
-		//     credits balance and 恢复时间 (from the credits' weekly reset).
+		// 1e. Re-sync Grok accounts through the authenticated credits endpoint.
+		//     It also provides liveness; subscription tier is not a video
+		//     entitlement signal and is intentionally not probed here.
 		m.tokenSvc.RefreshGrokLiveness(ctx)
 		// 1f. Re-probe ChatGPT accounts stuck in pending past stalePending — an
 		//     import probe interrupted by a restart (or that never finished) would

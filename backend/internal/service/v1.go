@@ -484,8 +484,44 @@ func v1ModelEntry(item model.ModelConfig, created int64, extended bool) map[stri
 		return entry
 	}
 	entry["kind"] = item.Type
-	entry["supported_ratios"] = repo.JSONRatios(item.Ratios)
-	entry["supported_resolutions"] = repo.JSONStrings(item.Resolutions)
+	entry["type"] = item.Type
+	ratios := repo.JSONRatios(item.Ratios)
+	resolutions := repo.JSONStrings(item.Resolutions)
+	// Different downstream model importers use either the explicit
+	// `supported_*` names or the shorter catalog names. Return both aliases so
+	// capability UIs do not silently drop ratios/resolutions.
+	entry["supported_ratios"] = ratios
+	entry["ratios"] = ratios
+	// Some downstream catalog importers use the public settings schema's
+	// camelCase names instead of the snake_case/OpenAI aliases above. Keep
+	// both representations in the extended model response so capabilities are
+	// not silently reduced during import (for example, Grok image ratios).
+	entry["aspectRatios"] = ratios
+	entry["supported_resolutions"] = resolutions
+	entry["resolutions"] = resolutions
+	entry["resolutionTiers"] = resolutions
+	entry["modality"] = item.Type
+	entry["name"] = item.EffectiveName()
+	upstreamModel := strings.TrimSpace(item.UpstreamModel)
+	if upstreamModel == "" {
+		upstreamModel = item.ID
+	}
+	entry["upstreamModel"] = upstreamModel
+	operations := []string{}
+	switch item.Type {
+	case "image":
+		operations = append(operations, "generation")
+		if item.ImageToImage {
+			operations = append(operations, "edit")
+		}
+	case "video":
+		operations = append(operations, "generation")
+	case "audio":
+		operations = append(operations, "speech")
+	default:
+		operations = append(operations, "completion")
+	}
+	entry["operations"] = operations
 	// Reference-image capabilities are part of model discovery as well as
 	// request validation. Clients use these fields to render the correct number
 	// of upload slots and to distinguish ordered frames from unordered assets.
@@ -495,6 +531,13 @@ func v1ModelEntry(item model.ModelConfig, created int64, extended bool) map[stri
 	entry["max_reference_media"] = max(0, item.MaxReferenceMedia)
 	entry["supports_audio_output"] = item.SupportsAudioOutput
 	entry["reference_mode"] = defaultString(strings.TrimSpace(item.ReferenceMode), "none")
+	entry["maxReferenceImages"] = max(0, item.MaxReferenceImages)
+	entry["maxReferenceVideos"] = max(0, item.MaxReferenceVideos)
+	entry["maxReferenceAudios"] = max(0, item.MaxReferenceAudios)
+	entry["maxReferenceMedia"] = max(0, item.MaxReferenceMedia)
+	entry["supportsAudioOutput"] = item.SupportsAudioOutput
+	entry["referenceMode"] = defaultString(strings.TrimSpace(item.ReferenceMode), "none")
+	entry["durations"] = repo.JSONStrings(item.Durations)
 	// Video models expose their selectable clip lengths (the /v1/videos
 	// `seconds` param) so a key holder can discover them, e.g. ["5s","8s"].
 	// Prefer the explicit durations list; fall back to the priced tiers.
@@ -507,6 +550,7 @@ func v1ModelEntry(item model.ModelConfig, created int64, extended bool) map[stri
 			sort.Strings(durations)
 		}
 		entry["supported_durations"] = durations
+		entry["durations"] = durations
 	}
 	return entry
 }
@@ -1086,8 +1130,8 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		upstreamURL = u
 	case "grok":
 		// Lite (fast mode) text-to-image — the only media a free grok account can
-		// generate; ratio/resolution aren't selectable upstream.
-		b, u, execErr := s.generateGrokImage(genCtx, eventID, modelItem, in, urlOnly)
+		// generate; aspect ratio is mapped to Grok's mediaGenInput format.
+		b, u, execErr := s.generateGrokImage(genCtx, eventID, modelItem, in, aspectRatio, urlOnly)
 		if execErr != nil {
 			_ = s.refundIfNeeded(ctx, principal, eventID, price)
 			_ = s.events.UpdateStatus(ctx, eventID, "failed", execErr.Error(), 0)
@@ -1182,15 +1226,19 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		}
 		if storeOutput || strings.TrimSpace(upstreamURL) != "" {
 			outURL := upstreamURL
-			if storeOutput {
-				outURL = fileURL
-			} else if gatedURL {
+			if gatedURL {
 				// Auth-gated URL (chatgpt): store it on the event and return a proxy
 				// URL that re-fetches with the account token (see OpenImageContent).
 				_ = s.events.SetFile(ctx, eventID, upstreamURL)
 				if base := strings.TrimRight(strings.TrimSpace(in.BaseURL), "/"); base != "" {
 					outURL = base + "/v1/images/" + eventID + "/content"
 				}
+			} else if strings.TrimSpace(outURL) == "" && storeOutput {
+				// API-key URL responses should expose the provider artifact URL when
+				// one exists. A private /images/... object requires a browser session
+				// and is not usable by downstream API clients; use it only as a
+				// fallback when the provider returned no URL at all.
+				outURL = fileURL
 			}
 			return map[string]any{
 				"created":    time.Now().Unix(),
@@ -1361,6 +1409,8 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 		videoBytes, videoURL, execErr = s.generateAdobeVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), !urlOnly)
 	case "runway":
 		videoBytes, videoURL, execErr = s.generateRunwayVideo(genCtx, eventID, modelItem, in, aspectRatio, parseDurationSeconds(duration), !urlOnly)
+	case "leonardo":
+		videoBytes, videoURL, execErr = s.generateLeonardoVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), !urlOnly)
 	case "grok":
 		videoBytes, videoURL, execErr = s.generateGrokVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), !urlOnly)
 	case "custom":
@@ -1519,6 +1569,8 @@ func (s *V1Service) runVideoJob(ctx context.Context, principal *APIPrincipal, in
 		_, videoURL, execErr = s.generateAdobeVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), false)
 	case "runway":
 		_, videoURL, execErr = s.generateRunwayVideo(genCtx, eventID, modelItem, in, aspectRatio, parseDurationSeconds(duration), false)
+	case "leonardo":
+		_, videoURL, execErr = s.generateLeonardoVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), false)
 	case "grok":
 		_, videoURL, execErr = s.generateGrokVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), false)
 	case "custom":
@@ -1777,8 +1829,9 @@ func (s *V1Service) hasActiveProviderToken(ctx context.Context, provider, kind s
 		if item.Status != "active" || item.Dead || strings.TrimSpace(item.Value) == "" {
 			continue
 		}
-		// adobe tracks the two quotas separately; grok marks Basic (non-Super)
-		// accounts video_limited — they still generate Lite images.
+		// Adobe tracks the two quotas separately. Grok's subscription tier is not
+		// an entitlement signal for media anymore; video/image availability is
+		// decided by the upstream generation response and cached credit balance.
 		if provider == "adobe" || provider == "grok" {
 			if kind == "video" && item.VideoLimited {
 				continue
@@ -2086,11 +2139,10 @@ func (s *V1Service) finishUnimplementedEvent(ctx context.Context, eventID string
 // may run (grok tolerates 10, unlike the 1-per-account default elsewhere).
 const grokConcurrencyPerAccount = 10
 
-// Adobe partner/points accounts can submit multiple asynchronous jobs. Keeping
-// them at the legacy built-in default of one caused burst workflows to reject
-// every request beyond the first two. Five per account covers the common 8-10
-// node batch while remaining bounded.
-const adobePointsConcurrencyPerAccount = 5
+// Adobe partner/points accounts use a bounded four-way simultaneous-generation
+// limit. This is also the default for newly imported accounts when no override
+// is stored, while keeping burst traffic below the provider's risk threshold.
+const adobePointsConcurrencyPerAccount = 4
 
 // Absorb short bursts above the account pool capacity instead of rejecting them
 // immediately. The generation context owns the upper bound for the whole job.
@@ -2804,8 +2856,9 @@ func upstreamQuality(resolution string) string {
 // generateGrokVideo runs grok's imagine video pipeline across the grok pool.
 // Mirrors the runway policy: no pre-deduct, skip accounts known out of credits
 // (cached remaining <= 0), and treat an out-of-credits / auth failure as a dead
-// account (the grok sso can't be renewed — 失效就失效). Text-to-video only for
-// now (grok reference-image upload isn't wired yet).
+// account (the grok sso can't be renewed — 失效就失效). Reference images are
+// decoded and uploaded by the provider client, so both text-to-video and
+// image-to-video requests preserve the caller's media inputs.
 func (s *V1Service) generateGrokVideo(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1VideoRequest, aspectRatio, resolution string, durationSeconds int, downloadResult bool) ([]byte, string, error) {
 	if s.grok == nil {
 		return nil, "", errors.New("grok client not configured")
@@ -2831,7 +2884,8 @@ func (s *V1Service) generateGrokVideo(ctx context.Context, eventID string, model
 		if item.Status != "active" || item.Dead || strings.TrimSpace(item.Value) == "" {
 			continue
 		}
-		// imagine video needs SuperGrok — skip the Basic accounts (video_limited).
+		// Keep the explicit per-account flag as a fail-safe for an upstream quota
+		// response, but do not derive it from the subscription tier.
 		if item.VideoLimited {
 			continue
 		}
@@ -2911,7 +2965,7 @@ func (s *V1Service) generateGrokVideo(ctx context.Context, eventID string, model
 // dead account (the grok sso can't be renewed). Lite is text-to-image only.
 // noStore url-only mode: skip the download and return the grok asset URL, which
 // is auth-gated and therefore served through the /content proxy.
-func (s *V1Service) generateGrokImage(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1ImageRequest, noStore bool) ([]byte, string, error) {
+func (s *V1Service) generateGrokImage(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1ImageRequest, aspectRatio string, noStore bool) ([]byte, string, error) {
 	urlOnly := noStore
 	if s.grok == nil {
 		return nil, "", errors.New("grok client not configured")
@@ -2955,7 +3009,7 @@ func (s *V1Service) generateGrokImage(ctx context.Context, eventID string, model
 			defer s.acctRelease(ctx, token.ID, eventID)
 			_ = s.events.SetAccount(ctx, eventID, token.ID, token.AccountEmail)
 			_ = s.tokens.TouchLastUsed(ctx, token.ID)
-			d, meta, genErr := s.grok.GenerateImage(ctx, token.Value, in.Prompt, !urlOnly)
+			d, meta, genErr := s.grok.GenerateImage(ctx, token.Value, in.Prompt, aspectRatio, !urlOnly)
 			if genErr == nil {
 				_, _ = s.tokens.Update(ctx, "grok", token.ID, map[string]any{
 					"last_used_at":  time.Now(),
@@ -3217,6 +3271,20 @@ func leonardoResetAfter(availableUntil string) string {
 	return time.Unix((time.Now().Unix()/86400+1)*86400, 0).UTC().Format(time.RFC3339)
 }
 
+// applyLeonardoPlanMeta 记下账号是普通号还是积分号:积分号(paid)的余额是买来的点数 /
+// 订阅点数,按上游 tokenRenewalDate 月度续期,不能套用普通号的每日重置。余额读取失败
+// (unknown,没有 paid 字段)时不写,以免把已知的积分号标记清掉。
+func applyLeonardoPlanMeta(meta map[string]any, data map[string]any) {
+	paid, ok := data["paid"].(bool)
+	if !ok {
+		return
+	}
+	meta["paid_account"] = paid
+	if plan := strings.TrimSpace(stringValue(data["plan"])); plan != "" {
+		meta["plan"] = plan
+	}
+}
+
 // leonardoDimensions maps the catalog's resolution+ratio to Leonardo pixel sizes.
 func leonardoDimensions(resolution, aspectRatio string) (int, int) {
 	res := strings.ToUpper(strings.TrimSpace(resolution))
@@ -3291,8 +3359,12 @@ func (s *V1Service) generateLeonardoImage(ctx context.Context, eventID string, m
 	s.rotateRoundRobin("leonardo", active)
 
 	width, height := leonardoDimensions(resolution, aspectRatio)
-	// The catalog model id is the upstream Leonardo model name (e.g. seedream-4.5).
-	upstreamModel := strings.TrimSpace(modelItem.ID)
+	// The upstream Leonardo model name (e.g. seedream-4.5): upstream_model when set
+	// (catalog ids must be unique across providers), else the catalog id.
+	upstreamModel := strings.TrimSpace(modelItem.UpstreamModel)
+	if upstreamModel == "" {
+		upstreamModel = strings.TrimSpace(modelItem.ID)
+	}
 
 	// Optional image-to-image: decode the reference image once up front (Leonardo
 	// seedream takes at most one).
@@ -3338,6 +3410,99 @@ func (s *V1Service) generateLeonardoImage(ctx context.Context, eventID string, m
 	return data, imageURL, err
 }
 
+// leonardoVideoDimensions maps the catalog resolution+ratio to the pixel sizes
+// Leonardo's video models accept (16:9 / 9:16 landscape-portrait pairs).
+func leonardoVideoDimensions(resolution, aspectRatio string) (int, int) {
+	res := strings.ToLower(strings.TrimSpace(resolution))
+	portrait := strings.TrimSpace(aspectRatio) == "9:16"
+	if res == "1080p" {
+		if portrait {
+			return 1080, 1920
+		}
+		return 1920, 1080
+	}
+	// 720p (default)
+	if portrait {
+		return 720, 1280
+	}
+	return 1280, 720
+}
+
+// leonardoVideoMinCredits is the cheapest per-clip token cost across Leonardo's
+// video models (LTX Fast = 40 tokens); accounts under it can't afford a clip.
+const leonardoVideoMinCredits = 40
+
+// generateLeonardoVideo runs the Leonardo text-to-video pipeline. Same account
+// policy as generateLeonardoImage: atomically pre-reserve the floor cost, refund
+// on failure, reconcile the real upstream balance after success.
+func (s *V1Service) generateLeonardoVideo(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1VideoRequest, aspectRatio, resolution string, durationSeconds int, downloadResult bool) ([]byte, string, error) {
+	if s.leonardo == nil {
+		return nil, "", errors.New("leonardo client not configured")
+	}
+	if s.settings != nil {
+		if proxy, err := s.settings.GetValue(ctx, "proxy.url"); err == nil {
+			s.leonardo.SetProxy(proxy)
+		}
+	}
+
+	items, err := s.tokens.ListByPool(ctx, "leonardo")
+	if err != nil {
+		return nil, "", err
+	}
+	var active []model.TokenAccount
+	for _, item := range items {
+		if item.Status != "active" || item.Dead || strings.TrimSpace(item.Value) == "" {
+			continue
+		}
+		if item.VideoLimited {
+			continue
+		}
+		if rem, ok := jsonMapInt(item.Meta, "cached_quota_remaining"); ok && rem < leonardoVideoMinCredits {
+			continue
+		}
+		active = append(active, item)
+	}
+	active = pinTestAccount(items, active, in.AccountID)
+	if len(active) == 0 {
+		return nil, "", ErrNoProviderAccount
+	}
+	s.rotateRoundRobin("leonardo", active)
+
+	width, height := leonardoVideoDimensions(resolution, aspectRatio)
+	// The upstream Leonardo model name: upstream_model when set (catalog ids must
+	// be unique across providers), else the catalog id.
+	upstreamModel := strings.TrimSpace(modelItem.UpstreamModel)
+	if upstreamModel == "" {
+		upstreamModel = strings.TrimSpace(modelItem.ID)
+	}
+
+	// token.Value is the cookie; GenerateVideo mints a fresh JWT each attempt, so
+	// an auth failure means the cookie itself is dead — no refresher (nil).
+	var videoURL string
+	data, err := s.runPoolWithFailover(ctx, eventID, "leonardo", active, "video", func(token model.TokenAccount) ([]byte, error) {
+		allowed, deducted, rerr := s.tokens.ReserveQuota(ctx, "leonardo", token.ID, leonardoVideoMinCredits)
+		if rerr != nil {
+			return nil, fmt.Errorf("%w: reserve: %v", leonardo.ErrTemporaryUpstream, rerr)
+		}
+		if !allowed {
+			return nil, leonardo.ErrQuotaExhausted
+		}
+		data, meta, genErr := s.leonardo.GenerateVideo(ctx, token.Value, upstreamModel, in.Prompt, width, height, durationSeconds, downloadResult)
+		if genErr != nil {
+			if deducted {
+				_ = s.tokens.RefundQuota(ctx, "leonardo", token.ID, leonardoVideoMinCredits)
+			}
+			return nil, genErr
+		}
+		videoURL = strings.TrimSpace(stringValue(meta["video_url"]))
+		s.reconcileLeonardoCredits(ctx, token.ID, token.Value)
+		return data, nil
+	}, func(e error) (bool, bool, bool, bool) {
+		return errors.Is(e, leonardo.ErrAuth), errors.Is(e, leonardo.ErrQuotaExhausted), errors.Is(e, leonardo.ErrTemporaryUpstream), false
+	}, nil, true)
+	return data, videoURL, err
+}
+
 // reconcileLeonardoCredits re-fetches an account's real token balance after a
 // render and writes it back, flipping the account to 限额 when below the per-gen
 // floor. Stores the daily renewal time so RecoverQuota can auto-recover it.
@@ -3360,6 +3525,7 @@ func (s *V1Service) reconcileLeonardoCredits(ctx context.Context, tokenID, cooki
 	meta := cloneJSONMap(item.Meta)
 	meta["cached_quota_remaining"] = rem
 	meta["cached_quota_at"] = int(time.Now().Unix())
+	applyLeonardoPlanMeta(meta, data)
 	patch := map[string]any{"meta": meta}
 	patch["cached_quota_reset_after"] = leonardoResetAfter(stringValue(data["available_until"]))
 	if rem < leonardoMinCredits && item.Status == "active" {

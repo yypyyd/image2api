@@ -10,12 +10,14 @@ const (
 )
 
 // shouldApplyReferenceGrid is retained as the wire-compatible name for the
-// reference_grid flag. It now controls the local Pigo face-swap preprocessing.
-// Adobe references are processed by default; other providers must opt in.
-func (s *V1Service) shouldApplyReferenceGrid(ctx context.Context, modelID string, requested bool) bool {
-	if requested {
+// reference_grid flag. The local Pigo face-panel transform is intentionally
+// limited to Seedance 2 and Seedance 2 Fast; all other models receive the
+// original reference bytes unchanged, even when the legacy flag is present.
+func (s *V1Service) shouldApplyReferenceGrid(_ context.Context, modelID string, _ bool) bool {
+	switch strings.ToLower(strings.TrimSpace(modelID)) {
+	case "firefly-seedance-2", "firefly-seedance-2-fast", "seedance20", "seedance20-fast", "sd2.0", "sd2.0-fast":
 		return true
+	default:
+		return false
 	}
-	item, err := s.models.Get(ctx, strings.TrimSpace(modelID))
-	return err == nil && strings.EqualFold(strings.TrimSpace(item.Provider), "adobe")
 }

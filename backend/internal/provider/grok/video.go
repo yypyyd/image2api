@@ -23,6 +23,12 @@ import (
 // path like "users/<uid>/generated/<id>/generated_video.mp4").
 const assetBase = "https://assets.grok.com/"
 
+// Grok may leave the conversations/new stream open while a longer (10s) clip
+// continues rendering. Do not hold the request until the HTTP client's 600s
+// timeout; after this window GenerateVideo falls back to polling the
+// deterministic generated_video.mp4 asset URL.
+const grokVideoStreamWait = 90 * time.Second
+
 var videoURLRe = regexp.MustCompile(`"videoUrl":"([^"]+)"`)
 
 // GenerateVideo runs grok's imagine video pipeline:
@@ -121,7 +127,9 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 	}
 
 	// body may be partial when psErr != nil — still worth scanning.
-	body, psErr := c.postStream(ctx, submitClient, token, "/rest/app-chat/conversations/new", payload)
+	streamCtx, cancelStream := context.WithTimeout(ctx, grokVideoStreamWait)
+	body, psErr := c.postStream(streamCtx, submitClient, token, "/rest/app-chat/conversations/new", payload)
+	cancelStream()
 	if dir := strings.TrimSpace(os.Getenv("GROK_DUMP")); dir != "" {
 		_ = os.WriteFile(dir+"/grok_body_"+postID+".txt", []byte(body), 0o644)
 	}
