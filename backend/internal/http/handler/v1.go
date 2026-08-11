@@ -6,16 +6,29 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"backend/internal/service"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 type V1Handler struct {
 	v1 *service.V1Service
+}
+
+const (
+	imageSyncKeepaliveDelay    = 10 * time.Second
+	imageSyncKeepaliveInterval = 10 * time.Second
+)
+
+type imageSyncResult struct {
+	response map[string]any
+	err      error
 }
 
 func NewV1Handler(v1 *service.V1Service) *V1Handler {
@@ -131,7 +144,7 @@ func (h *V1Handler) ImageGenerations(c *gin.Context) {
 		return
 	}
 
-	resp, err := h.v1.PrepareImageRequest(c.Request.Context(), principal, service.V1ImageRequest{
+	h.respondImageRequest(c, principal, service.V1ImageRequest{
 		Model:          body.Model,
 		Prompt:         body.Prompt,
 		RequestID:      imageRequestID(c),
@@ -141,11 +154,6 @@ func (h *V1Handler) ImageGenerations(c *gin.Context) {
 		ResponseFormat: body.ResponseFormat,
 		BaseURL:        requestBaseURL(c),
 	})
-	if err != nil {
-		h.writeV1Error(c, err, resp)
-		return
-	}
-	c.JSON(http.StatusOK, openaiImageResponse(resp))
 }
 
 // ImageEdits — OpenAI POST /v1/images/edits (image-to-image). multipart/form-data
@@ -171,7 +179,7 @@ func (h *V1Handler) ImageEdits(c *gin.Context) {
 		return
 	}
 	n, _ := strconv.Atoi(strings.TrimSpace(c.PostForm("n")))
-	resp, err := h.v1.PrepareImageRequest(c.Request.Context(), principal, service.V1ImageRequest{
+	h.respondImageRequest(c, principal, service.V1ImageRequest{
 		Model:           c.PostForm("model"),
 		Prompt:          c.PostForm("prompt"),
 		RequestID:       imageRequestID(c),
@@ -183,11 +191,99 @@ func (h *V1Handler) ImageEdits(c *gin.Context) {
 		ReferenceGrid:   parseFormBool(c.PostForm("reference_grid")),
 		BaseURL:         requestBaseURL(c),
 	})
+}
+
+func (h *V1Handler) respondImageRequest(c *gin.Context, principal *service.APIPrincipal, request service.V1ImageRequest) {
+	if !imageAsyncRequested(c) {
+		results := make(chan imageSyncResult, 1)
+		go func() {
+			resp, err := h.v1.PrepareImageRequest(c.Request.Context(), principal, request)
+			results <- imageSyncResult{response: resp, err: err}
+		}()
+		h.writeSynchronousImageResponse(c, results, imageSyncKeepaliveDelay, imageSyncKeepaliveInterval)
+		return
+	}
+
+	request.RequestID = ensureImageRequestID(c, request.RequestID)
+	resp, pending, err := h.v1.StartImageRequest(c.Request.Context(), principal, request)
 	if err != nil {
 		h.writeV1Error(c, err, resp)
 		return
 	}
-	c.JSON(http.StatusOK, openaiImageResponse(resp))
+	c.Header("Idempotency-Key", request.RequestID)
+	if pollURL, _ := resp["poll_url"].(string); pollURL != "" {
+		c.Header("Location", pollURL)
+	}
+	if pending {
+		c.Header("Preference-Applied", "respond-async")
+		c.Header("Retry-After", "3")
+		c.JSON(http.StatusAccepted, resp)
+		return
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// writeSynchronousImageResponse preserves the original OpenAI JSON contract
+// while preventing response-header and idle proxy timeouts during slow image
+// generations. JSON permits leading whitespace, so each flushed heartbeat is
+// still followed by one valid success or error object.
+func (h *V1Handler) writeSynchronousImageResponse(c *gin.Context, results <-chan imageSyncResult, initialDelay, interval time.Duration) {
+	timer := time.NewTimer(initialDelay)
+	defer timer.Stop()
+
+	select {
+	case result := <-results:
+		h.finishSynchronousImageResponse(c, result, false)
+		return
+	case <-timer.C:
+	case <-c.Request.Context().Done():
+		return
+	}
+
+	c.Header("Content-Type", "application/json; charset=utf-8")
+	c.Header("Cache-Control", "no-store, no-transform")
+	c.Header("X-Accel-Buffering", "no")
+	c.Status(http.StatusOK)
+	if _, err := c.Writer.Write([]byte(" \n")); err != nil {
+		return
+	}
+	c.Writer.Flush()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case result := <-results:
+			h.finishSynchronousImageResponse(c, result, true)
+			c.Writer.Flush()
+			return
+		case <-ticker.C:
+			if _, err := c.Writer.Write([]byte(" \n")); err != nil {
+				return
+			}
+			c.Writer.Flush()
+		case <-c.Request.Context().Done():
+			return
+		}
+	}
+}
+
+func (h *V1Handler) finishSynchronousImageResponse(c *gin.Context, result imageSyncResult, responseStarted bool) {
+	if result.err == nil {
+		if responseStarted {
+			_ = json.NewEncoder(c.Writer).Encode(openaiImageResponse(result.response))
+			return
+		}
+		c.JSON(http.StatusOK, openaiImageResponse(result.response))
+		return
+	}
+
+	status, body := v1ErrorResponse(result.err, result.response)
+	if responseStarted {
+		_ = json.NewEncoder(c.Writer).Encode(body)
+		return
+	}
+	c.JSON(status, body)
 }
 
 func (h *V1Handler) GetImageTask(c *gin.Context) {
@@ -209,6 +305,31 @@ func imageRequestID(c *gin.Context) string {
 		return value
 	}
 	return strings.TrimSpace(c.GetHeader("X-Request-ID"))
+}
+
+func ensureImageRequestID(c *gin.Context, requestID string) string {
+	if value := strings.TrimSpace(requestID); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(c.Writer.Header().Get("X-Request-Id")); value != "" {
+		return value
+	}
+	return uuid.NewString()
+}
+
+func imageAsyncRequested(c *gin.Context) bool {
+	prefer := strings.ToLower(c.GetHeader("Prefer"))
+	for _, item := range strings.Split(prefer, ",") {
+		if strings.TrimSpace(strings.SplitN(item, ";", 2)[0]) == "respond-async" {
+			return true
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Query("async"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // CreateVideo — OpenAI POST /v1/videos. Creates an async job and returns the
@@ -456,11 +577,15 @@ func openaiImageResponse(m map[string]any) gin.H {
 // openaiError writes an OpenAI-format error body:
 // {"error": {"message", "type", "param", "code"}}.
 func openaiError(c *gin.Context, status int, errType, code, message string) {
+	c.JSON(status, openaiErrorResponse(errType, code, message))
+}
+
+func openaiErrorResponse(errType, code, message string) gin.H {
 	body := gin.H{"message": message, "type": errType, "param": nil, "code": nil}
 	if code != "" {
 		body["code"] = code
 	}
-	c.JSON(status, gin.H{"error": body})
+	return gin.H{"error": body}
 }
 
 func (h *V1Handler) writeAuthError(c *gin.Context, err error) {
@@ -475,43 +600,48 @@ func (h *V1Handler) writeAuthError(c *gin.Context, err error) {
 }
 
 func (h *V1Handler) writeV1Error(c *gin.Context, err error, payload map[string]any) {
+	status, body := v1ErrorResponse(err, payload)
+	c.JSON(status, body)
+}
+
+func v1ErrorResponse(err error, payload map[string]any) (int, any) {
 	switch {
 	case errors.Is(err, service.ErrUnknownModel):
-		openaiError(c, http.StatusNotFound, "invalid_request_error", "model_not_found", err.Error())
+		return http.StatusNotFound, openaiErrorResponse("invalid_request_error", "model_not_found", err.Error())
 	case errors.Is(err, service.ErrUnsupportedParams), errors.Is(err, service.ErrBannedPrompt):
-		openaiError(c, http.StatusBadRequest, "invalid_request_error", "", err.Error())
+		return http.StatusBadRequest, openaiErrorResponse("invalid_request_error", "", err.Error())
 	case errors.Is(err, service.ErrContentRejected):
-		openaiError(c, http.StatusBadRequest, "invalid_request_error", "content_policy_violation", err.Error())
+		return http.StatusBadRequest, openaiErrorResponse("invalid_request_error", "content_policy_violation", err.Error())
 	case errors.Is(err, service.ErrInsufficientFunds):
-		openaiError(c, http.StatusPaymentRequired, "insufficient_quota", "insufficient_quota", err.Error())
+		return http.StatusPaymentRequired, openaiErrorResponse("insufficient_quota", "insufficient_quota", err.Error())
 	case errors.Is(err, service.ErrReferenceTooLarge):
-		openaiError(c, http.StatusRequestEntityTooLarge, "invalid_request_error", "", err.Error())
+		return http.StatusRequestEntityTooLarge, openaiErrorResponse("invalid_request_error", "", err.Error())
 	case errors.Is(err, service.ErrNoProviderAccount):
-		openaiError(c, http.StatusServiceUnavailable, "server_error", "", err.Error())
+		return http.StatusServiceUnavailable, openaiErrorResponse("server_error", "", err.Error())
 	case errors.Is(err, service.ErrProviderAuth):
-		openaiError(c, http.StatusServiceUnavailable, "server_error", "", err.Error())
+		return http.StatusServiceUnavailable, openaiErrorResponse("server_error", "", err.Error())
 	case errors.Is(err, service.ErrProviderQuota):
 		// Match the Python contract: provider quota exhaustion maps to 401
 		// (QuotaExhaustedError is handled alongside AuthError in routes.py).
-		openaiError(c, http.StatusUnauthorized, "insufficient_quota", "insufficient_quota", err.Error())
+		return http.StatusUnauthorized, openaiErrorResponse("insufficient_quota", "insufficient_quota", err.Error())
 	case errors.Is(err, service.ErrProviderTemporary):
-		openaiError(c, http.StatusServiceUnavailable, "server_error", "", err.Error())
+		return http.StatusServiceUnavailable, openaiErrorResponse("server_error", "", err.Error())
 	case errors.Is(err, service.ErrImageTaskNotFound):
-		openaiError(c, http.StatusNotFound, "invalid_request_error", "not_found", err.Error())
+		return http.StatusNotFound, openaiErrorResponse("invalid_request_error", "not_found", err.Error())
 	case errors.Is(err, service.ErrConcurrencyFull), errors.Is(err, service.ErrUserConcurrencyFull):
-		openaiError(c, http.StatusTooManyRequests, "rate_limit_error", "rate_limit_exceeded", err.Error())
+		return http.StatusTooManyRequests, openaiErrorResponse("rate_limit_error", "rate_limit_exceeded", err.Error())
 	case errors.Is(err, service.ErrVideoJobNotFound):
-		openaiError(c, http.StatusNotFound, "invalid_request_error", "not_found", err.Error())
+		return http.StatusNotFound, openaiErrorResponse("invalid_request_error", "not_found", err.Error())
 	case errors.Is(err, service.ErrVideoNotReady):
-		openaiError(c, http.StatusConflict, "invalid_request_error", "", err.Error())
+		return http.StatusConflict, openaiErrorResponse("invalid_request_error", "", err.Error())
 	case errors.Is(err, service.ErrProviderUnsupported):
-		openaiError(c, http.StatusNotImplemented, "server_error", "", err.Error())
+		return http.StatusNotImplemented, openaiErrorResponse("server_error", "", err.Error())
 	case errors.Is(err, service.ErrProviderExecution):
-		openaiError(c, http.StatusBadGateway, "server_error", "", err.Error())
+		return http.StatusBadGateway, openaiErrorResponse("server_error", "", err.Error())
 	case errors.Is(err, service.ErrGenerationPending):
-		c.JSON(http.StatusNotImplemented, payload)
+		return http.StatusNotImplemented, payload
 	default:
-		openaiError(c, http.StatusBadRequest, "invalid_request_error", "", err.Error())
+		return http.StatusBadRequest, openaiErrorResponse("invalid_request_error", "", err.Error())
 	}
 }
 
@@ -531,5 +661,15 @@ func requestBaseURL(c *gin.Context) string {
 	} else if c.Request.TLS != nil {
 		scheme = "https"
 	}
+	if port := strings.TrimSpace(strings.Split(c.GetHeader("X-Forwarded-Port"), ",")[0]); port != "" && !hostHasPort(host) {
+		if (scheme == "http" && port != "80") || (scheme == "https" && port != "443") {
+			host = net.JoinHostPort(strings.Trim(host, "[]"), port)
+		}
+	}
 	return scheme + "://" + host
+}
+
+func hostHasPort(host string) bool {
+	_, port, err := net.SplitHostPort(host)
+	return err == nil && port != ""
 }

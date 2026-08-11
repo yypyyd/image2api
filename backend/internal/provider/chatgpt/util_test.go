@@ -2,12 +2,49 @@ package chatgpt
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"os"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestNormalizeImageMime(t *testing.T) {
+	tests := map[string]string{
+		"image/jpeg":                 "image/jpeg",
+		"image/jpg":                  "image/jpeg",
+		"image/png":                  "image/png",
+		"image/gif":                  "image/gif",
+		"image/webp":                 "image/webp",
+		"image/x-webp":               "image/webp",
+		"IMAGE/WEBP; charset=binary": "image/webp",
+		"application/octet-stream":   "",
+	}
+	for input, want := range tests {
+		if got := normalizeImageMime(input); got != want {
+			t.Errorf("normalizeImageMime(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestInspectReferenceImageWebP(t *testing.T) {
+	const fixture = "UklGRiYAAABXRUJQVlA4IBoAAAAwAQCdASoBAAEAAgA0JZwAA3AA/vpopw8gAA=="
+	data, err := base64.StdEncoding.DecodeString(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, err := inspectReferenceImage(data, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.MimeType != "image/webp" || meta.Width != 1 || meta.Height != 1 {
+		t.Fatalf("WebP metadata = mime:%q size:%dx%d", meta.MimeType, meta.Width, meta.Height)
+	}
+	if !strings.HasSuffix(meta.FileName, ".webp") {
+		t.Fatalf("WebP filename = %q", meta.FileName)
+	}
+}
 
 func TestChatGPT403Classification(t *testing.T) {
 	edgeErr := ensureOK(403, []byte("<html><body>edge challenge</body></html>"), "bootstrap")

@@ -76,6 +76,12 @@ func NewApp(ctx context.Context) (*App, error) {
 		`ON cdk_codes (batch_id, redeemed_by) WHERE type = 'marketing' AND redeemed_by IS NOT NULL`).Error; err != nil {
 		return nil, fmt.Errorf("cdk marketing index: %w", err)
 	}
+	// API image idempotency is scoped to one user. Empty request IDs belong to
+	// legacy synchronous calls and intentionally remain repeatable.
+	if err := db.WithContext(ctx).Exec(`CREATE UNIQUE INDEX IF NOT EXISTS uniq_event_v1_image_request ` +
+		`ON event_logs (user_id, request_id) WHERE source = 'v1' AND kind = 'image' AND request_id <> ''`).Error; err != nil {
+		return nil, fmt.Errorf("v1 image idempotency index: %w", err)
+	}
 	if err := seedDefaults(ctx, db); err != nil {
 		return nil, fmt.Errorf("seed defaults: %w", err)
 	}

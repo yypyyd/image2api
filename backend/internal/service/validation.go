@@ -17,8 +17,9 @@ const (
 )
 
 var (
-	usernamePattern  = regexp.MustCompile(`^[A-Za-z0-9]{6,24}$`)
-	emailCodePattern = regexp.MustCompile(`^\d{6}$`)
+	usernamePattern      = regexp.MustCompile(`^[A-Za-z0-9]{6,24}$`)
+	loginUsernamePattern = regexp.MustCompile(`^[A-Za-z0-9]{1,24}$`)
+	emailCodePattern     = regexp.MustCompile(`^\d{6}$`)
 )
 
 func ValidateEmail(email string) (string, error) {
@@ -124,7 +125,13 @@ func ValidateLoginIdentifier(identifier string) (string, error) {
 	if strings.Contains(normalized, "@") {
 		return ValidateEmail(normalized)
 	}
-	return ValidateUsername(normalized)
+	if utf8.RuneCountInString(normalized) > MaxUsernameLength {
+		return "", errors.New("用户名长度不能超过 24 个字符")
+	}
+	if !loginUsernamePattern.MatchString(normalized) {
+		return "", errors.New("用户名只能使用字母和数字")
+	}
+	return normalized, nil
 }
 
 func ValidateAllowedEmailDomains(domains []string) []string {

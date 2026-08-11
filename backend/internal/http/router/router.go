@@ -47,7 +47,8 @@ func New(cfg *config.Config, auth *service.AuthService, handlers Handlers) *gin.
 		// their downloads are intentionally anonymous.
 		AllowOriginFunc:  func(origin string) bool { return strings.TrimSpace(origin) != "" },
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Authorization", "Content-Type", "X-Request-Id"},
+		AllowHeaders:     []string{"Authorization", "Content-Type", "Idempotency-Key", "Prefer", "X-Request-Id"},
+		ExposeHeaders:    []string{"Idempotency-Key", "Location", "Preference-Applied", "Retry-After", "X-Request-Id"},
 		AllowCredentials: false,
 	}))
 

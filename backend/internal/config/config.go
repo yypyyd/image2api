@@ -11,6 +11,7 @@ import (
 type Config struct {
 	AppEnv            string
 	HTTPAddr          string
+	PublicBaseURL     string
 	AppTitle          string
 	PostgresDSN       string
 	RedisAddr         string
@@ -40,6 +41,7 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		AppEnv:            envString("APP_ENV", "development"),
 		HTTPAddr:          envString("HTTP_ADDR", ":6061"),
+		PublicBaseURL:     strings.TrimRight(envString("PUBLIC_BASE_URL", ""), "/"),
 		AppTitle:          envString("APP_TITLE", "Vivid AI"),
 		PostgresDSN:       envString("POSTGRES_DSN", "host=127.0.0.1 user=postgres password=postgres dbname=vivid_ai port=5432 sslmode=disable TimeZone=Asia/Shanghai"),
 		RedisAddr:         envString("REDIS_ADDR", "127.0.0.1:6379"),

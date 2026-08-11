@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -109,6 +110,10 @@ type V1Service struct {
 	// refresh tokens may rotate, so concurrent first-use requests must not persist
 	// different generations of the same credential.
 	grokBuildLocks sync.Map
+	// imageJobs coalesces opt-in async image requests by (user, idempotency key).
+	// A short retention window lets polling observe validation/provider failures
+	// that happened before an event row could be created.
+	imageJobs sync.Map
 
 	// inflight maps an in-progress event ID → the cancel func of its generation
 	// work context, so the maintenance sweep can stop a stuck generation the
@@ -233,6 +238,24 @@ type V1ImageRequest struct {
 	// AccountID pins the generation to one specific provider account (admin
 	// account-test). Empty keeps the normal pool selection with failover.
 	AccountID string
+}
+
+const asyncImageJobRetention = 10 * time.Minute
+
+type asyncImageJob struct {
+	done     chan struct{}
+	response map[string]any
+	err      error
+}
+
+func newAsyncImageJob() *asyncImageJob {
+	return &asyncImageJob{done: make(chan struct{})}
+}
+
+func (j *asyncImageJob) complete(response map[string]any, err error) {
+	j.response = response
+	j.err = err
+	close(j.done)
 }
 
 // V1ChatResponse is a validated upstream chat-completions response. Body is
@@ -912,6 +935,115 @@ func (s *V1Service) PrepareImageRequest(ctx context.Context, principal *APIPrinc
 	return s.prepareImageExecution(ctx, principal, in, "v1", true)
 }
 
+// StartImageRequest starts an opt-in asynchronous OpenAI image request. The
+// caller receives a task object immediately and polls ImageTask. Requests with
+// the same user + idempotency key share one execution, preventing retry storms
+// from charging or rendering the same image more than once.
+func (s *V1Service) StartImageRequest(ctx context.Context, principal *APIPrincipal, in V1ImageRequest) (map[string]any, bool, error) {
+	in.RequestID = strings.TrimSpace(in.RequestID)
+	if principal == nil || principal.User == nil {
+		return nil, false, ErrInvalidAPIKey
+	}
+	if in.RequestID == "" {
+		return nil, false, fmt.Errorf("%w: idempotency key is required for async image requests", ErrUnsupportedParams)
+	}
+	if len(in.RequestID) > 191 {
+		return nil, false, fmt.Errorf("%w: idempotency key is too long", ErrUnsupportedParams)
+	}
+
+	if existing, err := s.imageTaskFromEvent(ctx, principal, in.RequestID); err == nil {
+		return existing, false, nil
+	} else if !errors.Is(err, ErrImageTaskNotFound) {
+		return nil, false, err
+	}
+
+	key := imageJobKey(principal.User.ID, in.RequestID)
+	candidate := newAsyncImageJob()
+	actual, loaded := s.imageJobs.LoadOrStore(key, candidate)
+	job := actual.(*asyncImageJob)
+	if loaded {
+		response, pending := asyncImageJobResponse(job, in.RequestID, s.imageTaskURL(in.RequestID, in.BaseURL))
+		return response, pending, nil
+	}
+
+	lockKey := "idem:image:" + key
+	lockToken := randomUpper(24)
+	if !s.conc.Acquire(ctx, lockKey, 1, lockToken) {
+		s.imageJobs.CompareAndDelete(key, candidate)
+		if existing, err := s.imageTaskFromEvent(ctx, principal, in.RequestID); err == nil {
+			return existing, false, nil
+		} else if !errors.Is(err, ErrImageTaskNotFound) {
+			return nil, false, err
+		}
+		return asyncImagePendingResponse(in.RequestID, s.imageTaskURL(in.RequestID, in.BaseURL)), true, nil
+	}
+
+	executionCtx := context.WithoutCancel(ctx)
+	go func() {
+		response, err := s.prepareImageExecution(executionCtx, principal, in, "v1", true)
+		candidate.complete(response, err)
+		s.conc.Release(context.Background(), lockKey, lockToken)
+		time.AfterFunc(asyncImageJobRetention, func() {
+			s.imageJobs.CompareAndDelete(key, candidate)
+		})
+	}()
+
+	return asyncImagePendingResponse(in.RequestID, s.imageTaskURL(in.RequestID, in.BaseURL)), true, nil
+}
+
+func imageJobKey(userID, requestID string) string {
+	return strings.TrimSpace(userID) + ":" + strings.TrimSpace(requestID)
+}
+
+func (s *V1Service) imageTaskURL(requestID, requestBaseURL string) string {
+	path := "/v1/images/tasks?request_id=" + url.QueryEscape(strings.TrimSpace(requestID))
+	if base := s.outputBaseURL(requestBaseURL); base != "" {
+		return base + path
+	}
+	return path
+}
+
+func asyncImagePendingResponse(requestID, pollURL string) map[string]any {
+	return map[string]any{
+		"id":          requestID,
+		"object":      "image.generation.task",
+		"status":      "queued",
+		"request_id":  requestID,
+		"poll_url":    pollURL,
+		"retry_after": 3,
+		"data":        []any{},
+	}
+}
+
+func asyncImageJobResponse(job *asyncImageJob, requestID, pollURL string) (map[string]any, bool) {
+	select {
+	case <-job.done:
+		if job.err != nil {
+			return map[string]any{
+				"id":         requestID,
+				"object":     "image.generation.task",
+				"status":     "failed",
+				"request_id": requestID,
+				"poll_url":   pollURL,
+				"error":      job.err.Error(),
+				"data":       []any{},
+			}, false
+		}
+		response := make(map[string]any, len(job.response)+5)
+		for key, value := range job.response {
+			response[key] = value
+		}
+		response["id"] = requestID
+		response["object"] = "image.generation.task"
+		response["status"] = "completed"
+		response["request_id"] = requestID
+		response["poll_url"] = pollURL
+		return response, false
+	default:
+		return asyncImagePendingResponse(requestID, pollURL), true
+	}
+}
+
 func (s *V1Service) prepareSessionImage(ctx context.Context, principal *APIPrincipal, in V1ImageRequest) (map[string]any, error) {
 	return s.prepareImageExecution(ctx, principal, in, "user", true)
 }
@@ -953,6 +1085,7 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 			return nil, err
 		}
 		in.ResponseFormat = responseFormat
+		in.BaseURL = s.outputBaseURL(in.BaseURL)
 	}
 	if source != "admin" {
 		if err := s.checkBannedPrompt(ctx, principal, in.Prompt); err != nil {
@@ -1003,7 +1136,20 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	var upstreamURL string
 	eventID, err := s.logPendingEvent(ctx, "image", modelItem, principal, in.Prompt, aspectRatio, resolution, "", refCount, price, relativePath, source, nil, in.DeAI, in.RequestID)
 	if err != nil {
+		// Charging happens before event creation. If persistence fails (including a
+		// distributed idempotency race stopped by the unique index), refund this
+		// attempt directly because there is no event row to claim via Refunded.
+		if price > 0 && principal != nil && principal.User != nil {
+			if updated, refundErr := s.users.AdjustCredits(ctx, principal.User.ID, price); refundErr == nil {
+				principal.User = updated
+			}
+		}
 		return nil, err
+	}
+	if apiRequest && storeOutput {
+		// API clients receive an opaque bearer URL rather than the internal
+		// owner/timestamp object key. The event resolves the private RustFS key.
+		fileURL = publicImageContentURL(in.BaseURL, eventID)
 	}
 	// Register so the maintenance sweep can cancel this generation if it abandons
 	// the row; deregister on return.
@@ -1237,10 +1383,7 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 			// on the event so OpenImageContent can fetch it with provider credentials
 			// when necessary.
 			_ = s.events.SetFile(ctx, eventID, upstreamURL)
-			outURL := upstreamURL
-			if base := strings.TrimRight(strings.TrimSpace(in.BaseURL), "/"); base != "" {
-				outURL = base + "/v1/images/" + eventID + "/content"
-			}
+			outURL := publicImageContentURL(in.BaseURL, eventID)
 			return map[string]any{
 				"created":    time.Now().Unix(),
 				"data":       []map[string]any{{"url": outURL}},
@@ -1288,6 +1431,14 @@ func (s *V1Service) ImageTask(ctx context.Context, principal *APIPrincipal, requ
 	if principal == nil || principal.User == nil || requestID == "" {
 		return nil, ErrImageTaskNotFound
 	}
+	if value, ok := s.imageJobs.Load(imageJobKey(principal.User.ID, requestID)); ok {
+		response, _ := asyncImageJobResponse(value.(*asyncImageJob), requestID, s.imageTaskURL(requestID, ""))
+		return response, nil
+	}
+	return s.imageTaskFromEvent(ctx, principal, requestID)
+}
+
+func (s *V1Service) imageTaskFromEvent(ctx context.Context, principal *APIPrincipal, requestID string) (map[string]any, error) {
 	event, err := s.events.GetImageByRequestID(ctx, principal.User.ID, requestID)
 	if err != nil {
 		return nil, err
@@ -1296,10 +1447,13 @@ func (s *V1Service) ImageTask(ctx context.Context, principal *APIPrincipal, requ
 		return nil, ErrImageTaskNotFound
 	}
 	result := map[string]any{
-		"id":       requestID,
-		"event_id": event.ID,
-		"created":  event.TS.Unix(),
-		"data":     []any{},
+		"id":         requestID,
+		"object":     "image.generation.task",
+		"request_id": requestID,
+		"poll_url":   s.imageTaskURL(requestID, ""),
+		"event_id":   event.ID,
+		"created":    event.TS.Unix(),
+		"data":       []any{},
 	}
 	switch event.Status {
 	case "success":
@@ -1347,6 +1501,9 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 	// context (12-min backstop — video polls up to 10 min — and registered so the
 	// maintenance sweep can cancel a stuck render when it abandons the row).
 	ctx = context.WithoutCancel(ctx)
+	if source == "v1" {
+		in.BaseURL = s.outputBaseURL(in.BaseURL)
+	}
 	if len(in.ReferenceImages) > 0 && s.shouldApplyReferenceGrid(ctx, in.Model, in.ReferenceGrid) {
 		gridded, err := applyReferenceFaceSwap(in.ReferenceImages)
 		if err != nil {
@@ -1685,8 +1842,26 @@ func (s *V1Service) OpenImageContent(ctx context.Context, principal *APIPrincipa
 	if ev == nil || ev.Kind != "image" {
 		return nil, "", ErrVideoJobNotFound
 	}
-	if ev.Status != "success" || strings.TrimSpace(ev.File) == "" {
+	file := strings.TrimSpace(ev.File)
+	if ev.Status != "success" || file == "" {
 		return nil, "", ErrVideoNotReady
+	}
+	// Persisted API results keep a private RustFS object key on the event. The
+	// public event URL reveals neither that key nor its user-owned directory.
+	if !strings.Contains(file, "://") {
+		resp, getErr := s.store.Get(ctx, file, "")
+		if getErr != nil {
+			return nil, "", fmt.Errorf("%w: fetch stored image: %v", ErrProviderTemporary, getErr)
+		}
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+			resp.Body.Close()
+			return nil, "", fmt.Errorf("%w: stored image status %d", ErrProviderTemporary, resp.StatusCode)
+		}
+		contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
+		if contentType == "" {
+			contentType = contentTypeForExt(filepath.Ext(file))
+		}
+		return resp.Body, contentType, nil
 	}
 	if ev.Provider == "chatgpt" && s.chatgpt != nil {
 		if s.settings != nil {
@@ -1731,6 +1906,23 @@ func (s *V1Service) OpenImageContent(ctx context.Context, principal *APIPrincipa
 		ct = "image/png"
 	}
 	return resp.Body, ct, nil
+}
+
+func publicImageContentURL(baseURL, eventID string) string {
+	path := "/v1/images/" + strings.TrimSpace(eventID) + "/content"
+	if base := strings.TrimRight(strings.TrimSpace(baseURL), "/"); base != "" {
+		return base + path
+	}
+	return path
+}
+
+func (s *V1Service) outputBaseURL(requestBaseURL string) string {
+	if s != nil && s.cfg != nil {
+		if configured := strings.TrimRight(strings.TrimSpace(s.cfg.PublicBaseURL), "/"); configured != "" {
+			return configured
+		}
+	}
+	return strings.TrimRight(strings.TrimSpace(requestBaseURL), "/")
 }
 
 func (s *V1Service) videoEventForUser(ctx context.Context, principal *APIPrincipal, id string) (*model.EventLog, error) {
@@ -2100,7 +2292,7 @@ func (s *V1Service) allocateOutput(principal *APIPrincipal, ext, baseURL string)
 
 func (s *V1Service) logPendingEvent(ctx context.Context, kind string, modelItem *model.ModelConfig, principal *APIPrincipal, prompt, ratio, resolution, duration string, refs int, cost float64, file, source string, refFiles []string, deai bool, requestID string) (string, error) {
 	event := &model.EventLog{
-		ID:         "evt-" + randomUpper(12),
+		ID:         "evt-" + randomUpper(24),
 		RequestID:  requestID,
 		TS:         time.Now(),
 		Kind:       kind,

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	_ "golang.org/x/image/webp"
 	"image"
 	_ "image/gif"
 	_ "image/jpeg"
@@ -820,9 +821,10 @@ func inspectReferenceImage(data []byte, index int) (uploadedReference, error) {
 	if len(data) == 0 {
 		return uploadedReference{}, errors.New("empty reference image")
 	}
-	mimeType := normalizeImageMime(stdhttp.DetectContentType(data))
+	detectedMime := stdhttp.DetectContentType(data)
+	mimeType := normalizeImageMime(detectedMime)
 	if mimeType == "" {
-		return uploadedReference{}, errors.New("unsupported reference image type")
+		return uploadedReference{}, fmt.Errorf("unsupported reference image type: %s", detectedMime)
 	}
 	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
@@ -848,6 +850,8 @@ func normalizeImageMime(v string) string {
 		return "image/png"
 	case "image/gif":
 		return "image/gif"
+	case "image/webp", "image/x-webp":
+		return "image/webp"
 	default:
 		return ""
 	}
@@ -861,6 +865,8 @@ func extensionForMime(mimeType string) string {
 		return ".png"
 	case "image/gif":
 		return ".gif"
+	case "image/webp":
+		return ".webp"
 	default:
 		return filepath.Ext(mimeType)
 	}

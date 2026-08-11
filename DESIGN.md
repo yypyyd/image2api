@@ -2,30 +2,40 @@
 
 ### 2026-08-11 - Public cross-origin image delivery
 
-**Change**: Generated image API responses now always use gateway-owned URLs.
-Persisted results use the public `/images/...` proxy, while no-store results use
-`/v1/images/{event_id}/content`, which fetches the provider artifact through the
-gateway. Both media routes are CORS-enabled and no longer require an API key or
-session cookie.
+**Change**: Generated image API responses now always use the opaque gateway URL
+`/v1/images/{event_id}/content`. Persisted results resolve the event to a private
+RustFS object key; no-store results resolve it to the provider artifact. New
+public event IDs use 24 random uppercase characters. The legacy `/images/...`
+route remains available for the site gallery and existing links, but its
+owner/timestamp object key is no longer returned by the image API. Both media
+routes are CORS-enabled and do not require an API key or session cookie.
 
 **Reason**: Browser and desktop API clients could not reliably consume
 successful image generations because each upstream provider has different CORS,
 URL expiry, and asset-authentication behavior.
 
-**Impact**: Gateway-hosted image URLs are intentionally shareable to anyone
-holding the URL. The object store and all non-media API routes remain protected.
-Event IDs and generated filenames are opaque random values, but they are not
-treated as authentication credentials after this change.
+**Impact**: Gateway-hosted image URLs are intentionally shareable bearer links.
+API responses no longer disclose the storage owner, username, timestamp, or
+object filename. The object store and all non-media API routes remain protected.
 
 **Security decision**: Keep the RustFS endpoint private and expose only gateway
 media routes as anonymous resources. The API CORS middleware accepts arbitrary
 origins without credentials so browser/desktop downstreams are not rejected;
 authentication is still required by user, billing, account, and administration
-endpoints.
+endpoints. Deployments should enforce per-IP request and connection limits on
+both public media routes at the outer reverse proxy.
 
 **Known risk**: A leaked image URL can be downloaded without login until the
-underlying object or upstream artifact expires. Operators who need private
-media should retain the previous session-gated behavior or add signed URLs.
+underlying object or upstream artifact expires. The opaque event ID prevents
+practical enumeration but is not revocable independently of the event/object.
+Operators requiring expiring access should add signed URLs.
+
+**HTTPS deployment**: An inner proxy must preserve the outer TLS terminator's
+`X-Forwarded-Proto`, and the application includes a non-default
+`X-Forwarded-Port` in returned absolute URLs. This prevents an HTTPS API request
+on ports such as `9445` from producing an unusable `http://` media URL.
+`PUBLIC_BASE_URL` overrides request-derived origins in API responses and should
+be set to the canonical Cloudflare/CDN HTTPS hostname in production.
 
 ### 2026-08-08 - API-key image URL passthrough
 
@@ -122,6 +132,24 @@ The account-management import parser accepts pasted credentials as well as CPA (
 ZIP processing is memory-only and never extracts paths to disk. It accepts JSON entries only, caps the archive at 1,000 JSON files, each uncompressed JSON entry at 2 MiB, and total uncompressed JSON data at 20 MiB. Duplicate credentials are removed before requests are sent. Agent Identity-only records are skipped because the image provider requires a ChatGPT `access_token`; when a file contains no supported credential, the UI reports that limitation explicitly.
 
 ## Change history
+
+### 2026-08-11 - Opt-in asynchronous image API behind Cloudflare
+
+**Change**: `/v1/images/generations` and `/v1/images/edits` accept `Prefer: respond-async` or `?async=true`. Opt-in requests immediately return `202` with a user-scoped `request_id`, `poll_url`, and retry interval while rendering continues independently. The existing task endpoint reports queued, completed, or failed state. Synchronous behavior remains the default.
+
+**Reason**: Cloudflare terminates proxied HTTP requests that produce no origin response for roughly 120 seconds, while valid image jobs can take several minutes. Returning a task before that edge timeout gives controlled downstreams a deterministic recovery contract without changing strict OpenAI clients that depend on the synchronous response shape.
+
+**Impact**: Existing downstream integrations are unchanged. Async clients must poll the supplied URL. Same-user requests sharing an idempotency key are coalesced in-process and guarded by Redis; PostgreSQL enforces a partial unique index for persisted API image events. A persistence failure after charging refunds the unlogged debit.
+
+**Decision**: Keep Cloudflare proxying and make async behavior explicit instead of silently changing every image response to `202`. This preserves edge protection and current client compatibility while providing a supported path for jobs that exceed CDN timeouts.
+
+### 2026-08-12 - Synchronous image response heartbeats
+
+**Change**: Synchronous `/v1/images/generations` and `/v1/images/edits` requests start a chunked `application/json` response after 10 seconds and flush JSON whitespace every 10 seconds until the final OpenAI success or error object is available. The `/v1/` Nginx location disables response buffering and the backend emits `X-Accel-Buffering: no`.
+
+**Reason**: A downstream Go client closed real image-edit requests after 31 and 62 seconds while Adobe was still rendering, producing Nginx `499` entries. Opt-in async cannot help an unchanged client that expects the synchronous OpenAI image shape. JSON-leading whitespace keeps response-header and idle timers active without changing the final parseable document.
+
+**Tradeoff**: Once the first heartbeat commits HTTP `200`, a later provider failure is represented by the standard OpenAI `{"error": ...}` body rather than a non-2xx transport status. Fast validation and admission failures that finish before the first heartbeat retain their original status codes.
 
 ### 2026-07-30 - URL-first image relay
 

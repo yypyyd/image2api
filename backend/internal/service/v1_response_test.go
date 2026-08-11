@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"backend/internal/config"
 	"backend/internal/model"
 	"gorm.io/datatypes"
 )
@@ -39,6 +40,52 @@ func TestNormalizeImageResponseFormat(t *testing.T) {
 				t.Fatalf("normalizeImageResponseFormat() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestPublicImageContentURL(t *testing.T) {
+	if got := publicImageContentURL("https://HOST:9445/", "evt-OPAQUE"); got != "https://HOST:9445/v1/images/evt-OPAQUE/content" {
+		t.Fatalf("publicImageContentURL() = %q", got)
+	}
+	if got := publicImageContentURL("", "evt-OPAQUE"); got != "/v1/images/evt-OPAQUE/content" {
+		t.Fatalf("relative publicImageContentURL() = %q", got)
+	}
+}
+
+func TestOutputBaseURLPrefersConfiguredPublicOrigin(t *testing.T) {
+	svc := &V1Service{cfg: &config.Config{PublicBaseURL: "https://api.example.test/"}}
+	if got := svc.outputBaseURL("http://internal:2000"); got != "https://api.example.test" {
+		t.Fatalf("outputBaseURL() = %q", got)
+	}
+}
+
+func TestImageTaskURLUsesPublicOriginAndEscapesRequestID(t *testing.T) {
+	svc := &V1Service{cfg: &config.Config{PublicBaseURL: "https://api.example.test/"}}
+	if got := svc.imageTaskURL("request id/1", "http://internal:2000"); got != "https://api.example.test/v1/images/tasks?request_id=request+id%2F1" {
+		t.Fatalf("imageTaskURL() = %q", got)
+	}
+}
+
+func TestAsyncImageJobResponseLifecycle(t *testing.T) {
+	job := newAsyncImageJob()
+	response, pending := asyncImageJobResponse(job, "req-1", "/poll")
+	if !pending || response["status"] != "queued" {
+		t.Fatalf("pending response = %#v, pending=%v", response, pending)
+	}
+
+	job.complete(map[string]any{"data": []map[string]any{{"url": "https://example.test/image.png"}}}, nil)
+	response, pending = asyncImageJobResponse(job, "req-1", "/poll")
+	if pending || response["status"] != "completed" || response["request_id"] != "req-1" {
+		t.Fatalf("completed response = %#v, pending=%v", response, pending)
+	}
+}
+
+func TestAsyncImageJobResponseFailure(t *testing.T) {
+	job := newAsyncImageJob()
+	job.complete(nil, errors.New("render failed"))
+	response, pending := asyncImageJobResponse(job, "req-2", "/poll")
+	if pending || response["status"] != "failed" || response["error"] != "render failed" {
+		t.Fatalf("failed response = %#v, pending=%v", response, pending)
 	}
 }
 
