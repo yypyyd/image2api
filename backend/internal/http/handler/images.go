@@ -24,10 +24,10 @@ func NewImageHandler(cfg *config.Config, imageAccess *service.ImageAccessService
 	}
 }
 
-// Serve gates access (public showcase images, or a logged-in cookie — a regular
-// user only their own images, an admin anyone's) and then PROXIES the object
-// from RustFS. Nothing is read from local disk; the RustFS endpoint is never
-// exposed to the client.
+// Serve proxies the object from RustFS. Generated media URLs are intentionally
+// directly downloadable by API clients, so this route does not require a web
+// session cookie. The object store itself remains private and is never exposed
+// to the client.
 func (h *ImageHandler) Serve(c *gin.Context) {
 	user := c.Param("user")
 	name := c.Param("name")
@@ -47,26 +47,12 @@ func (h *ImageHandler) Serve(c *gin.Context) {
 		origRel = service.LastFrameOrigKey(rel)
 	}
 
-	public, err := h.imageAccess.IsPublic(c.Request.Context(), origRel)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to authorize image"})
-		return
-	}
-	if !public {
-		authorized, err := h.imageAccess.IsAuthorized(
-			c.Request.Context(),
-			readCookie(c, h.cfg.SessionCookieName),
-			user,
-		)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"detail": "failed to authorize image"})
-			return
-		}
-		if !authorized {
-			c.JSON(http.StatusUnauthorized, gin.H{"detail": "需要登录后访问"})
-			return
-		}
-	}
+	// API clients commonly download this URL from a different origin (or from
+	// a desktop renderer). Keep media fetches unrestricted and explicitly mark
+	// them as cross-origin resources; the path contains a random filename and
+	// the RustFS endpoint remains private.
+	c.Header("Access-Control-Allow-Origin", "*")
+	c.Header("Cross-Origin-Resource-Policy", "cross-origin")
 
 	// Forward Range so the browser can seek within videos.
 	resp, err := h.store.Get(c.Request.Context(), rel, c.GetHeader("Range"))
@@ -96,6 +82,7 @@ func (h *ImageHandler) Serve(c *gin.Context) {
 	_, _ = io.Copy(c.Writer, resp.Body)
 }
 
+// readCookie is shared by the session-auth handlers in this package.
 func readCookie(c *gin.Context, name string) string {
 	v, err := c.Cookie(name)
 	if err != nil {

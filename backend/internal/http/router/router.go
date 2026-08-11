@@ -5,6 +5,7 @@ import (
 	"backend/internal/http/handler"
 	"backend/internal/http/middleware"
 	"backend/internal/service"
+	"strings"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -40,10 +41,14 @@ func New(cfg *config.Config, auth *service.AuthService, handlers Handlers) *gin.
 	engine.Use(gin.Recovery())
 	engine.Use(middleware.RequestID())
 	engine.Use(cors.New(cors.Config{
-		AllowOrigins:     cfg.CORSOrigins,
+		// Downstream API clients may run in a browser/desktop renderer with an
+		// origin that is not known at deployment time. Echo the requesting origin
+		// instead of rejecting it; media routes additionally emit `*` because
+		// their downloads are intentionally anonymous.
+		AllowOriginFunc:  func(origin string) bool { return strings.TrimSpace(origin) != "" },
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Authorization", "Content-Type", "X-Request-Id"},
-		AllowCredentials: true,
+		AllowCredentials: false,
 	}))
 
 	engine.GET("/health", handlers.Health.Handle)

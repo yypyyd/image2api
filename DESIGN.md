@@ -1,5 +1,32 @@
 # Design Notes
 
+### 2026-08-11 - Public cross-origin image delivery
+
+**Change**: Generated image API responses now always use gateway-owned URLs.
+Persisted results use the public `/images/...` proxy, while no-store results use
+`/v1/images/{event_id}/content`, which fetches the provider artifact through the
+gateway. Both media routes are CORS-enabled and no longer require an API key or
+session cookie.
+
+**Reason**: Browser and desktop API clients could not reliably consume
+successful image generations because each upstream provider has different CORS,
+URL expiry, and asset-authentication behavior.
+
+**Impact**: Gateway-hosted image URLs are intentionally shareable to anyone
+holding the URL. The object store and all non-media API routes remain protected.
+Event IDs and generated filenames are opaque random values, but they are not
+treated as authentication credentials after this change.
+
+**Security decision**: Keep the RustFS endpoint private and expose only gateway
+media routes as anonymous resources. The API CORS middleware accepts arbitrary
+origins without credentials so browser/desktop downstreams are not rejected;
+authentication is still required by user, billing, account, and administration
+endpoints.
+
+**Known risk**: A leaked image URL can be downloaded without login until the
+underlying object or upstream artifact expires. Operators who need private
+media should retain the previous session-gated behavior or add signed URLs.
+
 ### 2026-08-08 - API-key image URL passthrough
 
 **Change**: API-key image requests using `response_format=url` now return the provider artifact URL directly when the provider supplies one, even when an idempotency key also causes a private recovery copy to be stored. The session-gated `/images/...` URL is only a fallback when no provider URL exists; ChatGPT/Grok account-gated assets continue using the authenticated `/v1/images/{id}/content` proxy.

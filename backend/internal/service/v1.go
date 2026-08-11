@@ -998,13 +998,9 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 	if storeOutput {
 		fileURL, relativePath = s.allocateOutput(principal, "png", in.BaseURL)
 	}
-	// upstreamURL is the provider's original artifact URL. For API-key (source
-	// "v1") requests we return it instead of base64. When gatedURL is true the URL
-	// is auth-gated (chatgpt files.oaiusercontent.com — a plain GET 403s), so we
-	// store it on the event and hand the caller a proxy URL
-	// ({base}/v1/images/{eventID}/content) that re-fetches with the account token.
+	// upstreamURL is the provider's original artifact URL. API clients always
+	// receive a gateway URL; the gateway hides provider CORS and auth differences.
 	var upstreamURL string
-	var gatedURL bool
 	eventID, err := s.logPendingEvent(ctx, "image", modelItem, principal, in.Prompt, aspectRatio, resolution, "", refCount, price, relativePath, source, nil, in.DeAI, in.RequestID)
 	if err != nil {
 		return nil, err
@@ -1055,7 +1051,6 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		}
 		imageBytes = b
 		upstreamURL = u
-		gatedURL = true // chatgpt URL needs the account token → proxy it
 	case "leonardo":
 		b, u, execErr := s.generateLeonardoImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, urlOnly)
 		if execErr != nil {
@@ -1148,7 +1143,6 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 		}
 		imageBytes = b
 		upstreamURL = u
-		gatedURL = true // assets.grok.com needs the account token → proxy it
 	case "custom":
 		b, u, execErr := s.generateCustomImage(genCtx, eventID, modelItem, in, aspectRatio, resolution, urlOnly)
 		if execErr != nil {
@@ -1224,21 +1218,28 @@ func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPri
 				"credits":    principalCredits(principal),
 			}, nil
 		}
-		if storeOutput || strings.TrimSpace(upstreamURL) != "" {
+		if storeOutput {
+			// Persisted results use our RustFS-backed public image proxy.
+			return map[string]any{
+				"created":    time.Now().Unix(),
+				"data":       []map[string]any{{"url": fileURL}},
+				"model":      modelItem.EffectiveName(),
+				"provider":   modelItem.Provider,
+				"kind":       "image",
+				"url":        fileURL,
+				"elapsed_ms": elapsedMS,
+				"charged":    price,
+				"credits":    principalCredits(principal),
+			}, nil
+		}
+		if strings.TrimSpace(upstreamURL) != "" {
+			// No-store results still use our public proxy. The original URL is kept
+			// on the event so OpenImageContent can fetch it with provider credentials
+			// when necessary.
+			_ = s.events.SetFile(ctx, eventID, upstreamURL)
 			outURL := upstreamURL
-			if gatedURL {
-				// Auth-gated URL (chatgpt): store it on the event and return a proxy
-				// URL that re-fetches with the account token (see OpenImageContent).
-				_ = s.events.SetFile(ctx, eventID, upstreamURL)
-				if base := strings.TrimRight(strings.TrimSpace(in.BaseURL), "/"); base != "" {
-					outURL = base + "/v1/images/" + eventID + "/content"
-				}
-			} else if strings.TrimSpace(outURL) == "" && storeOutput {
-				// API-key URL responses should expose the provider artifact URL when
-				// one exists. A private /images/... object requires a browser session
-				// and is not usable by downstream API clients; use it only as a
-				// fallback when the provider returned no URL at all.
-				outURL = fileURL
+			if base := strings.TrimRight(strings.TrimSpace(in.BaseURL), "/"); base != "" {
+				outURL = base + "/v1/images/" + eventID + "/content"
 			}
 			return map[string]any{
 				"created":    time.Now().Unix(),
@@ -1673,16 +1674,15 @@ func (s *V1Service) OpenVideoContent(ctx context.Context, principal *APIPrincipa
 // OpenImageContent streams a no-store image by proxying the stored upstream URL.
 // chatgpt URLs are auth-gated (files.oaiusercontent.com — a plain GET 403s), so
 // they're fetched through the generating account's token; other providers'
-// URLs are public and proxied directly. Never persisted.
+// URLs are public and proxied directly. The caller intentionally does not need
+// an API key or web session: this is the directly-downloadable URL returned by
+// the image API, and the event ID is a random opaque identifier.
 func (s *V1Service) OpenImageContent(ctx context.Context, principal *APIPrincipal, id string) (io.ReadCloser, string, error) {
 	ev, err := s.events.GetByID(ctx, strings.TrimSpace(id))
 	if err != nil {
 		return nil, "", err
 	}
 	if ev == nil || ev.Kind != "image" {
-		return nil, "", ErrVideoJobNotFound
-	}
-	if principal != nil && principal.User != nil && ev.UserID != principal.User.ID {
 		return nil, "", ErrVideoJobNotFound
 	}
 	if ev.Status != "success" || strings.TrimSpace(ev.File) == "" {

@@ -344,19 +344,19 @@ func (h *V1Handler) GetVideoContent(c *gin.Context) {
 }
 
 // GetImageContent — GET /v1/images/{id}/content. Streams a no-store image by
-// proxying its stored (possibly auth-gated) upstream URL. Never persisted.
+// proxying its stored upstream URL. This endpoint is intentionally public so
+// browser/desktop API clients can fetch the returned URL without forwarding an
+// Authorization header; event IDs are random and the upstream object remains
+// hidden behind this proxy.
 func (h *V1Handler) GetImageContent(c *gin.Context) {
-	principal, err := h.v1.Authenticate(c.Request.Context(), c.GetHeader("Authorization"))
-	if err != nil {
-		h.writeAuthError(c, err)
-		return
-	}
-	body, contentType, err := h.v1.OpenImageContent(c.Request.Context(), principal, c.Param("id"))
+	body, contentType, err := h.v1.OpenImageContent(c.Request.Context(), nil, c.Param("id"))
 	if err != nil {
 		h.writeV1Error(c, err, nil)
 		return
 	}
 	defer body.Close()
+	c.Header("Access-Control-Allow-Origin", "*")
+	c.Header("Cross-Origin-Resource-Policy", "cross-origin")
 	c.Header("Content-Type", contentType)
 	c.Status(http.StatusOK)
 	_, _ = io.Copy(c.Writer, body)
