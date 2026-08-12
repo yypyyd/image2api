@@ -166,8 +166,13 @@ type Client struct {
 // Pacing/breaker knobs, tunable per deployment without a rebuild: the right
 // values depend on how hard Adobe is throttling the egress IP at the time.
 var (
-	adobeSubmitConcurrency = envPositiveInt("ADOBE_SUBMIT_CONCURRENCY", 1)
-	adobeSubmitMinInterval = envPositiveMillis("ADOBE_SUBMIT_INTERVAL_MS", 1200*time.Millisecond)
+	adobeSubmitConcurrency = envPositiveInt("ADOBE_SUBMIT_CONCURRENCY", 2)
+	// Pacing is adaptive per lane: submits start at the floor interval and only
+	// slow down (doubling toward the ceiling) while Adobe returns overload
+	// responses, then decay back to the floor as submits succeed. A queue burst
+	// therefore drains quickly whenever Adobe is healthy.
+	adobeSubmitMinInterval = envPositiveMillis("ADOBE_SUBMIT_INTERVAL_MS", 600*time.Millisecond)
+	adobeSubmitMaxInterval = envPositiveMillis("ADOBE_SUBMIT_INTERVAL_MAX_MS", 10*time.Second)
 	// A lane trips its breaker after this many consecutive overload responses and
 	// stays open for the cooldown, so a provider-wide outage fails fast instead of
 	// spending one account and one paced submit slot per doomed retry.
@@ -194,10 +199,23 @@ func envPositiveMillis(key string, def time.Duration) time.Duration {
 type submitLane struct {
 	gate chan struct{}
 
-	mu     sync.Mutex
-	next   time.Time // earliest time the next submit may start
-	fails  int       // consecutive overload responses
-	opened time.Time // when the breaker tripped (zero = closed)
+	mu       sync.Mutex
+	next     time.Time     // earliest time the next submit may start
+	interval time.Duration // current adaptive spacing (zero = floor)
+	fails    int           // consecutive overload responses
+	opened   time.Time     // when the breaker tripped (zero = closed)
+}
+
+// currentInterval returns the lane's adaptive spacing, clamped to the
+// configured floor/ceiling. Callers must hold l.mu.
+func (l *submitLane) currentInterval() time.Duration {
+	if l.interval < adobeSubmitMinInterval {
+		return adobeSubmitMinInterval
+	}
+	if l.interval > adobeSubmitMaxInterval {
+		return adobeSubmitMaxInterval
+	}
+	return l.interval
 }
 
 // tripped reports whether the lane is inside its breaker cooldown.
@@ -214,14 +232,24 @@ func (l *submitLane) tripped() bool {
 	return false
 }
 
-// record folds one submit outcome into the breaker: consecutive overload
-// responses trip it, any other outcome closes it.
+// record folds one submit outcome into the breaker and the adaptive interval:
+// overload responses double the spacing (multiplicative backoff) and
+// eventually trip the breaker; any other outcome closes the breaker and decays
+// the spacing back toward the floor.
 func (l *submitLane) record(overloaded bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if !overloaded {
 		l.fails, l.opened = 0, time.Time{}
+		l.interval = l.currentInterval() * 3 / 4
+		if l.interval < adobeSubmitMinInterval {
+			l.interval = adobeSubmitMinInterval
+		}
 		return
+	}
+	l.interval = l.currentInterval() * 2
+	if l.interval > adobeSubmitMaxInterval {
+		l.interval = adobeSubmitMaxInterval
 	}
 	l.fails++
 	if l.fails >= submitBreakerThreshold {
@@ -239,7 +267,7 @@ func (l *submitLane) reserve() time.Duration {
 	if wait < 0 {
 		wait = 0
 	}
-	l.next = time.Now().Add(wait + adobeSubmitMinInterval)
+	l.next = time.Now().Add(wait + l.currentInterval())
 	return wait
 }
 

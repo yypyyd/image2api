@@ -2358,6 +2358,17 @@ const providerAccountQueuePoll = 300 * time.Millisecond
 // the provider client because changing accounts does not change that egress.
 const maxTempFailoverAccounts = 3
 
+// Temporary upstream errors (overload / open breaker) are absorbed by waiting
+// and retrying inside the request instead of failing it: the synchronous
+// response heartbeats keep the downstream connection alive, so a queued burst
+// degrades into slower responses rather than user-visible errors. The window
+// bounds the total wait; the backoff paces retries across breaker cooldowns.
+const (
+	tempRetryWindow         = 120 * time.Second
+	tempRetryInitialBackoff = 3 * time.Second
+	tempRetryMaxBackoff     = 12 * time.Second
+)
+
 // runPoolWithFailover drives a generation across a round-robin-ordered account
 // list with per-error-class behavior, so a bad request never burns the whole
 // pool while genuinely limited accounts still fail over:
@@ -2386,8 +2397,33 @@ func (s *V1Service) runPoolWithFailover(ctx context.Context, eventID, pool strin
 ) ([]byte, error) {
 	tempDeadCount := 0
 	queueDeadline := time.Now().Add(providerAccountQueueWait)
+	tempRetryDeadline := time.Now().Add(tempRetryWindow)
+	tempRetryBackoff := tempRetryInitialBackoff
+	// waitTempRetry pauses before re-running the pool after a temporary
+	// upstream failure. It reports false once the retry window is spent or the
+	// caller has gone away, at which point the error is surfaced.
+	waitTempRetry := func() bool {
+		if time.Now().After(tempRetryDeadline) || ctx.Err() != nil {
+			return false
+		}
+		timer := time.NewTimer(tempRetryBackoff)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+		}
+		tempRetryBackoff *= 2
+		if tempRetryBackoff > tempRetryMaxBackoff {
+			tempRetryBackoff = tempRetryMaxBackoff
+		}
+		tempDeadCount = 0
+		return true
+	}
 	for {
 		var lastErr error
+		lastTempDead := false
+		retrying := false
 		busy := 0
 		for _, token := range active {
 			slots := poolAccountConcurrency(pool, token)
@@ -2404,17 +2440,27 @@ func (s *V1Service) runPoolWithFailover(ctx context.Context, eventID, pool strin
 				return data, nil
 			}
 			lastErr = err
+			lastTempDead = tempDead
 			// An upstream-wide busy signal (the provider's circuit is open) means every
-			// account fails identically — stop instead of burning the pool.
+			// account fails identically — stop burning the pool, wait out the
+			// cooldown inside the request, then retry.
 			if isUpstreamBusy(err) {
+				if waitTempRetry() {
+					retrying = true
+					break
+				}
 				return nil, lastErr
 			}
 			if tempDead {
 				// temp-failover policy: this account hit a temporary upstream error.
-				// Cap how many accounts one request may burn before we stop, so an
-				// upstream-wide blip doesn't fan out across the whole pool.
+				// Cap how many accounts one burst may burn, then wait and retry
+				// instead of failing the request while the retry window lasts.
 				tempDeadCount++
 				if tempDeadCount >= maxTempFailoverAccounts {
+					if waitTempRetry() {
+						retrying = true
+						break
+					}
 					return nil, lastErr
 				}
 			}
@@ -2425,7 +2471,16 @@ func (s *V1Service) runPoolWithFailover(ctx context.Context, eventID, pool strin
 			return nil, lastErr
 		}
 
+		if retrying {
+			continue
+		}
 		if lastErr != nil {
+			// The whole pool was tried and the last failure was a temporary
+			// upstream error → wait and retry within the window; anything else
+			// (auth/quota exhaustion across the pool) is surfaced immediately.
+			if lastTempDead && waitTempRetry() {
+				continue
+			}
 			return nil, lastErr
 		}
 		if busy == 0 {

@@ -91,6 +91,38 @@ func TestSubmitBreakerTripsAndFailsFast(t *testing.T) {
 	}
 }
 
+// The lane's spacing is adaptive: overload responses double it toward the
+// ceiling, successes decay it back to the floor, so queued bursts drain at the
+// floor rate whenever Adobe is healthy.
+func TestSubmitLaneAdaptiveInterval(t *testing.T) {
+	client := NewClient("test", "")
+	lane := client.lane(submitURL)
+	snapshot := func() time.Duration {
+		lane.mu.Lock()
+		defer lane.mu.Unlock()
+		return lane.currentInterval()
+	}
+	if got := snapshot(); got != adobeSubmitMinInterval {
+		t.Fatalf("initial interval = %v, want floor %v", got, adobeSubmitMinInterval)
+	}
+	lane.record(true)
+	if got := snapshot(); got != 2*adobeSubmitMinInterval {
+		t.Fatalf("interval after one overload = %v, want %v", got, 2*adobeSubmitMinInterval)
+	}
+	for i := 0; i < 20; i++ {
+		lane.record(true)
+	}
+	if got := snapshot(); got != adobeSubmitMaxInterval {
+		t.Fatalf("interval under sustained overload = %v, want ceiling %v", got, adobeSubmitMaxInterval)
+	}
+	for i := 0; i < 50; i++ {
+		lane.record(false)
+	}
+	if got := snapshot(); got != adobeSubmitMinInterval {
+		t.Fatalf("interval after sustained successes = %v, want floor %v", got, adobeSubmitMinInterval)
+	}
+}
+
 func TestSubmitGateHonorsCancellation(t *testing.T) {
 	client := NewClient("test", "")
 	_, release, err := client.acquireSubmit(context.Background(), submitURL)
