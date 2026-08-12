@@ -187,7 +187,7 @@ curl https://你的域名/v1/images/edits \
   -F model="seedream-4.5" -F prompt="改成赛博朋克风格" -F image=@input.png
 ```
 
-文本请求原样透传 OpenAI Chat Completions 字段,支持普通 JSON 与 `stream:true` SSE。文本按管理端配置的每请求固定积分收费;上游业务错误、空响应或流未正常结束会记失败并自动退款。图片默认返回 OpenAI 风格 `{ "created": ..., "data": [{ "url": "..." }] }`;普通请求直接返回上游 URL,不下载、不做 base64 编码、不留存。ChatGPT/Grok 等鉴权素材会返回本站 `/content` 流式代理 URL。显式传 `"response_format":"b64_json"` 才返回内联图片。同步图片生成超过 10 秒时会发送 JSON 合法前置空白心跳并关闭 Nginx 响应缓冲，避免下游、反代和 Cloudflare 把仍在工作的请求判为闲置；最终 OpenAI JSON 结构不变，标准 JSON 解析器无需调整。携带 `Idempotency-Key` 时结果保存到账号私有存储,同步响应遇到网关超时后可轮询 `GET /v1/images/tasks?request_id=...` 恢复。发送 `Prefer: respond-async`（或 `?async=true`）则立即返回 `202` 任务对象并通过同一查询接口轮询。**视频**走异步:`POST /v1/videos` 建任务 → 轮询 `GET /v1/videos/{id}` 至 `completed` → `GET /v1/videos/{id}/content` 取 mp4。完整参数见站内 **/docs** 文档页。
+文本请求原样透传 OpenAI Chat Completions 字段,支持普通 JSON 与 `stream:true` SSE。文本按管理端配置的每请求固定积分收费;上游业务错误、空响应或流未正常结束会记失败并自动退款。图片默认返回 OpenAI 风格 `{ "created": ..., "data": [{ "url": "..." }] }`;普通请求直接返回上游 URL,不下载、不做 base64 编码、不留存。ChatGPT/Grok 等鉴权素材会返回本站 `/content` 流式代理 URL。显式传 `"response_format":"b64_json"` 才返回内联图片。携带 `Idempotency-Key` 时结果保存到账号私有存储,同步响应遇到网关超时后可轮询 `GET /v1/images/tasks?request_id=...` 恢复。发送 `Prefer: respond-async`（或 `?async=true`）则立即返回 `202` 任务对象并通过同一查询接口轮询；未发送该标志的现有下游保持同步响应不变。**视频**走异步:`POST /v1/videos` 建任务 → 轮询 `GET /v1/videos/{id}` 至 `completed` → `GET /v1/videos/{id}/content` 取 mp4。完整参数见站内 **/docs** 文档页。
 
 ## 🚀 部署
 

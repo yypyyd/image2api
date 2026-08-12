@@ -65,7 +65,6 @@ go run ./cmd/api
   immediate `202` task object with `poll_url`; poll it until `completed` or
   `failed`. Async requests always use an idempotency key, generated from the
   request ID when the caller does not provide one.
-- Synchronous image requests that run longer than 10 seconds flush JSON-valid
-  leading whitespace every 10 seconds. The web proxy disables buffering for
-  `/v1/`, so CDN and downstream idle timers see progress while the final OpenAI
-  JSON response remains parseable without a client-specific streaming mode.
+- Default Adobe image routing uses ordinary accounts only. Points accounts are
+  reserved unless an administrator explicitly pins one for an account test;
+  Adobe video entitlement routing is unaffected.

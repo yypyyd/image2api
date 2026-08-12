@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"backend/internal/service"
 	"github.com/gin-gonic/gin"
@@ -19,16 +18,6 @@ import (
 
 type V1Handler struct {
 	v1 *service.V1Service
-}
-
-const (
-	imageSyncKeepaliveDelay    = 10 * time.Second
-	imageSyncKeepaliveInterval = 10 * time.Second
-)
-
-type imageSyncResult struct {
-	response map[string]any
-	err      error
 }
 
 func NewV1Handler(v1 *service.V1Service) *V1Handler {
@@ -195,12 +184,12 @@ func (h *V1Handler) ImageEdits(c *gin.Context) {
 
 func (h *V1Handler) respondImageRequest(c *gin.Context, principal *service.APIPrincipal, request service.V1ImageRequest) {
 	if !imageAsyncRequested(c) {
-		results := make(chan imageSyncResult, 1)
-		go func() {
-			resp, err := h.v1.PrepareImageRequest(c.Request.Context(), principal, request)
-			results <- imageSyncResult{response: resp, err: err}
-		}()
-		h.writeSynchronousImageResponse(c, results, imageSyncKeepaliveDelay, imageSyncKeepaliveInterval)
+		resp, err := h.v1.PrepareImageRequest(c.Request.Context(), principal, request)
+		if err != nil {
+			h.writeV1Error(c, err, resp)
+			return
+		}
+		c.JSON(http.StatusOK, openaiImageResponse(resp))
 		return
 	}
 
@@ -222,70 +211,6 @@ func (h *V1Handler) respondImageRequest(c *gin.Context, principal *service.APIPr
 	}
 	c.JSON(http.StatusOK, resp)
 }
-
-// writeSynchronousImageResponse preserves the original OpenAI JSON contract
-// while preventing response-header and idle proxy timeouts during slow image
-// generations. JSON permits leading whitespace, so each flushed heartbeat is
-// still followed by one valid success or error object.
-func (h *V1Handler) writeSynchronousImageResponse(c *gin.Context, results <-chan imageSyncResult, initialDelay, interval time.Duration) {
-	timer := time.NewTimer(initialDelay)
-	defer timer.Stop()
-
-	select {
-	case result := <-results:
-		h.finishSynchronousImageResponse(c, result, false)
-		return
-	case <-timer.C:
-	case <-c.Request.Context().Done():
-		return
-	}
-
-	c.Header("Content-Type", "application/json; charset=utf-8")
-	c.Header("Cache-Control", "no-store, no-transform")
-	c.Header("X-Accel-Buffering", "no")
-	c.Status(http.StatusOK)
-	if _, err := c.Writer.Write([]byte(" \n")); err != nil {
-		return
-	}
-	c.Writer.Flush()
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case result := <-results:
-			h.finishSynchronousImageResponse(c, result, true)
-			c.Writer.Flush()
-			return
-		case <-ticker.C:
-			if _, err := c.Writer.Write([]byte(" \n")); err != nil {
-				return
-			}
-			c.Writer.Flush()
-		case <-c.Request.Context().Done():
-			return
-		}
-	}
-}
-
-func (h *V1Handler) finishSynchronousImageResponse(c *gin.Context, result imageSyncResult, responseStarted bool) {
-	if result.err == nil {
-		if responseStarted {
-			_ = json.NewEncoder(c.Writer).Encode(openaiImageResponse(result.response))
-			return
-		}
-		c.JSON(http.StatusOK, openaiImageResponse(result.response))
-		return
-	}
-
-	status, body := v1ErrorResponse(result.err, result.response)
-	if responseStarted {
-		_ = json.NewEncoder(c.Writer).Encode(body)
-		return
-	}
-	c.JSON(status, body)
-}
-
 func (h *V1Handler) GetImageTask(c *gin.Context) {
 	principal, err := h.v1.Authenticate(c.Request.Context(), c.GetHeader("Authorization"))
 	if err != nil {

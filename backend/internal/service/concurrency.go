@@ -64,6 +64,24 @@ func (c *ConcurrencyService) Release(ctx context.Context, key, token string) {
 	_ = c.redis.ZRem(ctx, key, token).Err()
 }
 
+// NextCursor returns the next value of a shared round-robin counter (starting at
+// 0) and advances it. It is Redis-backed on purpose: a per-process counter
+// restarts at 0 on every deploy, which makes the scheduler re-pick the head of
+// the account list over and over and leaves the tail of a large pool idle.
+// ok=false when Redis is unavailable, so the caller can fall back.
+func (c *ConcurrencyService) NextCursor(ctx context.Context, key string) (uint64, bool) {
+	if c == nil || c.redis == nil {
+		return 0, false
+	}
+	ctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	n, err := c.redis.Incr(ctx, "rr:"+key).Result()
+	if err != nil {
+		return 0, false
+	}
+	return uint64(n - 1), true
+}
+
 // Count returns the live (non-expired) slot count under `key` — for display.
 func (c *ConcurrencyService) Count(ctx context.Context, key string) int {
 	if c == nil || c.redis == nil {

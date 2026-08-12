@@ -1804,6 +1804,9 @@ func accountRow(item model.TokenAccount, inFlight int64) map[string]any {
 		"success_total":     item.SuccessTotal,
 		"fail_total":        item.FailTotal,
 		"fails_streak":      item.Fails,
+		// Provider-side failures (overload / 5xx) — kept out of fail_total so an
+		// upstream outage doesn't make every account look broken.
+		"upstream_fails":    item.UpstreamFails,
 		"status":            item.Status,
 		"dead":              item.Dead,
 		"image_limited":     item.ImageLimited,

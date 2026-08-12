@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -104,8 +105,14 @@ type V1Service struct {
 	// value: *uint64). Each pick advances the pool's cursor by one so accounts
 	// are used in a fixed, even rotation (acct1→acct2→acct3→acct1…) independent
 	// of fails/last_used. The atomic counter also serializes concurrent picks so
-	// two simultaneous requests never start on the same account.
+	// two simultaneous requests never start on the same account. It is only the
+	// fallback for a missing/unreachable Redis — see nextCursor.
 	tokenCursors sync.Map
+	// acctCooldowns holds "pool:accountID" → time.Time until which an account that
+	// just failed upstream is demoted to the back of its pool's rotation, so the
+	// next request prefers a different account instead of immediately retrying the
+	// one that just failed. Nothing is ever removed from the rotation.
+	acctCooldowns sync.Map
 	// grokBuildLocks serializes SSO->Build conversion/refresh per account. OAuth
 	// refresh tokens may rotate, so concurrent first-use requests must not persist
 	// different generations of the same credential.
@@ -2338,14 +2345,18 @@ const adobePointsConcurrencyPerAccount = 4
 
 // Absorb short bursts above the account pool capacity instead of rejecting them
 // immediately. The generation context owns the upper bound for the whole job.
+// accountFailureCooldown is how long an account stays demoted after an upstream
+// (auth/temporary/fatal) failure. Short on purpose: it only reorders the
+// rotation, and a pool where every account is cooling behaves exactly as before.
+const accountFailureCooldown = 45 * time.Second
+
 const providerAccountQueueWait = 90 * time.Second
 const providerAccountQueuePoll = 300 * time.Millisecond
 
-// maxTempDeadAccounts caps how many accounts the "temporary error = fail over"
-// policy may burn per request before giving up, so an upstream-wide blip
-// ("system under load") can't fan a single request out across the whole pool.
-// After this many accounts fail this way, the request fails.
-const maxTempDeadAccounts = 3
+// Bound temporary failover so a shared-egress outage cannot fan one downstream
+// request across the entire account pool. Adobe submits are also serialized by
+// the provider client because changing accounts does not change that egress.
+const maxTempFailoverAccounts = 3
 
 // runPoolWithFailover drives a generation across a round-robin-ordered account
 // list with per-error-class behavior, so a bad request never burns the whole
@@ -2357,7 +2368,7 @@ const maxTempDeadAccounts = 3
 //     fresh token; if it still auth-fails (or there's nothing to refresh, e.g.
 //     chatgpt's JWT IS the credential), mark the account and fail over.
 //   - 上游临时 temporary → record the failure (no disable/dead) and FAIL OVER to
-//     the next account immediately, capped at maxTempDeadAccounts accounts so a
+//     the next account immediately, capped by maxTempFailoverAccounts so a
 //     pool-wide blip can't fan a single request out across everything.
 //   - 参数错 / request-level (anything else) → return immediately, no retry, no
 //     account penalty (the account isn't at fault).
@@ -2393,12 +2404,17 @@ func (s *V1Service) runPoolWithFailover(ctx context.Context, eventID, pool strin
 				return data, nil
 			}
 			lastErr = err
+			// An upstream-wide busy signal (the provider's circuit is open) means every
+			// account fails identically — stop instead of burning the pool.
+			if isUpstreamBusy(err) {
+				return nil, lastErr
+			}
 			if tempDead {
 				// temp-failover policy: this account hit a temporary upstream error.
 				// Cap how many accounts one request may burn before we stop, so an
 				// upstream-wide blip doesn't fan out across the whole pool.
 				tempDeadCount++
-				if tempDeadCount >= maxTempDeadAccounts {
+				if tempDeadCount >= maxTempFailoverAccounts {
 					return nil, lastErr
 				}
 			}
@@ -2468,6 +2484,7 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 				}
 			}
 			s.markTokenFailure(ctx, pool, token, kind, true, false)
+			s.coolDownAccount(pool, token.ID)
 			return nil, err, true, false
 		}
 		// Fatal / temporary-under-failover-policy upstream error.
@@ -2478,23 +2495,32 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 				// overload) look the same, and killing wipes healthy accounts.
 				// Record the failure and fail over to the next account (no
 				// disable/dead). The 4th return value caps how many accounts one
-				// request may burn this way (maxTempDeadAccounts) so a pool-wide
+				// request may burn this way (maxTempFailoverAccounts) so a pool-wide
 				// blip can't fan a single request across the whole pool.
-				s.markTokenFailure(ctx, pool, token, kind, false, false)
+				s.markTokenUpstreamFailure(ctx, pool, token)
+				s.coolDownAccount(pool, token.ID)
 				return nil, err, true, true
 			}
 			s.markTokenDead(ctx, pool, token, kind)
 			return nil, err, true, true
 		}
 		if isTemp {
-			// Temporary upstream error → record the failure (no disable/dead) and
-			// fail over to the NEXT account, capped via the tempDead return so a
-			// pool-wide blip can't fan one request across the whole pool.
-			s.markTokenFailure(ctx, pool, token, kind, false, false)
+			// Temporary upstream error → record it against the upstream (not the
+			// account) and fail over to the NEXT account, capped via the tempDead
+			// return so a pool-wide blip can't fan one request across the whole pool.
+			s.markTokenUpstreamFailure(ctx, pool, token)
+			s.coolDownAccount(pool, token.ID)
 			return nil, err, true, true
 		}
 		return nil, err, false, false // 参数错 / request-level
 	}
+}
+
+// isUpstreamBusy reports a provider-level "everything is failing" signal, so the
+// scheduler can stop failing over instead of retrying the same outage on
+// account after account.
+func isUpstreamBusy(err error) bool {
+	return errors.Is(err, adobe.ErrUpstreamBusy)
 }
 
 func adobeErrClass(e error) (bool, bool, bool, bool) {
@@ -2508,11 +2534,6 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 	if s.adobe == nil {
 		return nil, "", errors.New("adobe client not configured")
 	}
-	if s.settings != nil {
-		if proxy, err := s.settings.GetValue(ctx, "proxy.url"); err == nil {
-			s.adobe.SetProxy(proxy)
-		}
-	}
 
 	items, err := s.tokens.ListByPool(ctx, "adobe")
 	if err != nil {
@@ -2524,7 +2545,7 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 		// quota is exhausted (VideoLimited) is still usable for image as long as
 		// its image quota remains. status=="quota" means BOTH kinds are limited
 		// (or a legacy/full quota mark), so it's excluded for either kind.
-		if item.Status == "active" && !item.Dead && !item.ImageLimited && strings.TrimSpace(item.Value) != "" && adobeAccountSupportsModel(item, modelItem.ID, "image") {
+		if item.Status == "active" && !item.Dead && !item.ImageLimited && strings.TrimSpace(item.Value) != "" && !adobePointsAccount(item) && adobeAccountSupportsModel(item, modelItem.ID, "image") {
 			active = append(active, item)
 		}
 	}
@@ -2541,7 +2562,7 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 
 	// Round-robin order. Adobe uses tempFailover=true: a temporary upstream error
 	// ("system under load") fails over to the next account without penalizing the
-	// current one, capped at maxTempDeadAccounts; auth/quota also fail over
+	// current one, capped at maxTempFailoverAccounts; auth/quota also fail over
 	// (see runPoolWithFailover). imageURL is captured from the successful attempt.
 	var imageURL string
 	data, err := s.runPoolWithFailover(ctx, eventID, "adobe", active, "image", func(token model.TokenAccount) ([]byte, error) {
@@ -2567,11 +2588,6 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 func (s *V1Service) generateAdobeVideo(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1VideoRequest, aspectRatio, resolution string, durationSeconds int, downloadResult bool) ([]byte, string, error) {
 	if s.adobe == nil {
 		return nil, "", errors.New("adobe client not configured")
-	}
-	if s.settings != nil {
-		if proxy, err := s.settings.GetValue(ctx, "proxy.url"); err == nil {
-			s.adobe.SetProxy(proxy)
-		}
 	}
 
 	items, err := s.tokens.ListByPool(ctx, "adobe")
@@ -2605,7 +2621,7 @@ func (s *V1Service) generateAdobeVideo(ctx context.Context, eventID string, mode
 
 	// Round-robin order; fail over to the next account on auth/quota; temporary
 	// upstream errors fail over too without penalizing the account (tempFailover,
-	// capped at maxTempDeadAccounts). videoURL is
+	// capped at maxTempFailoverAccounts). videoURL is
 	// captured from the successful attempt's meta (the upstream presigned URL).
 	var videoURL string
 	data, err := s.runPoolWithFailover(ctx, eventID, "adobe", active, "video", func(token model.TokenAccount) ([]byte, error) {
@@ -3434,7 +3450,7 @@ func (s *V1Service) generateChatGPTImage(ctx context.Context, eventID string, mo
 	}
 
 	// Round-robin order; on a transient upstream error FAIL OVER to the next
-	// account (tempFailover=true, capped at maxTempDeadAccounts) — never mark the
+	// account (tempFailover=true, capped at maxTempFailoverAccounts) — never mark the
 	// account dead. Auth/quota fail over immediately (see runPoolWithFailover).
 	var imageURL string
 	data, err := s.runPoolWithFailover(ctx, eventID, "chatgpt", active, "image", func(token model.TokenAccount) ([]byte, error) {
@@ -4461,6 +4477,18 @@ func (s *V1Service) markTokenFailure(ctx context.Context, pool string, token mod
 	_, _ = s.tokens.Update(ctx, pool, token.ID, patch)
 }
 
+// markTokenUpstreamFailure records a failure caused by the provider itself
+// (overload / 5xx / circuit open) WITHOUT touching the account's own health
+// counters: during an upstream outage every account fails identically, so
+// charging it to fails/fail_total makes a perfectly healthy pool look dead in
+// the admin UI (and drowns real per-account problems in noise).
+func (s *V1Service) markTokenUpstreamFailure(ctx context.Context, pool string, token model.TokenAccount) {
+	_, _ = s.tokens.Update(ctx, pool, token.ID, map[string]any{
+		"last_used_at":   time.Now(),
+		"upstream_fails": gorm.Expr("upstream_fails + 1"),
+	})
+}
+
 // markTokenDead disables an account and marks it dead on a fatal upstream error
 // (a non-overload temporary Adobe failure that ops policy treats as account death).
 func (s *V1Service) markTokenDead(ctx context.Context, pool string, token model.TokenAccount, kind string) {
@@ -4473,20 +4501,56 @@ func (s *V1Service) markTokenDead(ctx context.Context, pool string, token model.
 	})
 }
 
-// nextCursor returns the pool's current round-robin position and atomically
-// advances it by one. Concurrent callers each get a distinct value, so parallel
-// picks land on different accounts instead of racing onto the same one. The
-// counter is in-memory (per process): it resets on restart, which only shifts
-// the rotation's starting point — distribution stays even.
+// nextCursor returns the pool's current round-robin position and advances it by
+// one. Concurrent callers each get a distinct value, so parallel picks land on
+// different accounts instead of racing onto the same one.
+//
+// The counter lives in Redis so the rotation survives restarts: with a
+// per-process counter every deploy reset it to 0 and the scheduler kept
+// re-picking the head of the account list, leaving most of a large pool idle.
+// The in-memory fallback (Redis down/unset) starts at a random offset for the
+// same reason.
 func (s *V1Service) nextCursor(pool string) uint64 {
-	v, _ := s.tokenCursors.LoadOrStore(pool, new(uint64))
+	if n, ok := s.conc.NextCursor(context.Background(), pool); ok {
+		return n
+	}
+	v, _ := s.tokenCursors.LoadOrStore(pool, randomCursor())
 	return atomic.AddUint64(v.(*uint64), 1) - 1
+}
+
+func randomCursor() *uint64 {
+	start := rand.Uint64()
+	return &start
+}
+
+// coolDownAccount demotes an account in its pool's rotation for a short window
+// after an upstream failure (see acctCooldowns).
+func (s *V1Service) coolDownAccount(pool, accountID string) {
+	if accountID == "" {
+		return
+	}
+	s.acctCooldowns.Store(pool+":"+accountID, time.Now().Add(accountFailureCooldown))
+}
+
+func (s *V1Service) accountCooling(pool, accountID string) bool {
+	key := pool + ":" + accountID
+	v, ok := s.acctCooldowns.Load(key)
+	if !ok {
+		return false
+	}
+	until, _ := v.(time.Time)
+	if time.Now().Before(until) {
+		return true
+	}
+	s.acctCooldowns.Delete(key)
+	return false
 }
 
 // rotateRoundRobin orders the active accounts by a stable key (ID) and rotates
 // the slice in place so iteration begins at the pool's current cursor position,
 // then advances the cursor. This is strict round-robin: account selection
-// cycles in fixed order regardless of fails or last_used. The fall-through
+// cycles in fixed order regardless of fails or last_used, except that accounts
+// inside their post-failure cooldown are moved to the back. The fall-through
 // retry chain is preserved — on failure the caller's loop simply continues to
 // the next account in rotation order.
 // pinTestAccount narrows account selection to the single account requested by
@@ -4524,28 +4588,42 @@ func adobeAccountSupportsModel(item model.TokenAccount, modelID, kind string) bo
 	return ok && total >= 10000
 }
 
+func adobePointsAccount(item model.TokenAccount) bool {
+	total, ok := jsonMapInt(item.Meta, "cached_quota_total")
+	return ok && total >= 10000
+}
+
 func (s *V1Service) rotateRoundRobin(pool string, items []model.TokenAccount) {
 	if len(items) <= 1 {
 		return
 	}
+	// Accounts that just failed upstream are demoted behind the healthy ones (but
+	// never removed — they're still tried if everything else is busy/cooling).
 	// Weight = priority: higher-weight accounts come first, so the scheduler tries
 	// them before lower-weight ones (and only falls through when they're at their
-	// concurrency cap). Within the SAME weight all accounts are equal, so they're
-	// rotated by the pool cursor for even distribution.
+	// concurrency cap). Within the SAME cooling state and weight all accounts are
+	// equal, so they're rotated by the pool cursor for even distribution.
+	cooling := make(map[string]bool, len(items))
+	for _, item := range items {
+		cooling[item.ID] = s.accountCooling(pool, item.ID)
+	}
 	sort.SliceStable(items, func(i, j int) bool {
+		if cooling[items[i].ID] != cooling[items[j].ID] {
+			return !cooling[items[i].ID]
+		}
 		if items[i].Weight != items[j].Weight {
 			return items[i].Weight > items[j].Weight
 		}
 		return items[i].ID < items[j].ID
 	})
-	start := int(s.nextCursor(pool))
+	start := s.nextCursor(pool)
 	for i := 0; i < len(items); {
 		j := i + 1
-		for j < len(items) && items[j].Weight == items[i].Weight {
+		for j < len(items) && items[j].Weight == items[i].Weight && cooling[items[j].ID] == cooling[items[i].ID] {
 			j++
 		}
 		if g := j - i; g > 1 {
-			off := start % g
+			off := int(start % uint64(g))
 			if off != 0 {
 				grp := items[i:j]
 				rot := make([]model.TokenAccount, 0, g)

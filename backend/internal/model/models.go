@@ -180,12 +180,16 @@ type CDKCode struct {
 }
 
 type TokenAccount struct {
-	ID                    string            `gorm:"primaryKey;size:64"`
-	Pool                  string            `gorm:"size:64;index;not null"`
-	Value                 string            `gorm:"type:text"`
-	Status                string            `gorm:"size:32;index;not null"`
-	Fails                 int               `gorm:"not null;default:0"`
-	FailTotal             int               `gorm:"not null;default:0"`
+	ID        string `gorm:"primaryKey;size:64"`
+	Pool      string `gorm:"size:64;index;not null"`
+	Value     string `gorm:"type:text"`
+	Status    string `gorm:"size:32;index;not null"`
+	Fails     int    `gorm:"not null;default:0"`
+	FailTotal int    `gorm:"not null;default:0"`
+	// Provider-side failures (overload / 5xx / circuit open) are tracked apart
+	// from Fails/FailTotal: every account fails the same way during an upstream
+	// outage, so they say nothing about this account's health.
+	UpstreamFails         int               `gorm:"not null;default:0"`
 	SuccessTotal          int               `gorm:"not null;default:0"`
 	Dead                  bool              `gorm:"not null;default:false"`
 	Meta                  datatypes.JSONMap `gorm:"type:jsonb"`
@@ -206,7 +210,7 @@ type TokenAccount struct {
 	Weight int `gorm:"not null;default:0"`
 	// Concurrency is the max simultaneous jobs for THIS account. Custom upstreams
 	// and Adobe accounts honor it; other built-in pools use their system default.
-	// 0 = use the pool default (Adobe points 5, ordinary pools 1, Grok 10).
+	// 0 = use the pool default (Adobe points 4, ordinary pools 1, Grok 10).
 	Concurrency int `gorm:"not null;default:0"`
 	CreatedAt   time.Time
 	UpdatedAt   time.Time

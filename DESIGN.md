@@ -133,6 +133,14 @@ ZIP processing is memory-only and never extracts paths to disk. It accepts JSON 
 
 ## Change history
 
+### 2026-08-12 - Keep points accounts out of default Adobe image routing
+
+**Change**: Ordinary Adobe image requests exclude accounts whose cached quota identifies them as points accounts. An admin-pinned account test still bypasses this filter, and Adobe video entitlement routing is unchanged. Adobe submits are serialized and start at least 1.2 seconds apart across accounts on the direct server egress, while accepted jobs continue polling concurrently. Temporary failures remain capped at three accounts per request. Adobe no longer reads the shared `proxy.url` generation setting.
+
+**Reason**: A burst of image requests received `timeout_error: system under load` across many different ordinary accounts using the same direct egress. Changing accounts did not change the rate-limited dimension and amplified one downstream request into repeated submits.
+
+**Impact**: Image capacity now comes only from ordinary Adobe accounts unless an administrator explicitly pins a points account. Burst submits queue at the gateway instead of hitting Adobe simultaneously; polling and downloads retain their existing concurrency. Provider-wide overload remains bounded and does not disable otherwise healthy accounts.
+
 ### 2026-08-11 - Opt-in asynchronous image API behind Cloudflare
 
 **Change**: `/v1/images/generations` and `/v1/images/edits` accept `Prefer: respond-async` or `?async=true`. Opt-in requests immediately return `202` with a user-scoped `request_id`, `poll_url`, and retry interval while rendering continues independently. The existing task endpoint reports queued, completed, or failed state. Synchronous behavior remains the default.
@@ -142,14 +150,6 @@ ZIP processing is memory-only and never extracts paths to disk. It accepts JSON 
 **Impact**: Existing downstream integrations are unchanged. Async clients must poll the supplied URL. Same-user requests sharing an idempotency key are coalesced in-process and guarded by Redis; PostgreSQL enforces a partial unique index for persisted API image events. A persistence failure after charging refunds the unlogged debit.
 
 **Decision**: Keep Cloudflare proxying and make async behavior explicit instead of silently changing every image response to `202`. This preserves edge protection and current client compatibility while providing a supported path for jobs that exceed CDN timeouts.
-
-### 2026-08-12 - Synchronous image response heartbeats
-
-**Change**: Synchronous `/v1/images/generations` and `/v1/images/edits` requests start a chunked `application/json` response after 10 seconds and flush JSON whitespace every 10 seconds until the final OpenAI success or error object is available. The `/v1/` Nginx location disables response buffering and the backend emits `X-Accel-Buffering: no`.
-
-**Reason**: A downstream Go client closed real image-edit requests after 31 and 62 seconds while Adobe was still rendering, producing Nginx `499` entries. Opt-in async cannot help an unchanged client that expects the synchronous OpenAI image shape. JSON-leading whitespace keeps response-header and idle timers active without changing the final parseable document.
-
-**Tradeoff**: Once the first heartbeat commits HTTP `200`, a later provider failure is represented by the standard OpenAI `{"error": ...}` body rather than a non-2xx transport status. Fast validation and admission failures that finish before the first heartbeat retain their original status codes.
 
 ### 2026-07-30 - URL-first image relay
 

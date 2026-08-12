@@ -159,6 +159,26 @@ func TestAdobeAccountSupportsModel(t *testing.T) {
 	}
 }
 
+func TestAdobePointsAccount(t *testing.T) {
+	tests := []struct {
+		name string
+		meta datatypes.JSONMap
+		want bool
+	}{
+		{name: "ordinary", meta: datatypes.JSONMap{"cached_quota_total": 10}},
+		{name: "points", meta: datatypes.JSONMap{"cached_quota_total": 10000}, want: true},
+		{name: "larger points balance", meta: datatypes.JSONMap{"cached_quota_total": 50000}, want: true},
+		{name: "unknown quota", meta: datatypes.JSONMap{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := adobePointsAccount(model.TokenAccount{Meta: tt.meta}); got != tt.want {
+				t.Fatalf("adobePointsAccount() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestResolveAdobeVideoEngineVeoLite(t *testing.T) {
 	engine, upstream := resolveAdobeVideoEngine("gemini-veo31-lite")
 	if engine != "veo31-lite" || upstream != "" {
