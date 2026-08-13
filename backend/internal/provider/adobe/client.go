@@ -166,18 +166,18 @@ type Client struct {
 // Pacing/breaker knobs, tunable per deployment without a rebuild: the right
 // values depend on how hard Adobe is throttling the egress IP at the time.
 var (
-	adobeSubmitConcurrency = envPositiveInt("ADOBE_SUBMIT_CONCURRENCY", 2)
+	adobeSubmitConcurrency = envPositiveInt("ADOBE_SUBMIT_CONCURRENCY", 1)
 	// Pacing is adaptive per lane: submits start at the floor interval and only
 	// slow down (doubling toward the ceiling) while Adobe returns overload
 	// responses, then decay back to the floor as submits succeed. A queue burst
 	// therefore drains quickly whenever Adobe is healthy.
-	adobeSubmitMinInterval = envPositiveMillis("ADOBE_SUBMIT_INTERVAL_MS", 600*time.Millisecond)
-	adobeSubmitMaxInterval = envPositiveMillis("ADOBE_SUBMIT_INTERVAL_MAX_MS", 10*time.Second)
+	adobeSubmitMinInterval = envPositiveMillis("ADOBE_SUBMIT_INTERVAL_MS", 2*time.Second)
+	adobeSubmitMaxInterval = envPositiveMillis("ADOBE_SUBMIT_INTERVAL_MAX_MS", 30*time.Second)
 	// A lane trips its breaker after this many consecutive overload responses and
 	// stays open for the cooldown, so a provider-wide outage fails fast instead of
 	// spending one account and one paced submit slot per doomed retry.
-	submitBreakerThreshold = envPositiveInt("ADOBE_SUBMIT_BREAKER_FAILS", 4)
-	submitBreakerCooldown  = envPositiveMillis("ADOBE_SUBMIT_BREAKER_COOLDOWN_MS", 20*time.Second)
+	submitBreakerThreshold = envPositiveInt("ADOBE_SUBMIT_BREAKER_FAILS", 1)
+	submitBreakerCooldown  = envPositiveMillis("ADOBE_SUBMIT_BREAKER_COOLDOWN_MS", 5*time.Minute)
 )
 
 func envPositiveInt(key string, def int) int {
@@ -822,9 +822,10 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 		return respBody, "", fmt.Errorf("%w (submit %d %s: %s)", ErrAuth, resp.StatusCode, resp.Header.Get("x-access-error"), clip(respBody, 300))
 	}
 	// "system under load" / timeout_error = adobe rate-limit/overload (can come on a
-	// non-5xx) — treat as temporary so the pool retries instead of failing.
+	// non-5xx). This is endpoint/egress-wide rather than account-specific, so
+	// preserve ErrUpstreamBusy and stop account failover immediately.
 	if b := string(respBody); strings.Contains(b, "system under load") || strings.Contains(b, "timeout_error") {
-		return respBody, "", ErrTemporaryUpstream
+		return respBody, "", fmt.Errorf("%w: adobe submit: %s", ErrUpstreamBusy, clip(respBody, 300))
 	}
 	if rejectErr := contentRejectionError(resp.StatusCode, string(respBody)); rejectErr != nil {
 		return respBody, "", rejectErr
@@ -1026,7 +1027,7 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 	// "system under load" / timeout_error = adobe overload — treat as a temporary
 	// error so the tempFailover policy moves to the next account (same as the image path).
 	if b := string(respBody); strings.Contains(b, "system under load") || strings.Contains(b, "timeout_error") {
-		return respBody, "", ErrTemporaryUpstream
+		return respBody, "", fmt.Errorf("%w: adobe submit: %s", ErrUpstreamBusy, clip(respBody, 300))
 	}
 	if resp.StatusCode != 200 {
 		return respBody, "", fmt.Errorf("video submit rejected: %d %s", resp.StatusCode, clip(respBody, 300))

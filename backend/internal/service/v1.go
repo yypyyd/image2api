@@ -2364,7 +2364,7 @@ const maxTempFailoverAccounts = 3
 // degrades into slower responses rather than user-visible errors. The window
 // bounds the total wait; the backoff paces retries across breaker cooldowns.
 const (
-	tempRetryWindow         = 120 * time.Second
+	tempRetryWindow         = 300 * time.Second
 	tempRetryInitialBackoff = 3 * time.Second
 	tempRetryMaxBackoff     = 12 * time.Second
 )
@@ -2441,14 +2441,11 @@ func (s *V1Service) runPoolWithFailover(ctx context.Context, eventID, pool strin
 			}
 			lastErr = err
 			lastTempDead = tempDead
-			// An upstream-wide busy signal (the provider's circuit is open) means every
-			// account fails identically — stop burning the pool, wait out the
-			// cooldown inside the request, then retry.
+			// An upstream-wide busy signal means every account behind this service's
+			// shared egress will fail identically. Surface it immediately: waiting and
+			// retrying inside the request only prolongs downstream connections and
+			// keeps Adobe's egress-level throttle hot.
 			if isUpstreamBusy(err) {
-				if waitTempRetry() {
-					retrying = true
-					break
-				}
 				return nil, lastErr
 			}
 			if tempDead {

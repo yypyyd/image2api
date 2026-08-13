@@ -3,6 +3,7 @@ package adobe
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -88,6 +89,13 @@ func TestSubmitBreakerTripsAndFailsFast(t *testing.T) {
 		t.Fatalf("acquireSubmit() after recovery = %v, want nil", err)
 	} else {
 		release()
+	}
+}
+
+func TestAdobeErrClassTreatsSubmitOverloadAsBusy(t *testing.T) {
+	err := fmt.Errorf("%w: adobe submit: system under load", ErrUpstreamBusy)
+	if !errors.Is(err, ErrUpstreamBusy) || !errors.Is(err, ErrTemporaryUpstream) {
+		t.Fatalf("submit overload = %v, want busy and temporary identities", err)
 	}
 }
 
