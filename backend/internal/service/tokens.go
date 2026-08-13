@@ -2,23 +2,24 @@ package service
 
 import (
 	"context"
-	"sync"
-	"sync/atomic"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"backend/internal/model"
 	"backend/internal/provider/adobe"
 	"backend/internal/provider/chatgpt"
+	"backend/internal/provider/custom"
+	"backend/internal/provider/grok"
 	"backend/internal/provider/imagine"
 	"backend/internal/provider/krea"
 	"backend/internal/provider/leonardo"
-	"backend/internal/provider/grok"
 	"backend/internal/provider/runway"
 	"backend/internal/repo"
 
@@ -49,6 +50,7 @@ type TokenService struct {
 	krea     *krea.Client
 	imagine  *imagine.Client
 	grok     *grok.Client
+	custom   *custom.Client
 	// sem caps concurrent background pending-probe goroutines (mirrors Python's
 	// 10-worker _quota_check_pool) so a big paste doesn't fire hundreds of
 	// simultaneous upstream requests.
@@ -58,7 +60,7 @@ type TokenService struct {
 	kreaActivating atomic.Bool
 }
 
-func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileRepository, events *repo.EventRepository, settings *repo.SiteSettingRepository, adobeClient *adobe.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, leonardoClient *leonardo.Client, kreaClient *krea.Client, imagineClient *imagine.Client, grokClient *grok.Client) *TokenService {
+func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileRepository, events *repo.EventRepository, settings *repo.SiteSettingRepository, adobeClient *adobe.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, leonardoClient *leonardo.Client, kreaClient *krea.Client, imagineClient *imagine.Client, grokClient *grok.Client, customClient *custom.Client) *TokenService {
 	return &TokenService{
 		tokens:   tokens,
 		refresh:  refresh,
@@ -71,21 +73,32 @@ func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileR
 		krea:     kreaClient,
 		imagine:  imagineClient,
 		grok:     grokClient,
+		custom:   customClient,
 		sem:      make(chan struct{}, 10),
 	}
 }
 
-// applyProxy snapshots the configured outbound proxy onto a provider client right
-// before an upstream call. Adobe/ChatGPT/Runway/Leonardo all egress through it;
-// without this the import/quota probes would dial from the bare server IP (which
-// Leonardo rate-limits with a 429).
+// applyProxy snapshots the single site-wide egress route onto every provider
+// client immediately before account import, refresh, quota and maintenance
+// calls. Empty proxy.url explicitly clears prior proxy state and means direct.
 func (s *TokenService) applyProxy(ctx context.Context) {
-	if s.settings == nil {
-		return
+	proxy := ""
+	if s.settings != nil {
+		var err error
+		proxy, err = s.settings.GetValue(ctx, "proxy.url")
+		if err != nil {
+			// Preserve the last known route on a transient settings-store error.
+			return
+		}
 	}
-	proxy, err := s.settings.GetValue(ctx, "proxy.url")
-	if err != nil {
-		return
+	if s.adobe != nil {
+		s.adobe.SetProxy(proxy)
+	}
+	if s.chatgpt != nil {
+		s.chatgpt.SetProxy(proxy)
+	}
+	if s.runway != nil {
+		s.runway.SetProxy(proxy)
 	}
 	if s.leonardo != nil {
 		s.leonardo.SetProxy(proxy)
@@ -98,6 +111,9 @@ func (s *TokenService) applyProxy(ctx context.Context) {
 	}
 	if s.grok != nil {
 		s.grok.SetProxy(proxy)
+	}
+	if s.custom != nil {
+		s.custom.SetProxy(proxy)
 	}
 }
 
@@ -220,6 +236,7 @@ func (s *TokenService) Add(ctx context.Context, pool, value, tokenID string) (*m
 }
 
 func (s *TokenService) ImportChatGPTToken(ctx context.Context, accessToken, tokenID string) (*model.TokenAccount, error) {
+	s.applyProxy(ctx)
 	accessToken = strings.TrimSpace(accessToken)
 	if accessToken == "" {
 		return nil, errors.New("access_token required")
@@ -279,6 +296,7 @@ func (s *TokenService) ImportChatGPTToken(ctx context.Context, accessToken, toke
 // (= the JWT "id" claim) is stashed in meta["team_id"] so generation can send it
 // as x-runway-workspace later. Recovery time == the JWT expiry.
 func (s *TokenService) ImportRunwayToken(ctx context.Context, accessToken, tokenID string) (*model.TokenAccount, error) {
+	s.applyProxy(ctx)
 	accessToken = strings.TrimSpace(strings.TrimPrefix(accessToken, "Bearer "))
 	if accessToken == "" {
 		return nil, errors.New("access_token required")
@@ -334,6 +352,7 @@ func (s *TokenService) ImportRunwayToken(ctx context.Context, accessToken, token
 // so there's no refresh profile. Lands a pending row, then the worker validates
 // the cookie + hydrates email/quota off-thread.
 func (s *TokenService) ImportLeonardoCookie(ctx context.Context, cookie, tokenID string) (*model.TokenAccount, error) {
+	s.applyProxy(ctx)
 	cookie = cleanAdobeCookie(cookie) // same paste-cleanup (JSON / "Cookie:" prefix)
 	if cookie == "" {
 		return nil, errors.New("cookie required")
@@ -430,6 +449,7 @@ func (s *TokenService) checkPendingLeonardo(tokenID, cookie string) {
 // ImportKreaCookie imports a Krea account. Like Leonardo the stored credential
 // IS the cookie (Supabase session); quota/generation forward it directly.
 func (s *TokenService) ImportKreaCookie(ctx context.Context, cookie, tokenID string) (*model.TokenAccount, error) {
+	s.applyProxy(ctx)
 	cookie = cleanAdobeCookie(cookie) // same paste-cleanup (JSON / "Cookie:" prefix)
 	if cookie == "" {
 		return nil, errors.New("cookie required")
@@ -526,6 +546,7 @@ func (s *TokenService) checkPendingKrea(tokenID, cookie string) {
 // JSON {"token","refreshToken"}; quota/generation forward it (refreshing the
 // access token from the refreshToken when expired).
 func (s *TokenService) ImportImagineToken(ctx context.Context, cred, tokenID string) (*model.TokenAccount, error) {
+	s.applyProxy(ctx)
 	cred = strings.TrimSpace(cred)
 	if cred == "" {
 		return nil, errors.New("credential required")
@@ -618,6 +639,7 @@ func (s *TokenService) checkPendingImagine(tokenID, cred string) {
 }
 
 func (s *TokenService) ImportAdobeCookie(ctx context.Context, cookie, tokenID string) (*model.TokenAccount, *model.RefreshProfile, error) {
+	s.applyProxy(ctx)
 	cookie = cleanAdobeCookie(cookie)
 	if cookie == "" {
 		return nil, nil, errors.New("cookie required")
@@ -684,6 +706,7 @@ func (s *TokenService) checkPendingAdobe(tokenID, cookie string) {
 	defer func() { <-s.sem }()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
+	s.applyProxy(ctx)
 
 	if s.adobe == nil {
 		s.finishPending(ctx, "adobe", tokenID, "disabled", true, nil)
@@ -756,6 +779,7 @@ func (s *TokenService) checkPendingChatGPT(tokenID, accessToken string) {
 	defer func() { <-s.sem }()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
+	s.applyProxy(ctx)
 	s.probeAndFinishChatGPT(ctx, tokenID, accessToken)
 }
 
@@ -777,9 +801,8 @@ func (s *TokenService) probeAndFinishChatGPT(ctx context.Context, tokenID, acces
 	var data map[string]any
 	var err error
 	for attempt := 0; attempt < 3; attempt++ {
-		// This diagnostic read must not inherit CHATGPT_PROXY_URL: the dedicated
-		// proxy may be region-bound and a challenge/401 there is not proof that the
-		// JWT is dead. Generation keeps its configured proxy and handles auth at use.
+		// This diagnostic read follows the same global egress as generation. A
+		// challenge/401 is still not treated as definitive proof that the JWT died.
 		data, err = s.chatgpt.FetchImageQuotaDirect(ctx, accessToken)
 		if err != nil {
 			break
@@ -938,6 +961,7 @@ func (s *TokenService) checkPendingRunway(tokenID, accessToken string) {
 	defer func() { <-s.sem }()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
+	s.applyProxy(ctx)
 
 	if s.runway == nil {
 		s.finishPending(ctx, "runway", tokenID, "active", false, nil)
@@ -972,6 +996,7 @@ func (s *TokenService) checkPendingRunway(tokenID, accessToken string) {
 // Identity is the session id (grok sso has no email/exp claim). No refresh: a
 // dead session just dies (失效就失效).
 func (s *TokenService) ImportGrokToken(ctx context.Context, ssoToken, tokenID string) (*model.TokenAccount, error) {
+	s.applyProxy(ctx)
 	ssoToken = strings.TrimSpace(strings.TrimPrefix(ssoToken, "Bearer "))
 	ssoToken = strings.TrimPrefix(ssoToken, "sso=")
 	if ssoToken == "" {
@@ -1008,7 +1033,6 @@ func (s *TokenService) ImportGrokToken(ctx context.Context, ssoToken, tokenID st
 	go s.checkPendingGrok(tokenID, ssoToken)
 	return item, nil
 }
-
 
 func (s *TokenService) checkPendingGrok(tokenID, ssoToken string) {
 	defer func() {
@@ -1121,7 +1145,8 @@ func (s *TokenService) RefreshGrokLiveness(ctx context.Context) {
 // ImportCustomAccount adds an upstream as a custom account: base_url + key, the
 // csv list of model ids it serves (empty = all), plus optional weight and
 // per-account concurrency. No probe — the account goes active immediately and is
-// matched to custom models by id at generation time. Calls go direct (no proxy).
+// matched to custom models by id at generation time. Calls follow the global
+// proxy setting, like every other provider.
 func (s *TokenService) ImportCustomAccount(ctx context.Context, baseURL, apiKey, models, name string, weight, concurrency int, tokenID string) (*model.TokenAccount, error) {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	apiKey = strings.TrimSpace(apiKey)
@@ -1326,6 +1351,7 @@ func (s *TokenService) Accounts(ctx context.Context) ([]map[string]any, error) {
 }
 
 func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]any, error) {
+	s.applyProxy(ctx)
 	item, err := s.tokens.Get(ctx, normalizePool(pool), id)
 	if err != nil {
 		return nil, err
@@ -1683,6 +1709,7 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 }
 
 func (s *TokenService) Email(ctx context.Context, pool, id string) (map[string]any, error) {
+	s.applyProxy(ctx)
 	item, err := s.tokens.Get(ctx, normalizePool(pool), id)
 	if err != nil {
 		return nil, err
@@ -1788,29 +1815,29 @@ func accountRow(item model.TokenAccount, inFlight int64) map[string]any {
 	hasQuota := typeLabel == "openai" || typeLabel == "adobe" || typeLabel == "runway" || typeLabel == "leonardo" || typeLabel == "krea" || typeLabel == "imagine" || typeLabel == "grok"
 	paidPlan, _ := jsonMapBool(item.Meta, "paid_account")
 	return map[string]any{
-		"id":                item.ID,
-		"pool":              item.Pool,
-		"type":              typeLabel,
-		"email":             emptyToNil(email),
-		"team_id":           emptyToNil(teamID),
-		"remaining":         valueOrNil(hasQuota && hasRemaining, remaining),
-		"quota_total":       valueOrNil(hasQuota && hasTotal, total),
-		"reset_after":       emptyToNil(item.CachedQuotaResetAfter),
-		"quota_cached_at":   valueOrNil(quotaAt != 0, quotaAt),
-		"created_at":        unixOrNil(item.AddedAt),
-		"last_used_at":      unixOrNil(item.LastUsedAt),
-		"expires_at":        jwtExpiryUnix(item.Value),
-		"in_flight":         inFlight,
-		"success_total":     item.SuccessTotal,
-		"fail_total":        item.FailTotal,
-		"fails_streak":      item.Fails,
+		"id":              item.ID,
+		"pool":            item.Pool,
+		"type":            typeLabel,
+		"email":           emptyToNil(email),
+		"team_id":         emptyToNil(teamID),
+		"remaining":       valueOrNil(hasQuota && hasRemaining, remaining),
+		"quota_total":     valueOrNil(hasQuota && hasTotal, total),
+		"reset_after":     emptyToNil(item.CachedQuotaResetAfter),
+		"quota_cached_at": valueOrNil(quotaAt != 0, quotaAt),
+		"created_at":      unixOrNil(item.AddedAt),
+		"last_used_at":    unixOrNil(item.LastUsedAt),
+		"expires_at":      jwtExpiryUnix(item.Value),
+		"in_flight":       inFlight,
+		"success_total":   item.SuccessTotal,
+		"fail_total":      item.FailTotal,
+		"fails_streak":    item.Fails,
 		// Provider-side failures (overload / 5xx) — kept out of fail_total so an
 		// upstream outage doesn't make every account look broken.
-		"upstream_fails":    item.UpstreamFails,
-		"status":            item.Status,
-		"dead":              item.Dead,
-		"image_limited":     item.ImageLimited,
-		"video_limited":     item.VideoLimited,
+		"upstream_fails": item.UpstreamFails,
+		"status":         item.Status,
+		"dead":           item.Dead,
+		"image_limited":  item.ImageLimited,
+		"video_limited":  item.VideoLimited,
 		// Capability state is deliberately separate from the shared media-credit
 		// balance. Grok has independent chat/image/video product surfaces; callers
 		// must not infer chat availability from the media quota number.
@@ -1822,10 +1849,10 @@ func accountRow(item model.TokenAccount, inFlight int64) map[string]any {
 		"concurrency":       item.Concurrency,
 		// Leonardo 积分号 (paid credits, monthly renewal) vs 普通号 (daily free tokens)
 		// — surfaced so the accounts table can label them; nil for other providers.
-		"plan":              emptyToNil(strings.TrimSpace(stringValue(item.Meta["plan"]))),
-		"paid_plan":         paidPlan,
-		"base_url":          emptyToNil(strings.TrimSpace(stringValue(item.Meta["base_url"]))),
-		"models":            strings.TrimSpace(stringValue(item.Meta["models"])),
+		"plan":      emptyToNil(strings.TrimSpace(stringValue(item.Meta["plan"]))),
+		"paid_plan": paidPlan,
+		"base_url":  emptyToNil(strings.TrimSpace(stringValue(item.Meta["base_url"]))),
+		"models":    strings.TrimSpace(stringValue(item.Meta["models"])),
 	}
 }
 

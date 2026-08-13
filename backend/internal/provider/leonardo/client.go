@@ -39,7 +39,8 @@ var (
 )
 
 type Client struct {
-	proxy string
+	proxyMu sync.RWMutex
+	proxy   string
 	// sessions caches the short-lived access token per cookie so we don't hit
 	// /api/auth/get-session on every call — Leonardo rate-limits that endpoint
 	// (429) hard, so re-using the ~1h JWT is essential.
@@ -52,7 +53,15 @@ func NewClient(proxy string) *Client {
 }
 
 func (c *Client) SetProxy(proxy string) {
+	c.proxyMu.Lock()
 	c.proxy = strings.TrimSpace(proxy)
+	c.proxyMu.Unlock()
+}
+
+func (c *Client) proxyValue() string {
+	c.proxyMu.RLock()
+	defer c.proxyMu.RUnlock()
+	return c.proxy
 }
 
 // IsLeonardoCookie reports whether a pasted credential is a Leonardo cookie: it
@@ -276,8 +285,8 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, cookie string) (map[st
 }
 
 // graphql runs a GraphQL call through the proxy. graphqlP lets callers pick the
-// egress: only the generate submit uses the proxy; reference-image upload and
-// polling run direct (local IP).
+// Egress is uniform: reference upload, submit and polling all follow the global
+// proxy when configured.
 func (c *Client) graphql(ctx context.Context, accessToken string, payload []byte) ([]byte, int, error) {
 	return c.graphqlP(ctx, accessToken, payload, true)
 }
@@ -334,8 +343,8 @@ func unknownBalance(reason string) map[string]any {
 
 func (c *Client) newTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
 
-// newDirectTLSClient egresses on the local IP (never the proxy). Used for
-// reference-image upload, polling and result download.
+// newDirectTLSClient preserves historical call sites; the global proxy still
+// applies whenever configured.
 func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(false) }
 
 func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
@@ -346,8 +355,8 @@ func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
 		tlsclient.WithTimeoutSeconds(60),
 		tlsclient.WithClientProfile(profiles.Chrome_120),
 	}
-	if useProxy && c.proxy != "" {
-		options = append(options, tlsclient.WithProxyUrl(c.proxy))
+	if proxy := c.proxyValue(); proxy != "" {
+		options = append(options, tlsclient.WithProxyUrl(proxy))
 	}
 	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
 }

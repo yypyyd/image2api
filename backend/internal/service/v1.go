@@ -93,6 +93,8 @@ type V1Service struct {
 	grok     *grok.Client
 	custom   *custom.Client
 	store    *storage.Client
+	proxyMu  sync.RWMutex
+	proxy    string
 	// refresh re-mints an Adobe access token from its cookie when a request hits a
 	// 401 mid-flight (set via SetRefresh — wired after construction to avoid an
 	// init cycle). nil for deployments without cookie refresh.
@@ -353,7 +355,7 @@ type MediaReference struct {
 }
 
 func NewV1Service(cfg *config.Config, models *repo.ModelRepository, users *repo.UserRepository, events *repo.EventRepository, tokens *repo.TokenRepository, settings *repo.SiteSettingRepository, cgroups *repo.ConcurrencyGroupRepository, conc *ConcurrencyService, adobeClient *adobe.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, leonardoClient *leonardo.Client, kreaClient *krea.Client, imagineClient *imagine.Client, grokClient *grok.Client, customClient *custom.Client, store *storage.Client) *V1Service {
-	return &V1Service{
+	service := &V1Service{
 		cfg:      cfg,
 		models:   models,
 		users:    users,
@@ -373,6 +375,12 @@ func NewV1Service(cfg *config.Config, models *repo.ModelRepository, users *repo.
 		store:    store,
 		inflight: &InflightRegistry{},
 	}
+	if settings != nil {
+		if proxy, err := settings.GetValue(context.Background(), "proxy.url"); err == nil {
+			service.proxy = strings.TrimSpace(proxy)
+		}
+	}
+	return service
 }
 
 // Inflight exposes the registry so the maintenance sweep can cancel a stuck
@@ -386,6 +394,79 @@ func (s *V1Service) SetRefresh(r *RefreshProfileService) { s.refresh = r }
 
 // SetBannedWords wires the prompt blocklist in after construction.
 func (s *V1Service) SetBannedWords(r *repo.BannedWordRepository) { s.banned = r }
+
+// applyGlobalProxy snapshots the administrator's single outbound route onto
+// every provider. A missing/empty value explicitly means local direct egress;
+// provider-specific environment proxies never override this runtime setting.
+func (s *V1Service) applyGlobalProxy(ctx context.Context) string {
+	proxy := ""
+	if s.settings != nil {
+		var err error
+		proxy, err = s.settings.GetValue(ctx, "proxy.url")
+		if err != nil {
+			// A transient settings-store failure is not equivalent to an
+			// administrator clearing the proxy. Keep the last known route.
+			s.proxyMu.RLock()
+			proxy = s.proxy
+			s.proxyMu.RUnlock()
+			return s.setProviderProxy(proxy)
+		}
+	}
+	proxy = strings.TrimSpace(proxy)
+	s.proxyMu.Lock()
+	s.proxy = proxy
+	s.proxyMu.Unlock()
+	return s.setProviderProxy(proxy)
+}
+
+func (s *V1Service) setProviderProxy(proxy string) string {
+	if s.adobe != nil {
+		s.adobe.SetProxy(proxy)
+	}
+	if s.chatgpt != nil {
+		s.chatgpt.SetProxy(proxy)
+	}
+	if s.runway != nil {
+		s.runway.SetProxy(proxy)
+	}
+	if s.leonardo != nil {
+		s.leonardo.SetProxy(proxy)
+	}
+	if s.krea != nil {
+		s.krea.SetProxy(proxy)
+	}
+	if s.imagine != nil {
+		s.imagine.SetProxy(proxy)
+	}
+	if s.grok != nil {
+		s.grok.SetProxy(proxy)
+	}
+	if s.custom != nil {
+		s.custom.SetProxy(proxy)
+	}
+	return strings.TrimSpace(proxy)
+}
+
+func globalProxyHTTPClient(proxyRaw string, timeout time.Duration) (*http.Client, error) {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Explicitly disable ProxyFromEnvironment. Only the persisted administrator
+	// setting controls account egress; empty means local direct.
+	transport.Proxy = nil
+	proxyRaw = strings.TrimSpace(proxyRaw)
+	if proxyRaw != "" {
+		proxyURL, err := url.Parse(proxyRaw)
+		if err != nil || proxyURL.Host == "" {
+			return nil, errors.New("invalid global proxy configuration")
+		}
+		switch strings.ToLower(proxyURL.Scheme) {
+		case "http", "https", "socks5", "socks5h":
+		default:
+			return nil, errors.New("unsupported global proxy scheme")
+		}
+		transport.Proxy = http.ProxyURL(proxyURL)
+	}
+	return &http.Client{Transport: transport, Timeout: timeout}, nil
+}
 
 // checkBannedPrompt rejects the request when the prompt contains any banned
 // word (case-insensitive substring). A hit bumps the word's counter and the
@@ -626,6 +707,7 @@ func (s *V1Service) PrepareAdminChatTest(ctx context.Context, modelName, prompt,
 }
 
 func (s *V1Service) prepareChatCompletion(ctx context.Context, principal *APIPrincipal, payload []byte, accountID, source string) (*V1ChatResponse, error) {
+	s.applyGlobalProxy(ctx)
 	if source == "" {
 		source = "v1"
 	}
@@ -701,11 +783,7 @@ func (s *V1Service) prepareChatCompletion(ctx context.Context, principal *APIPri
 	if len(active) == 0 || (pool == "custom" && s.custom == nil) || (pool == "chatgpt" && s.chatgpt == nil) || (pool == "grok" && s.grok == nil) {
 		return nil, ErrNoProviderAccount
 	}
-	if pool == "grok" && s.settings != nil {
-		if proxy, err := s.settings.GetValue(ctx, "proxy.url"); err == nil {
-			s.grok.SetProxy(proxy)
-		}
-	}
+	s.applyGlobalProxy(ctx)
 
 	bookCtx := context.WithoutCancel(ctx)
 	userSlot := randomUpper(12)
@@ -1060,6 +1138,7 @@ func (s *V1Service) prepareAdminTestImage(ctx context.Context, principal *APIPri
 }
 
 func (s *V1Service) prepareImageExecution(ctx context.Context, principal *APIPrincipal, in V1ImageRequest, source string, charge bool) (map[string]any, error) {
+	s.applyGlobalProxy(ctx)
 	// Detach the whole execution from the request lifecycle. The frontend tracks
 	// progress by polling /jobs/mine, so a client disconnect — or an nginx/CDN
 	// gateway timeout on the slow synchronous response — must NOT cancel an
@@ -1503,6 +1582,7 @@ func (s *V1Service) prepareAdminTestVideo(ctx context.Context, principal *APIPri
 }
 
 func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPrincipal, in V1VideoRequest, source string, charge bool) (map[string]any, error) {
+	s.applyGlobalProxy(ctx)
 	// Detach from the request lifecycle — see prepareImageExecution. `ctx`
 	// (WithoutCancel) carries all bookkeeping; `genCtx` is the cancellable work
 	// context (12-min backstop — video polls up to 10 min — and registered so the
@@ -1719,6 +1799,7 @@ func (s *V1Service) StartVideoJob(ctx context.Context, principal *APIPrincipal, 
 // runVideoJob renders the clip in the background, capturing the upstream URL
 // (downloadResult=false → no bytes, no RustFS) and storing it on the event.
 func (s *V1Service) runVideoJob(ctx context.Context, principal *APIPrincipal, in V1VideoRequest, modelItem *model.ModelConfig, eventID, aspectRatio, resolution, duration string, price float64) {
+	s.applyGlobalProxy(ctx)
 	genCtx, cancel := context.WithTimeout(ctx, 12*time.Minute)
 	defer cancel()
 	s.inflight.Add(eventID, cancel)
@@ -1793,6 +1874,7 @@ func (s *V1Service) VideoJob(ctx context.Context, principal *APIPrincipal, id st
 // OpenVideoContent streams a completed job's video by proxying the stored
 // upstream URL (downloaded on demand — never persisted).
 func (s *V1Service) OpenVideoContent(ctx context.Context, principal *APIPrincipal, id string) (io.ReadCloser, string, error) {
+	proxy := s.applyGlobalProxy(ctx)
 	ev, err := s.videoEventForUser(ctx, principal, id)
 	if err != nil {
 		return nil, "", err
@@ -1820,9 +1902,13 @@ func (s *V1Service) OpenVideoContent(ctx context.Context, principal *APIPrincipa
 	if err != nil {
 		return nil, "", err
 	}
-	resp, err := (&http.Client{Timeout: 5 * time.Minute}).Do(req)
+	client, err := globalProxyHTTPClient(proxy, 5*time.Minute)
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: fetch upstream video: %v", ErrProviderTemporary, err)
+		return nil, "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: fetch upstream video failed", ErrProviderTemporary)
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
@@ -1842,6 +1928,7 @@ func (s *V1Service) OpenVideoContent(ctx context.Context, principal *APIPrincipa
 // an API key or web session: this is the directly-downloadable URL returned by
 // the image API, and the event ID is a random opaque identifier.
 func (s *V1Service) OpenImageContent(ctx context.Context, principal *APIPrincipal, id string) (io.ReadCloser, string, error) {
+	proxy := s.applyGlobalProxy(ctx)
 	ev, err := s.events.GetByID(ctx, strings.TrimSpace(id))
 	if err != nil {
 		return nil, "", err
@@ -1900,9 +1987,13 @@ func (s *V1Service) OpenImageContent(ctx context.Context, principal *APIPrincipa
 	if err != nil {
 		return nil, "", err
 	}
-	resp, err := (&http.Client{Timeout: 5 * time.Minute}).Do(req)
+	client, err := globalProxyHTTPClient(proxy, 5*time.Minute)
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: fetch upstream image: %v", ErrProviderTemporary, err)
+		return nil, "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: fetch upstream image failed", ErrProviderTemporary)
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
@@ -2354,15 +2445,15 @@ const providerAccountQueueWait = 90 * time.Second
 const providerAccountQueuePoll = 300 * time.Millisecond
 
 // Bound temporary failover so a shared-egress outage cannot fan one downstream
-// request across the entire account pool. Adobe submits are also serialized by
-// the provider client because changing accounts does not change that egress.
+// request across the entire account pool. This is retry/failover accounting,
+// not a submit rate limiter or circuit breaker.
 const maxTempFailoverAccounts = 3
 
-// Temporary upstream errors (overload / open breaker) are absorbed by waiting
+// Temporary upstream errors (including provider-side overload) are absorbed by waiting
 // and retrying inside the request instead of failing it: the synchronous
 // response heartbeats keep the downstream connection alive, so a queued burst
 // degrades into slower responses rather than user-visible errors. The window
-// bounds the total wait; the backoff paces retries across breaker cooldowns.
+// bounds the total wait; the backoff only separates retries after failures.
 const (
 	tempRetryWindow         = 300 * time.Second
 	tempRetryInitialBackoff = 3 * time.Second
@@ -2441,13 +2532,6 @@ func (s *V1Service) runPoolWithFailover(ctx context.Context, eventID, pool strin
 			}
 			lastErr = err
 			lastTempDead = tempDead
-			// An upstream-wide busy signal means every account behind this service's
-			// shared egress will fail identically. Surface it immediately: waiting and
-			// retrying inside the request only prolongs downstream connections and
-			// keeps Adobe's egress-level throttle hot.
-			if isUpstreamBusy(err) {
-				return nil, lastErr
-			}
 			if tempDead {
 				// temp-failover policy: this account hit a temporary upstream error.
 				// Cap how many accounts one burst may burn, then wait and retry
@@ -2568,13 +2652,6 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 	}
 }
 
-// isUpstreamBusy reports a provider-level "everything is failing" signal, so the
-// scheduler can stop failing over instead of retrying the same outage on
-// account after account.
-func isUpstreamBusy(err error) bool {
-	return errors.Is(err, adobe.ErrUpstreamBusy)
-}
-
 func adobeErrClass(e error) (bool, bool, bool, bool) {
 	return errors.Is(e, adobe.ErrAuth), errors.Is(e, adobe.ErrQuotaExhausted), errors.Is(e, adobe.ErrTemporaryUpstream), errors.Is(e, adobe.ErrDeadUpstream)
 }
@@ -2586,6 +2663,7 @@ func (s *V1Service) generateAdobeImage(ctx context.Context, eventID string, mode
 	if s.adobe == nil {
 		return nil, "", errors.New("adobe client not configured")
 	}
+	s.applyGlobalProxy(ctx)
 
 	items, err := s.tokens.ListByPool(ctx, "adobe")
 	if err != nil {
@@ -2641,6 +2719,7 @@ func (s *V1Service) generateAdobeVideo(ctx context.Context, eventID string, mode
 	if s.adobe == nil {
 		return nil, "", errors.New("adobe client not configured")
 	}
+	s.applyGlobalProxy(ctx)
 
 	items, err := s.tokens.ListByPool(ctx, "adobe")
 	if err != nil {
@@ -2892,13 +2971,14 @@ func (s *V1Service) effectiveProvider(ctx context.Context, modelItem *model.Mode
 }
 
 // generateCustomImage forwards an image generation to an OpenAI-compatible
-// upstream. The upstream (custom account) is matched by model id; calls go direct
-// (no proxy). Billing uses the local model price.
+// upstream. The upstream (custom account) is matched by model id and follows
+// the configured global proxy. Billing uses the local model price.
 func (s *V1Service) generateCustomImage(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1ImageRequest, aspectRatio, resolution string, noStore bool) ([]byte, string, error) {
 	urlOnly := noStore
 	if s.custom == nil {
 		return nil, "", errors.New("custom client not configured")
 	}
+	s.applyGlobalProxy(ctx)
 	refs, err := decodeReferenceImages(in.ReferenceImages, max(1, modelItem.MaxReferenceImages))
 	if err != nil {
 		return nil, "", err
@@ -2968,11 +3048,13 @@ func (s *V1Service) generateCustomImage(ctx context.Context, eventID string, mod
 }
 
 // generateCustomVideo forwards a video generation to an OpenAI-compatible
-// (Sora-style) upstream, matched by model id. No proxy; local-price billing.
+// (Sora-style) upstream, matched by model id and the configured global proxy;
+// local-price billing.
 func (s *V1Service) generateCustomVideo(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1VideoRequest, aspectRatio, resolution string, durationSeconds int, downloadResult bool) ([]byte, string, error) {
 	if s.custom == nil {
 		return nil, "", errors.New("custom client not configured")
 	}
+	s.applyGlobalProxy(ctx)
 	active, err := s.customActive(ctx, modelItem.ID)
 	if err != nil {
 		return nil, "", err

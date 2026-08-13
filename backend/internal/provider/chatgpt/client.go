@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	http "github.com/bogdanfinn/fhttp"
@@ -37,10 +38,10 @@ var (
 )
 
 type Client struct {
-	proxy          string
-	dedicatedProxy string
-	deviceID       string
-	sessionID      string
+	proxyMu   sync.RWMutex
+	proxy     string
+	deviceID  string
+	sessionID string
 }
 
 type fileEntry struct {
@@ -61,21 +62,22 @@ type uploadedReference struct {
 func NewClient(proxy string) *Client {
 	proxy = strings.TrimSpace(proxy)
 	return &Client{
-		proxy:          proxy,
-		dedicatedProxy: proxy,
-		deviceID:       newUUID(),
-		sessionID:      newUUID(),
+		proxy:     proxy,
+		deviceID:  newUUID(),
+		sessionID: newUUID(),
 	}
 }
 
 func (c *Client) SetProxy(proxy string) {
-	// A provider-specific environment proxy is authoritative. The shared
-	// site-wide proxy remains the fallback only when no dedicated route exists.
-	if c.dedicatedProxy != "" {
-		c.proxy = c.dedicatedProxy
-		return
-	}
+	c.proxyMu.Lock()
 	c.proxy = strings.TrimSpace(proxy)
+	c.proxyMu.Unlock()
+}
+
+func (c *Client) proxyValue() string {
+	c.proxyMu.RLock()
+	defer c.proxyMu.RUnlock()
+	return c.proxy
 }
 
 // GenerateText submits a new ChatGPT Web conversation and returns the final
@@ -373,7 +375,7 @@ func applyAssistantEvent(raw []byte, current string, active bool) (string, bool,
 }
 
 func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, aspectRatio, resolution string, refs [][]byte, downloadResult bool) ([]byte, map[string]any, error) {
-	// With CHATGPT_PROXY_URL configured, every phase uses the same egress. This
+	// With the global proxy configured, every phase uses the same egress. This
 	// prevents Cloudflare from seeing an impossible mid-session region change.
 	session, err := c.newDirectSession(accessToken)
 	if err != nil {
@@ -503,11 +505,10 @@ func (c *Client) FetchImageQuota(ctx context.Context, accessToken string) (map[s
 	return c.fetchImageQuota(ctx, session, accessToken)
 }
 
-// FetchImageQuotaDirect performs the best-effort quota read from the gateway's
-// own egress, deliberately bypassing the provider's dedicated generation proxy.
-// A proxy/region challenge must never be mistaken for a dead imported JWT.
+// FetchImageQuotaDirect preserves the historical API name. Its egress follows
+// the same global proxy setting as every other ChatGPT request.
 func (c *Client) FetchImageQuotaDirect(ctx context.Context, accessToken string) (map[string]any, error) {
-	session, err := c.newSessionP(accessToken, false)
+	session, err := c.newDirectSession(accessToken)
 	if err != nil {
 		return nil, err
 	}
@@ -578,7 +579,7 @@ func (c *Client) newSession(accessToken string) (tlsclient.HttpClient, error) {
 // newDirectSession preserves the historical call sites but uses the dedicated
 // ChatGPT proxy when configured. Without one it remains a direct session.
 func (c *Client) newDirectSession(accessToken string) (tlsclient.HttpClient, error) {
-	return c.newSessionP(accessToken, c.proxy != "")
+	return c.newSessionP(accessToken, c.proxyValue() != "")
 }
 
 func (c *Client) newSessionP(accessToken string, useProxy bool) (tlsclient.HttpClient, error) {
@@ -589,8 +590,8 @@ func (c *Client) newSessionP(accessToken string, useProxy bool) (tlsclient.HttpC
 		tlsclient.WithClientProfile(profiles.Chrome_110),
 		tlsclient.WithRandomTLSExtensionOrder(),
 	}
-	if useProxy && c.proxy != "" {
-		options = append(options, tlsclient.WithProxyUrl(c.proxy))
+	if proxy := c.proxyValue(); proxy != "" {
+		options = append(options, tlsclient.WithProxyUrl(proxy))
 	}
 	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
 	if err != nil {

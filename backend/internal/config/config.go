@@ -27,7 +27,6 @@ type Config struct {
 	RustFSBucket      string
 	RustFSAccessKey   string
 	RustFSSecretKey   string
-	ChatGPTProxyURL   string
 }
 
 func Load() (*Config, error) {
@@ -63,7 +62,6 @@ func Load() (*Config, error) {
 		RustFSBucket:    envString("RUSTFS_BUCKET", ""),
 		RustFSAccessKey: envString("RUSTFS_ACCESS_KEY", ""),
 		RustFSSecretKey: envString("RUSTFS_SECRET_KEY", ""),
-		ChatGPTProxyURL: envString("CHATGPT_PROXY_URL", ""),
 	}
 
 	return cfg, nil

@@ -57,16 +57,15 @@ func TestChatGPT403Classification(t *testing.T) {
 	}
 }
 
-func TestDedicatedChatGPTProxyOverridesSharedProxy(t *testing.T) {
-	client := NewClient("http://dedicated.example:8118")
-	client.SetProxy("http://shared.example:8080")
-	if client.proxy != "http://dedicated.example:8118" {
-		t.Fatalf("proxy = %q, want dedicated proxy", client.proxy)
+func TestGlobalChatGPTProxyReplacesAndClearsPreviousValue(t *testing.T) {
+	client := NewClient("http://legacy.example:8118")
+	client.SetProxy(" http://global.example:8080 ")
+	if client.proxyValue() != "http://global.example:8080" {
+		t.Fatalf("proxy = %q, want global proxy", client.proxyValue())
 	}
-	fallback := NewClient("")
-	fallback.SetProxy("http://shared.example:8080")
-	if fallback.proxy != "http://shared.example:8080" {
-		t.Fatalf("fallback proxy = %q, want shared proxy", fallback.proxy)
+	client.SetProxy("")
+	if client.proxyValue() != "" {
+		t.Fatalf("proxy = %q, want direct egress", client.proxyValue())
 	}
 }
 

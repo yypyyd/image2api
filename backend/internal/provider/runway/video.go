@@ -69,9 +69,8 @@ func (c *Client) GenerateVideo(ctx context.Context, token, teamID, prompt, aspec
 		return nil, nil, errors.New("runway: failed to decode first-frame image")
 	}
 
-	// Only the task-create (generate submit) egresses via the proxy; reference
-	// upload, dataset create, polling and download run on the local IP (matches
-	// the image pipeline).
+	// Every phase follows the global proxy setting: reference upload, dataset
+	// create, submit, polling and download.
 	submitClient, err := c.newTLSClient()
 	if err != nil {
 		return nil, nil, err

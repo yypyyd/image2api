@@ -15,6 +15,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 
 	http "github.com/bogdanfinn/fhttp"
 	tlsclient "github.com/bogdanfinn/tls-client"
@@ -88,22 +89,22 @@ func browserHeaders(token, teamID string) http.Header {
 	traceID := randHex(16)
 	spanID := randHex(8)
 	h := http.Header{
-		"accept":                              {"application/json"},
-		"accept-language":                     {"zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6"},
-		"authorization":                       {"Bearer " + strings.TrimPrefix(token, "Bearer ")},
-		"baggage":                             {"sentry-environment=production,sentry-release=" + buildHash + ",sentry-public_key=8ea832c064ed4bbcb4b8952c02ba119a,sentry-trace_id=" + traceID},
-		"content-type":                        {"application/json"},
-		"origin":                              {origin},
-		"priority":                            {"u=1, i"},
-		"referer":                             {origin + "/"},
-		"sec-ch-ua":                           {secChUA},
-		"sec-ch-ua-mobile":                    {"?0"},
-		"sec-ch-ua-platform":                  {`"Windows"`},
-		"sec-fetch-dest":                      {"empty"},
-		"sec-fetch-mode":                      {"cors"},
-		"sec-fetch-site":                      {"same-site"},
-		"sentry-trace":                        {traceID + "-" + spanID},
-		"user-agent":                          {userAgent},
+		"accept":             {"application/json"},
+		"accept-language":    {"zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6"},
+		"authorization":      {"Bearer " + strings.TrimPrefix(token, "Bearer ")},
+		"baggage":            {"sentry-environment=production,sentry-release=" + buildHash + ",sentry-public_key=8ea832c064ed4bbcb4b8952c02ba119a,sentry-trace_id=" + traceID},
+		"content-type":       {"application/json"},
+		"origin":             {origin},
+		"priority":           {"u=1, i"},
+		"referer":            {origin + "/"},
+		"sec-ch-ua":          {secChUA},
+		"sec-ch-ua-mobile":   {"?0"},
+		"sec-ch-ua-platform": {`"Windows"`},
+		"sec-fetch-dest":     {"empty"},
+		"sec-fetch-mode":     {"cors"},
+		"sec-fetch-site":     {"same-site"},
+		"sentry-trace":       {traceID + "-" + spanID},
+		"user-agent":         {userAgent},
 		// x-runway-* identify this as the real web app to Runway's anti-abuse.
 		// client-id must be persistent per account (see clientIDFromToken);
 		// omitting these is what zeroes an account's credits on first upload.
@@ -153,7 +154,8 @@ var (
 )
 
 type Client struct {
-	proxy string
+	proxyMu sync.RWMutex
+	proxy   string
 }
 
 func NewClient(proxy string) *Client {
@@ -161,7 +163,15 @@ func NewClient(proxy string) *Client {
 }
 
 func (c *Client) SetProxy(proxy string) {
+	c.proxyMu.Lock()
 	c.proxy = strings.TrimSpace(proxy)
+	c.proxyMu.Unlock()
+}
+
+func (c *Client) proxyValue() string {
+	c.proxyMu.RLock()
+	defer c.proxyMu.RUnlock()
+	return c.proxy
 }
 
 // IsRunwayToken reports whether a JWT looks like a Runway access token: a
@@ -289,8 +299,8 @@ func unknownBalance(reason string) map[string]any {
 
 func (c *Client) newTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
 
-// newDirectTLSClient egresses on the local IP (never the proxy). Used for
-// reference-image upload, polling and result download.
+// newDirectTLSClient preserves historical call sites; global proxy egress is
+// still applied by newTLSClientP whenever one is configured.
 func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(false) }
 
 func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
@@ -303,8 +313,8 @@ func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
 		tlsclient.WithClientProfile(profiles.Chrome_133),
 		tlsclient.WithRandomTLSExtensionOrder(),
 	}
-	if useProxy && c.proxy != "" {
-		options = append(options, tlsclient.WithProxyUrl(c.proxy))
+	if proxy := c.proxyValue(); proxy != "" {
+		options = append(options, tlsclient.WithProxyUrl(proxy))
 	}
 	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
 }

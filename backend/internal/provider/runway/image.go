@@ -35,8 +35,8 @@ func (c *Client) GenerateImage(ctx context.Context, token, teamID, modelID, prom
 		imageSize = "1K"
 	}
 
-	// Only the task-create (generate submit) egresses via the proxy; reference
-	// upload, polling and download run on the local IP.
+	// Reference upload, task create, polling and download all follow the global
+	// proxy setting.
 	submitClient, err := c.newTLSClient()
 	if err != nil {
 		return nil, nil, err

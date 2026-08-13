@@ -50,22 +50,26 @@ var (
 )
 
 type Client struct {
-	proxy string
+	proxyMu sync.RWMutex
+	proxy   string
 }
 
 func NewClient(proxy string) *Client {
-	return &Client{proxy: configuredProxy(proxy)}
+	return &Client{proxy: strings.TrimSpace(proxy)}
 }
 
 func (c *Client) SetProxy(proxy string) {
-	c.proxy = configuredProxy(proxy)
+	c.proxyMu.Lock()
+	c.proxy = strings.TrimSpace(proxy)
+	current := c.proxy
+	c.proxyMu.Unlock()
+	SetStatsigProxy(current)
 }
 
-func configuredProxy(proxy string) string {
-	if proxy = strings.TrimSpace(proxy); proxy != "" {
-		return proxy
-	}
-	return strings.TrimSpace(os.Getenv("GROK_PROXY_URL"))
+func (c *Client) proxyValue() string {
+	c.proxyMu.RLock()
+	defer c.proxyMu.RUnlock()
+	return c.proxy
 }
 
 // IsGrokToken reports whether a JWT looks like a Grok website "sso" cookie: a
@@ -739,10 +743,12 @@ func (c *Client) applyHeaders(req *http.Request, token string, extra map[string]
 func (c *Client) newTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
 
 // newDirectTLSClient keeps direct egress when no Grok proxy is configured. When
-// GROK_PROXY_URL (or the shared proxy setting) is present, every Grok endpoint
+// When the shared proxy setting is present, every Grok endpoint
 // must use it: session/quota probes, the Statsig challenge, media upload, submit,
 // polling, and artifact download all fail on networks where grok.com is blocked.
-func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(c.proxy != "") }
+func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) {
+	return c.newTLSClientP(c.proxyValue() != "")
+}
 
 func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
 	options := []tlsclient.HttpClientOption{
@@ -752,8 +758,8 @@ func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
 		tlsclient.WithClientProfile(profiles.Chrome_133),
 		tlsclient.WithRandomTLSExtensionOrder(),
 	}
-	if useProxy && c.proxy != "" {
-		options = append(options, tlsclient.WithProxyUrl(c.proxy))
+	if proxy := c.proxyValue(); proxy != "" {
+		options = append(options, tlsclient.WithProxyUrl(proxy))
 	}
 	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
 }

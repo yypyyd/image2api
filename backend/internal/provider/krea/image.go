@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	genModel    = "flux2-klein4b"   // the single exposed Krea model
+	genModel    = "flux2-klein4b" // the single exposed Krea model
 	genEndpoint = "/api/jobs/v2/new/fluxKlein4b"
 	refStrength = 0.4
 )
@@ -280,8 +280,8 @@ func (c *Client) apiPost(ctx context.Context, cookie, path, contentType string, 
 	return c.apiPostP(ctx, cookie, path, contentType, body, true)
 }
 
-// apiPostP picks the egress: reference-image upload runs direct (local IP), the
-// generate submit uses the proxy.
+// apiPostP keeps the historical useProxy argument for call-site clarity; every
+// request follows the global proxy when configured.
 func (c *Client) apiPostP(ctx context.Context, cookie, path, contentType string, body []byte, useProxy bool) ([]byte, int, error) {
 	client, err := c.newTLSClientP(useProxy)
 	if err != nil {
@@ -318,7 +318,7 @@ func (c *Client) apiPostP(ctx context.Context, cookie, path, contentType string,
 }
 
 func (c *Client) apiPostJSON(ctx context.Context, cookie, path string, payload any) ([]byte, int, error) {
-	// project bootstrap runs on the local IP; only the generate submit uses the proxy.
+	// Project bootstrap and generation both follow the global proxy setting.
 	b, _ := json.Marshal(payload)
 	return c.apiPostP(ctx, cookie, path, "application/json", b, false)
 }

@@ -81,10 +81,8 @@ services:
       RUSTFS_SECRET_KEY: vividai-secret-change-me
       # Optional ChatGPT-only full-path proxy. Bootstrap, quota, uploads,
       # generation, polling, and protected asset downloads all use it.
-      CHATGPT_PROXY_URL: ${CHATGPT_PROXY_URL:-}
       # Optional Grok-only proxy (does not affect other providers). Use HTTP(S)
       # when grok-4.5 Build OAuth/chat must also traverse the proxy.
-      GROK_PROXY_URL: ${GROK_PROXY_URL:-}
       # Set to the URL your reverse proxy serves the site on (comma-separated).
       CORS_ORIGINS: http://localhost:2000
       # true only if your reverse proxy serves HTTPS; false for plain HTTP.

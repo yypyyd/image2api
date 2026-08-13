@@ -70,7 +70,23 @@ var (
 	statsigRefreshStarted sync.Once
 	statsigLastCapture    time.Time
 	statsigLastCaptureMu  sync.Mutex
+	statsigProxy          string
+	statsigProxyMu        sync.RWMutex
 )
+
+// SetStatsigProxy applies the same site-wide egress rule to the headless Grok
+// signer capture as to normal Grok API calls.
+func SetStatsigProxy(proxy string) {
+	statsigProxyMu.Lock()
+	statsigProxy = strings.TrimSpace(proxy)
+	statsigProxyMu.Unlock()
+}
+
+func currentStatsigProxy() string {
+	statsigProxyMu.RLock()
+	defer statsigProxyMu.RUnlock()
+	return statsigProxy
+}
 
 // SetStatsigRecipe atomically replaces the live (header, suffix, trailer) used by
 // statsigID and drops the per-session challenge cache so the next request adopts
@@ -134,7 +150,7 @@ func CaptureStatsigRecipe(ctx context.Context) (headerHex, suffix string, traile
 		chromedp.Flag("disable-dev-shm-usage", true),
 		chromedp.UserAgent(userAgent),
 	)
-	if proxy := strings.TrimSpace(os.Getenv("GROK_STATSIG_PROXY")); proxy != "" {
+	if proxy := currentStatsigProxy(); proxy != "" {
 		opts = append(opts, chromedp.ProxyServer(proxy))
 	}
 	allocCtx, cancel := chromedp.NewExecAllocator(ctx, opts...)

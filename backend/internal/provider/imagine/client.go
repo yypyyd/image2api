@@ -44,13 +44,14 @@ var (
 const refreshLeadSeconds = 600 // 10 minutes
 
 type Client struct {
-	proxy string
+	proxyMu sync.RWMutex
+	proxy   string
 	// freshest credential per account (key: user id) + a per-account refresh lock,
 	// so concurrent callers don't each spend the rotating refresh_token — the first
 	// refreshes, the rest reuse the cached fresh credential.
-	mu      sync.Mutex
-	creds   map[string]string
-	locks   map[string]*sync.Mutex
+	mu    sync.Mutex
+	creds map[string]string
+	locks map[string]*sync.Mutex
 }
 
 func NewClient(proxy string) *Client {
@@ -58,7 +59,15 @@ func NewClient(proxy string) *Client {
 }
 
 func (c *Client) SetProxy(proxy string) {
+	c.proxyMu.Lock()
 	c.proxy = strings.TrimSpace(proxy)
+	c.proxyMu.Unlock()
+}
+
+func (c *Client) proxyValue() string {
+	c.proxyMu.RLock()
+	defer c.proxyMu.RUnlock()
+	return c.proxy
 }
 
 func (c *Client) userLock(userID string) *sync.Mutex {
@@ -340,7 +349,8 @@ func (c *Client) apiGet(ctx context.Context, token, url string) ([]byte, int, er
 	return c.apiGetP(ctx, token, url, true)
 }
 
-// apiGetP picks the egress: polling runs direct (local IP).
+// apiGetP keeps the historical useProxy argument for call-site clarity; polling
+// and all other requests follow the global proxy when configured.
 func (c *Client) apiGetP(ctx context.Context, token, url string, useProxy bool) ([]byte, int, error) {
 	client, err := c.newTLSClientP(useProxy)
 	if err != nil {
@@ -372,8 +382,8 @@ func (c *Client) apiGetP(ctx context.Context, token, url string, useProxy bool) 
 
 func (c *Client) newTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
 
-// newDirectTLSClient egresses on the local IP (never the proxy). Used for
-// polling and result download.
+// newDirectTLSClient preserves historical call sites; the global proxy still
+// applies whenever configured.
 func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(false) }
 
 func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
@@ -381,8 +391,8 @@ func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
 		tlsclient.WithTimeoutSeconds(60),
 		tlsclient.WithClientProfile(profiles.Chrome_120),
 	}
-	if useProxy && c.proxy != "" {
-		options = append(options, tlsclient.WithProxyUrl(c.proxy))
+	if proxy := c.proxyValue(); proxy != "" {
+		options = append(options, tlsclient.WithProxyUrl(proxy))
 	}
 	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
 }

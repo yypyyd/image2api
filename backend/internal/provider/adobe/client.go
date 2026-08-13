@@ -11,8 +11,6 @@ import (
 	"io"
 	"math/rand"
 	"net/url"
-	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,13 +44,6 @@ var (
 	// surface it as-is without penalizing/killing the account or failing over.
 	ErrContentRejected = errors.New("Adobe 内容安全审核未通过，请修改提示词或参考素材后重试")
 )
-
-// ErrUpstreamBusy is returned while a submit lane's breaker is open: Adobe is
-// overloaded for that endpoint, so every account and every retry fails the same
-// way. It unwraps to ErrTemporaryUpstream (so existing classification keeps
-// working) and callers additionally use its identity to stop failing over across
-// accounts instead of burning the pool on a doomed request.
-var ErrUpstreamBusy = fmt.Errorf("%w: Adobe 上游繁忙（已暂时熔断），请稍后重试", ErrTemporaryUpstream)
 
 // ContentRejectionError preserves Adobe's moderation code so callers can
 // distinguish a blocked prompt/reference from a randomly unsafe generated
@@ -153,122 +144,9 @@ var profileURLs = []string{
 }
 
 type Client struct {
-	apiKey string
-	proxy  string
-	// Adobe applies overload controls per endpoint family, not per account, so
-	// submits are paced and circuit-broken per lane (3p images / 3p videos /
-	// native image / native video) keyed by submit endpoint: an overloaded lane
-	// can no longer stall the healthy ones behind a single global gate. Polling
-	// and downloads of accepted jobs are never gated.
-	lanes sync.Map // lane key -> *submitLane
-}
-
-// Pacing/breaker knobs, tunable per deployment without a rebuild: the right
-// values depend on how hard Adobe is throttling the egress IP at the time.
-var (
-	adobeSubmitConcurrency = envPositiveInt("ADOBE_SUBMIT_CONCURRENCY", 1)
-	// Pacing is adaptive per lane: submits start at the floor interval and only
-	// slow down (doubling toward the ceiling) while Adobe returns overload
-	// responses, then decay back to the floor as submits succeed. A queue burst
-	// therefore drains quickly whenever Adobe is healthy.
-	adobeSubmitMinInterval = envPositiveMillis("ADOBE_SUBMIT_INTERVAL_MS", 2*time.Second)
-	adobeSubmitMaxInterval = envPositiveMillis("ADOBE_SUBMIT_INTERVAL_MAX_MS", 30*time.Second)
-	// A lane trips its breaker after this many consecutive overload responses and
-	// stays open for the cooldown, so a provider-wide outage fails fast instead of
-	// spending one account and one paced submit slot per doomed retry.
-	submitBreakerThreshold = envPositiveInt("ADOBE_SUBMIT_BREAKER_FAILS", 1)
-	submitBreakerCooldown  = envPositiveMillis("ADOBE_SUBMIT_BREAKER_COOLDOWN_MS", 5*time.Minute)
-)
-
-func envPositiveInt(key string, def int) int {
-	if n, err := strconv.Atoi(strings.TrimSpace(os.Getenv(key))); err == nil && n > 0 {
-		return n
-	}
-	return def
-}
-
-func envPositiveMillis(key string, def time.Duration) time.Duration {
-	if ms := envPositiveInt(key, 0); ms > 0 {
-		return time.Duration(ms) * time.Millisecond
-	}
-	return def
-}
-
-// submitLane paces submits to one Adobe submit endpoint and tracks that
-// endpoint's overload breaker.
-type submitLane struct {
-	gate chan struct{}
-
-	mu       sync.Mutex
-	next     time.Time     // earliest time the next submit may start
-	interval time.Duration // current adaptive spacing (zero = floor)
-	fails    int           // consecutive overload responses
-	opened   time.Time     // when the breaker tripped (zero = closed)
-}
-
-// currentInterval returns the lane's adaptive spacing, clamped to the
-// configured floor/ceiling. Callers must hold l.mu.
-func (l *submitLane) currentInterval() time.Duration {
-	if l.interval < adobeSubmitMinInterval {
-		return adobeSubmitMinInterval
-	}
-	if l.interval > adobeSubmitMaxInterval {
-		return adobeSubmitMaxInterval
-	}
-	return l.interval
-}
-
-// tripped reports whether the lane is inside its breaker cooldown.
-func (l *submitLane) tripped() bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.opened.IsZero() {
-		return false
-	}
-	if time.Since(l.opened) < submitBreakerCooldown {
-		return true
-	}
-	l.opened = time.Time{}
-	return false
-}
-
-// record folds one submit outcome into the breaker and the adaptive interval:
-// overload responses double the spacing (multiplicative backoff) and
-// eventually trip the breaker; any other outcome closes the breaker and decays
-// the spacing back toward the floor.
-func (l *submitLane) record(overloaded bool) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if !overloaded {
-		l.fails, l.opened = 0, time.Time{}
-		l.interval = l.currentInterval() * 3 / 4
-		if l.interval < adobeSubmitMinInterval {
-			l.interval = adobeSubmitMinInterval
-		}
-		return
-	}
-	l.interval = l.currentInterval() * 2
-	if l.interval > adobeSubmitMaxInterval {
-		l.interval = adobeSubmitMaxInterval
-	}
-	l.fails++
-	if l.fails >= submitBreakerThreshold {
-		l.fails, l.opened = 0, time.Now()
-	}
-}
-
-// reserve claims the lane's next paced slot and returns how long the caller must
-// wait before firing. The reservation is stamped up-front so a queued submit
-// can't collapse onto the previous one.
-func (l *submitLane) reserve() time.Duration {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	wait := time.Until(l.next)
-	if wait < 0 {
-		wait = 0
-	}
-	l.next = time.Now().Add(wait + l.currentInterval())
-	return wait
+	apiKey  string
+	proxyMu sync.RWMutex
+	proxy   string
 }
 
 func NewClient(apiKey, proxy string) *Client {
@@ -279,59 +157,15 @@ func NewClient(apiKey, proxy string) *Client {
 }
 
 func (c *Client) SetProxy(proxy string) {
+	c.proxyMu.Lock()
 	c.proxy = strings.TrimSpace(proxy)
+	c.proxyMu.Unlock()
 }
 
-// lane returns the submit lane for an endpoint (host+path, so the 3p image and
-// 3p video services are paced apart even though they share a host).
-func (c *Client) lane(endpoint string) *submitLane {
-	key := endpoint
-	if u, err := url.Parse(endpoint); err == nil && u.Host != "" {
-		key = u.Host + u.Path
-	}
-	if existing, ok := c.lanes.Load(key); ok {
-		return existing.(*submitLane)
-	}
-	actual, _ := c.lanes.LoadOrStore(key, &submitLane{gate: make(chan struct{}, adobeSubmitConcurrency)})
-	return actual.(*submitLane)
-}
-
-// acquireSubmit takes the endpoint's paced submit slot. It fails fast with
-// ErrUpstreamBusy while that endpoint's breaker is open.
-func (c *Client) acquireSubmit(ctx context.Context, endpoint string) (*submitLane, func(), error) {
-	lane := c.lane(endpoint)
-	if lane.tripped() {
-		return nil, nil, ErrUpstreamBusy
-	}
-	select {
-	case lane.gate <- struct{}{}:
-	case <-ctx.Done():
-		return nil, nil, fmt.Errorf("%w: waiting for Adobe submit slot: %w", ErrTemporaryUpstream, ctx.Err())
-	}
-	release := func() { <-lane.gate }
-
-	if wait := lane.reserve(); wait > 0 {
-		timer := time.NewTimer(wait)
-		select {
-		case <-timer.C:
-		case <-ctx.Done():
-			timer.Stop()
-			release()
-			return nil, nil, fmt.Errorf("%w: waiting for Adobe submit slot: %w", ErrTemporaryUpstream, ctx.Err())
-		}
-	}
-	return lane, release, nil
-}
-
-// isUpstreamOverloaded reports Adobe's overload signals: the 408/429/5xx status
-// family plus the "system under load" / timeout_error body it also returns on
-// otherwise-normal statuses.
-func isUpstreamOverloaded(status int, body []byte) bool {
-	if status == 408 || status == 429 || status >= 500 {
-		return true
-	}
-	b := string(body)
-	return strings.Contains(b, "system under load") || strings.Contains(b, "timeout_error")
+func (c *Client) proxyValue() string {
+	c.proxyMu.RLock()
+	defer c.proxyMu.RUnlock()
+	return c.proxy
 }
 
 func (c *Client) ExchangeCookie(ctx context.Context, cookie string) (*CookieExchangeResult, error) {
@@ -362,7 +196,6 @@ func (c *Client) UploadMedia(ctx context.Context, token string, content []byte, 
 	if kind != "image" && kind != "video" && kind != "audio" {
 		return "", errors.New("unsupported adobe media kind")
 	}
-	// Reference-image upload runs on the local IP (not the proxy).
 	body, err, retryable := c.uploadMediaOnce(ctx, token, content, contentType, engine, kind)
 	for attempt := 0; err != nil && retryable && attempt < uploadMaxRetries && ctx.Err() == nil; attempt++ {
 		body, err, retryable = c.uploadMediaOnce(ctx, token, content, contentType, engine, kind)
@@ -478,8 +311,6 @@ func defaultMediaContentType(kind string) string {
 const generatedImageSafetyMaxAttempts = 3
 
 func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspectRatio, resolution string, blobIDs []string, downloadResult bool) ([]byte, map[string]any, error) {
-	// Only the generate submit goes through the proxy; polling + download run on
-	// the local IP.
 	submitSess, err := c.newTLSClient()
 	if err != nil {
 		return nil, nil, err
@@ -521,7 +352,7 @@ generationAttempts:
 			if isRetryableGeneratedImageRejection(submitErr) {
 				continue generationAttempts
 			}
-			if errors.Is(submitErr, ErrAuth) || errors.Is(submitErr, ErrQuotaExhausted) || errors.Is(submitErr, ErrContentRejected) || errors.Is(submitErr, ErrUpstreamBusy) {
+			if errors.Is(submitErr, ErrAuth) || errors.Is(submitErr, ErrQuotaExhausted) || errors.Is(submitErr, ErrContentRejected) {
 				return nil, nil, submitErr
 			}
 		}
@@ -529,11 +360,6 @@ generationAttempts:
 	}
 	if isRetryableGeneratedImageRejection(lastErr) {
 		return nil, nil, fmt.Errorf("%w：Adobe 生成结果连续 %d 次未通过安全审核，请补充成年人、着装和场景描述后重试", ErrContentRejected, generatedImageSafetyMaxAttempts)
-	}
-	// Keep the circuit-open identity intact (rewrapping it as a plain temporary
-	// error would hide it from the scheduler's fail-fast check).
-	if errors.Is(lastErr, ErrUpstreamBusy) {
-		return nil, nil, lastErr
 	}
 	// Preserve the temporary classification so the pool retries (overload / 5xx /
 	// rate-limit) instead of failing the request outright.
@@ -551,7 +377,6 @@ generationAttempts:
 // in meta["video_url"] — used by the async /v1/videos job, which proxies that URL
 // on /content instead of persisting the file.
 func (c *Client) GenerateVideo(ctx context.Context, token, engine, prompt, aspectRatio string, durationSeconds int, resolution, referenceMode, upstreamModel string, inputs VideoInputs, downloadResult bool) ([]byte, map[string]any, error) {
-	// Only the submit goes through the proxy; polling + download run on the local IP.
 	submitSess, err := c.newTLSClient()
 	if err != nil {
 		return nil, nil, err
@@ -750,12 +575,6 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, token string) (map[str
 }
 
 func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, prompt, endpoint string, payload map[string]any) ([]byte, string, error) {
-	lane, release, err := c.acquireSubmit(ctx, endpoint)
-	if err != nil {
-		return nil, "", err
-	}
-	defer release()
-
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, "", err
@@ -806,7 +625,6 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 
 	resp, err := sess.client.Do(req)
 	if err != nil {
-		lane.record(true)
 		return nil, "", fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
 	}
 	defer resp.Body.Close()
@@ -814,18 +632,16 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 	if err != nil {
 		return nil, "", err
 	}
-	lane.record(isUpstreamOverloaded(resp.StatusCode, respBody))
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
 		if strings.EqualFold(resp.Header.Get("x-access-error"), "taste_exhausted") {
 			return respBody, "", ErrQuotaExhausted
 		}
 		return respBody, "", fmt.Errorf("%w (submit %d %s: %s)", ErrAuth, resp.StatusCode, resp.Header.Get("x-access-error"), clip(respBody, 300))
 	}
-	// "system under load" / timeout_error = adobe rate-limit/overload (can come on a
-	// non-5xx). This is endpoint/egress-wide rather than account-specific, so
-	// preserve ErrUpstreamBusy and stop account failover immediately.
+	// Adobe may report overload in a nominal response. It remains a regular
+	// temporary upstream error: there is no client-side breaker or submit pacing.
 	if b := string(respBody); strings.Contains(b, "system under load") || strings.Contains(b, "timeout_error") {
-		return respBody, "", fmt.Errorf("%w: adobe submit: %s", ErrUpstreamBusy, clip(respBody, 300))
+		return respBody, "", fmt.Errorf("%w: adobe submit: %s", ErrTemporaryUpstream, clip(respBody, 300))
 	}
 	if rejectErr := contentRejectionError(resp.StatusCode, string(respBody)); rejectErr != nil {
 		return respBody, "", rejectErr
@@ -937,12 +753,6 @@ func (c *Client) pollImage(ctx context.Context, sess *tlsSession, token, pollURL
 }
 
 func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpoint string, payload map[string]any) ([]byte, string, error) {
-	lane, release, err := c.acquireSubmit(ctx, endpoint)
-	if err != nil {
-		return nil, "", err
-	}
-	defer release()
-
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, "", err
@@ -996,7 +806,6 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 
 	resp, err := sess.client.Do(req)
 	if err != nil {
-		lane.record(true)
 		return nil, "", fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
 	}
 	defer resp.Body.Close()
@@ -1005,7 +814,6 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 	if err != nil {
 		return nil, "", err
 	}
-	lane.record(isUpstreamOverloaded(resp.StatusCode, respBody))
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
 		if strings.EqualFold(resp.Header.Get("x-access-error"), "taste_exhausted") {
 			return respBody, "", ErrQuotaExhausted
@@ -1027,7 +835,7 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 	// "system under load" / timeout_error = adobe overload — treat as a temporary
 	// error so the tempFailover policy moves to the next account (same as the image path).
 	if b := string(respBody); strings.Contains(b, "system under load") || strings.Contains(b, "timeout_error") {
-		return respBody, "", fmt.Errorf("%w: adobe submit: %s", ErrUpstreamBusy, clip(respBody, 300))
+		return respBody, "", fmt.Errorf("%w: adobe submit: %s", ErrTemporaryUpstream, clip(respBody, 300))
 	}
 	if resp.StatusCode != 200 {
 		return respBody, "", fmt.Errorf("video submit rejected: %d %s", resp.StatusCode, clip(respBody, 300))
@@ -1252,16 +1060,15 @@ type tlsSession struct {
 	fp     fingerprint
 }
 
-// newTLSClient builds a session that routes through the configured proxy (when
-// set). newDirectTLSClient builds one that always uses the local IP. Only the
-// image-generation submit goes through the proxy; reference-image upload,
-// polling and result download run on the local IP.
+// Every Adobe session follows the same global egress rule: use the configured
+// proxy when non-empty, otherwise connect directly from the local host. The
+// historical "direct" helper remains only to keep call sites readable.
 func (c *Client) newTLSClient() (*tlsSession, error) {
 	return c.newTLSSession(randomFingerprint(), true)
 }
 
 func (c *Client) newDirectTLSClient() (*tlsSession, error) {
-	return c.newTLSSession(randomFingerprint(), false)
+	return c.newTLSSession(randomFingerprint(), c.proxyValue() != "")
 }
 
 func (c *Client) newTLSSession(fp fingerprint, useProxy bool) (*tlsSession, error) {
@@ -1271,8 +1078,8 @@ func (c *Client) newTLSSession(fp fingerprint, useProxy bool) (*tlsSession, erro
 		tlsclient.WithNotFollowRedirects(),
 		tlsclient.WithRandomTLSExtensionOrder(),
 	}
-	if useProxy && c.proxy != "" {
-		options = append(options, tlsclient.WithProxyUrl(c.proxy))
+	if proxy := c.proxyValue(); useProxy && proxy != "" {
+		options = append(options, tlsclient.WithProxyUrl(proxy))
 	}
 	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
 	if err != nil {

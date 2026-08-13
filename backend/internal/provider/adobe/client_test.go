@@ -3,146 +3,82 @@ package adobe
 import (
 	"context"
 	"errors"
-	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
-func TestSubmitGateSerializesAndSpacesStarts(t *testing.T) {
+func TestSubmitImageHasNoGlobalGateOrPacing(t *testing.T) {
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		started <- struct{}{}
+		<-release
+		w.Header().Set("x-override-status-link", "https://poll.example/result")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
 	client := NewClient("test", "")
-	start := time.Now()
-	_, releaseFirst, err := client.acquireSubmit(context.Background(), submitURL)
+	sess, err := client.newTLSClient()
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	acquired := make(chan time.Time, 1)
-	go func() {
-		_, release, acquireErr := client.acquireSubmit(context.Background(), submitURL)
-		if acquireErr != nil {
-			return
-		}
-		acquired <- time.Now()
-		release()
-	}()
-
-	select {
-	case <-acquired:
-		t.Fatal("second submit acquired the gate before the first released it")
-	case <-time.After(25 * time.Millisecond):
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, submitErr := client.submitImage(context.Background(), sess, "token", "prompt", server.URL, map[string]any{"prompt": "test"})
+			errs <- submitErr
+		}()
 	}
 
-	releaseFirst()
-	select {
-	case secondStarted := <-acquired:
-		if spacing := secondStarted.Sub(start); spacing < adobeSubmitMinInterval-50*time.Millisecond {
-			t.Fatalf("submit spacing = %v, want at least %v", spacing, adobeSubmitMinInterval)
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-timer.C:
+			close(release)
+			t.Fatal("concurrent Adobe submit was blocked by a global gate or pacing delay")
 		}
-	case <-time.After(adobeSubmitMinInterval + time.Second):
-		t.Fatal("second submit never acquired the gate")
+	}
+	close(release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
-// A busy/paced lane must not hold up a different submit endpoint: 3p overload
-// used to stall native image and video submits behind one global gate.
-func TestSubmitLanesAreIndependent(t *testing.T) {
+func TestSystemUnderLoadRemainsTemporaryWithoutBreaker(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"error_code":"timeout_error","message":"system under load"}`))
+	}))
+	defer server.Close()
+
 	client := NewClient("test", "")
-	_, release, err := client.acquireSubmit(context.Background(), submitURL)
+	sess, err := client.newTLSClient()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer release()
-
-	done := make(chan struct{})
-	go func() {
-		_, otherRelease, otherErr := client.acquireSubmit(context.Background(), image5SubmitURL)
-		if otherErr == nil {
-			otherRelease()
-			close(done)
+	for i := 0; i < 2; i++ {
+		_, _, submitErr := client.submitImage(context.Background(), sess, "token", "prompt", server.URL, map[string]any{"prompt": "test"})
+		if !errors.Is(submitErr, ErrTemporaryUpstream) {
+			t.Fatalf("attempt %d error = %v, want ErrTemporaryUpstream", i+1, submitErr)
 		}
-	}()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("native image submit blocked behind the 3p lane")
-	}
-}
-
-func TestSubmitBreakerTripsAndFailsFast(t *testing.T) {
-	client := NewClient("test", "")
-	lane := client.lane(submitURL)
-	for i := 0; i < submitBreakerThreshold; i++ {
-		lane.record(isUpstreamOverloaded(408, []byte(`{"error_code":"timeout_error","message":"system under load"}`)))
-	}
-	if _, _, err := client.acquireSubmit(context.Background(), submitURL); !errors.Is(err, ErrUpstreamBusy) || !errors.Is(err, ErrTemporaryUpstream) {
-		t.Fatalf("acquireSubmit() error = %v, want ErrUpstreamBusy wrapping ErrTemporaryUpstream", err)
-	}
-	// Another endpoint stays open, and a good response closes the breaker.
-	if _, release, err := client.acquireSubmit(context.Background(), image5SubmitURL); err != nil {
-		t.Fatalf("native image lane = %v, want open", err)
-	} else {
-		release()
-	}
-	lane.record(false)
-	if _, release, err := client.acquireSubmit(context.Background(), submitURL); err != nil {
-		t.Fatalf("acquireSubmit() after recovery = %v, want nil", err)
-	} else {
-		release()
-	}
-}
-
-func TestAdobeErrClassTreatsSubmitOverloadAsBusy(t *testing.T) {
-	err := fmt.Errorf("%w: adobe submit: system under load", ErrUpstreamBusy)
-	if !errors.Is(err, ErrUpstreamBusy) || !errors.Is(err, ErrTemporaryUpstream) {
-		t.Fatalf("submit overload = %v, want busy and temporary identities", err)
-	}
-}
-
-// The lane's spacing is adaptive: overload responses double it toward the
-// ceiling, successes decay it back to the floor, so queued bursts drain at the
-// floor rate whenever Adobe is healthy.
-func TestSubmitLaneAdaptiveInterval(t *testing.T) {
-	client := NewClient("test", "")
-	lane := client.lane(submitURL)
-	snapshot := func() time.Duration {
-		lane.mu.Lock()
-		defer lane.mu.Unlock()
-		return lane.currentInterval()
-	}
-	if got := snapshot(); got != adobeSubmitMinInterval {
-		t.Fatalf("initial interval = %v, want floor %v", got, adobeSubmitMinInterval)
-	}
-	lane.record(true)
-	if got := snapshot(); got != 2*adobeSubmitMinInterval {
-		t.Fatalf("interval after one overload = %v, want %v", got, 2*adobeSubmitMinInterval)
-	}
-	for i := 0; i < 20; i++ {
-		lane.record(true)
-	}
-	if got := snapshot(); got != adobeSubmitMaxInterval {
-		t.Fatalf("interval under sustained overload = %v, want ceiling %v", got, adobeSubmitMaxInterval)
-	}
-	for i := 0; i < 50; i++ {
-		lane.record(false)
-	}
-	if got := snapshot(); got != adobeSubmitMinInterval {
-		t.Fatalf("interval after sustained successes = %v, want floor %v", got, adobeSubmitMinInterval)
-	}
-}
-
-func TestSubmitGateHonorsCancellation(t *testing.T) {
-	client := NewClient("test", "")
-	_, release, err := client.acquireSubmit(context.Background(), submitURL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer release()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if _, _, err := client.acquireSubmit(ctx, submitURL); !errors.Is(err, context.Canceled) {
-		t.Fatalf("acquireSubmit() error = %v, want context.Canceled", err)
+		if strings.Contains(strings.ToLower(submitErr.Error()), "熔断") {
+			t.Fatalf("attempt %d returned breaker state: %v", i+1, submitErr)
+		}
 	}
 }
 

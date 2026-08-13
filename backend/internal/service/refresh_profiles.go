@@ -15,13 +15,15 @@ import (
 type RefreshProfileService struct {
 	profiles *repo.RefreshProfileRepository
 	tokens   *repo.TokenRepository
+	settings *repo.SiteSettingRepository
 	adobe    *adobe.Client
 }
 
-func NewRefreshProfileService(profiles *repo.RefreshProfileRepository, tokens *repo.TokenRepository, adobeClient *adobe.Client) *RefreshProfileService {
+func NewRefreshProfileService(profiles *repo.RefreshProfileRepository, tokens *repo.TokenRepository, settings *repo.SiteSettingRepository, adobeClient *adobe.Client) *RefreshProfileService {
 	return &RefreshProfileService{
 		profiles: profiles,
 		tokens:   tokens,
+		settings: settings,
 		adobe:    adobeClient,
 	}
 }
@@ -34,6 +36,15 @@ func (s *RefreshProfileService) RefreshNow(ctx context.Context, id string) error
 	if s.adobe == nil || s.tokens == nil {
 		return errors.New("refresh client not configured")
 	}
+	proxy := ""
+	if s.settings != nil {
+		var proxyErr error
+		proxy, proxyErr = s.settings.GetValue(ctx, "proxy.url")
+		if proxyErr != nil {
+			return proxyErr
+		}
+	}
+	s.adobe.SetProxy(proxy)
 	profile, err := s.profiles.Get(ctx, id)
 	if err != nil {
 		return err

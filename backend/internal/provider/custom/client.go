@@ -1,8 +1,8 @@
 // Package custom implements a generic OpenAI-compatible upstream client. A
 // "custom" model forwards generation to any OpenAI-compatible API: the upstream
 // base_url + api_key live on a custom account (pool="custom"), the upstream model
-// name on the model config (UpstreamModel). Calls go DIRECT (no tls-client, no
-// proxy) — the upstream is a normal API with no anti-bot.
+// name on the model config (UpstreamModel). Calls use the site-wide proxy when
+// configured and connect directly when it is empty.
 package custom
 
 import (
@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -27,9 +28,18 @@ var (
 	ErrBadRequest        = errors.New("custom upstream rejected request")
 )
 
-type Client struct{}
+type Client struct {
+	mu    sync.RWMutex
+	proxy string
+}
 
 func NewClient() *Client { return &Client{} }
+
+func (c *Client) SetProxy(proxy string) {
+	c.mu.Lock()
+	c.proxy = strings.TrimSpace(proxy)
+	c.mu.Unlock()
+}
 
 // sanitizeErr strips the upstream URL/host from a network error so a user's
 // private upstream URL never leaks into the event log / API response.
@@ -57,7 +67,37 @@ func sanitizeErr(err error) string {
 	return "upstream request failed"
 }
 
-func httpClient() *http.Client { return &http.Client{Timeout: 10 * time.Minute} }
+func (c *Client) httpClient() (*http.Client, error) {
+	c.mu.RLock()
+	proxyRaw := c.proxy
+	c.mu.RUnlock()
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Do not inherit HTTP_PROXY/HTTPS_PROXY from the process: an empty admin
+	// setting means explicit local egress for every account type.
+	transport.Proxy = nil
+	if proxyRaw != "" {
+		proxyURL, err := url.Parse(proxyRaw)
+		if err != nil || proxyURL.Host == "" {
+			return nil, errors.New("invalid global proxy configuration")
+		}
+		switch strings.ToLower(proxyURL.Scheme) {
+		case "http", "https", "socks5", "socks5h":
+		default:
+			return nil, errors.New("unsupported global proxy scheme")
+		}
+		transport.Proxy = http.ProxyURL(proxyURL)
+	}
+	return &http.Client{Transport: transport, Timeout: 10 * time.Minute}, nil
+}
+
+func (c *Client) do(req *http.Request) (*http.Response, error) {
+	client, err := c.httpClient()
+	if err != nil {
+		return nil, err
+	}
+	return client.Do(req)
+}
 
 // ChatResponse is a successful OpenAI-compatible chat-completions response.
 // Streaming bodies remain connected to the upstream and must be closed by the
@@ -98,7 +138,7 @@ func (c *Client) ChatCompletions(ctx context.Context, baseURL, apiKey, upstreamM
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
 	}
-	resp, err := httpClient().Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
 	}
@@ -241,7 +281,7 @@ func (c *Client) GenerateImage(ctx context.Context, baseURL, apiKey, model, prom
 	req = req.WithContext(ctx)
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
-	resp, err := httpClient().Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, "", fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
 	}
@@ -250,7 +290,7 @@ func (c *Client) GenerateImage(ctx context.Context, baseURL, apiKey, model, prom
 	if e := mapStatus(resp.StatusCode, body); e != nil {
 		return nil, "", e
 	}
-	return imageFromResponse(ctx, body, downloadResult)
+	return c.imageFromResponse(ctx, body, downloadResult)
 }
 
 // GenerateVideo drives the upstream Sora-style async video API:
@@ -356,7 +396,7 @@ func (c *Client) doJSON(ctx context.Context, method, url, apiKey string, body []
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := httpClient().Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
 	}
@@ -383,7 +423,7 @@ func (c *Client) doMultipart(ctx context.Context, url, apiKey string, body io.Re
 	req = req.WithContext(ctx)
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", contentType)
-	resp, err := httpClient().Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
 	}
@@ -406,7 +446,7 @@ func (c *Client) download(ctx context.Context, url, apiKey string) ([]byte, erro
 	req, _ := http.NewRequest(http.MethodGet, url, nil)
 	req = req.WithContext(ctx)
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	resp, err := httpClient().Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
 	}
@@ -430,7 +470,7 @@ func (c *Client) download(ctx context.Context, url, apiKey string) ([]byte, erro
 // We always request response_format=url, so the response must carry a URL — a
 // base64-only response is treated as an error (no base64 pass-through). With
 // downloadResult=false the URL is returned directly (no download).
-func imageFromResponse(ctx context.Context, body []byte, downloadResult bool) ([]byte, string, error) {
+func (c *Client) imageFromResponse(ctx context.Context, body []byte, downloadResult bool) ([]byte, string, error) {
 	var out struct {
 		Data []struct {
 			URL string `json:"url"`
@@ -447,7 +487,7 @@ func imageFromResponse(ctx context.Context, body []byte, downloadResult bool) ([
 		return nil, url, nil
 	}
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	resp, err := httpClient().Do(req)
+	resp, err := c.do(req)
 	if err != nil {
 		return nil, "", fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
 	}

@@ -45,13 +45,14 @@ var (
 const refreshLeadSeconds = 600 // 10 minutes
 
 type Client struct {
-	proxy string
+	proxyMu sync.RWMutex
+	proxy   string
 	// freshest cookie per account (key: user id) + a per-account refresh lock, so
 	// concurrent callers don't each spend the single-use (rotating) refresh_token —
 	// the first refreshes, the rest reuse the cached fresh cookie.
-	mu       sync.Mutex
-	cookies  map[string]string
-	locks    map[string]*sync.Mutex
+	mu      sync.Mutex
+	cookies map[string]string
+	locks   map[string]*sync.Mutex
 	// actAt = last /app activation time per account (key: user id); actLocks gives
 	// a per-account lock so concurrent generations wait for the first to finish the
 	// (once-per-daily-reset) activation instead of each loading /app.
@@ -150,15 +151,15 @@ func (c *Client) refreshPost(ctx context.Context, refreshToken string) ([]byte, 
 	}
 	req = req.WithContext(ctx)
 	req.Header = http.Header{
-		"accept":                  {"*/*"},
-		"content-type":            {"application/json;charset=UTF-8"},
-		"apikey":                  {kreaAnonKey},
-		"authorization":           {"Bearer " + kreaAnonKey},
-		"x-client-info":           {"supabase-ssr/0.6.1 createBrowserClient"},
-		"x-supabase-api-version":  {"2024-01-01"},
-		"origin":                  {apiBase},
-		"referer":                 {apiBase + "/"},
-		"user-agent":              {userAgent},
+		"accept":                 {"*/*"},
+		"content-type":           {"application/json;charset=UTF-8"},
+		"apikey":                 {kreaAnonKey},
+		"authorization":          {"Bearer " + kreaAnonKey},
+		"x-client-info":          {"supabase-ssr/0.6.1 createBrowserClient"},
+		"x-supabase-api-version": {"2024-01-01"},
+		"origin":                 {apiBase},
+		"referer":                {apiBase + "/"},
+		"user-agent":             {userAgent},
 		http.HeaderOrderKey: {
 			"accept", "content-type", "apikey", "authorization", "x-client-info",
 			"x-supabase-api-version", "origin", "referer", "user-agent",
@@ -278,7 +279,15 @@ func toInt64(v any) int64 {
 }
 
 func (c *Client) SetProxy(proxy string) {
+	c.proxyMu.Lock()
 	c.proxy = strings.TrimSpace(proxy)
+	c.proxyMu.Unlock()
+}
+
+func (c *Client) proxyValue() string {
+	c.proxyMu.RLock()
+	defer c.proxyMu.RUnlock()
+	return c.proxy
 }
 
 // IsKreaCookie reports whether a pasted credential is a Krea cookie: it carries
@@ -397,7 +406,8 @@ func (c *Client) apiGet(ctx context.Context, cookie, path string) ([]byte, int, 
 	return c.apiGetP(ctx, cookie, path, true)
 }
 
-// apiGetP picks the egress: polling / asset resolution run direct (local IP).
+// apiGetP keeps the historical useProxy argument for call-site clarity; the
+// global proxy is applied whenever configured, including polling and assets.
 func (c *Client) apiGetP(ctx context.Context, cookie, path string, useProxy bool) ([]byte, int, error) {
 	client, err := c.newTLSClientP(useProxy)
 	if err != nil {
@@ -433,8 +443,8 @@ func (c *Client) apiGetP(ctx context.Context, cookie, path string, useProxy bool
 
 func (c *Client) newTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
 
-// newDirectTLSClient egresses on the local IP (never the proxy). Used for
-// reference-image upload, polling and result download.
+// newDirectTLSClient preserves historical call sites; the global proxy still
+// applies whenever configured.
 func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(false) }
 
 func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
@@ -442,8 +452,8 @@ func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
 		tlsclient.WithTimeoutSeconds(60),
 		tlsclient.WithClientProfile(profiles.Chrome_120),
 	}
-	if useProxy && c.proxy != "" {
-		options = append(options, tlsclient.WithProxyUrl(c.proxy))
+	if proxy := c.proxyValue(); proxy != "" {
+		options = append(options, tlsclient.WithProxyUrl(proxy))
 	}
 	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
 }

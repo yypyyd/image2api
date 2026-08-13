@@ -1,9 +1,7 @@
 package adobe
 
 import (
-	"context"
 	"errors"
-	"net/http"
 	"strings"
 )
 
@@ -19,15 +17,6 @@ type CookieExchangeResult struct {
 	AccessToken string
 	ExpiresIn   int
 	Raw         map[string]any
-}
-
-func ExchangeCookieToAccessToken(ctx context.Context, client *http.Client, cookie string) (*CookieExchangeResult, error) {
-	_ = client
-	tlsClient, err := NewClient(clientID, "").newTLSClient()
-	if err != nil {
-		return nil, err
-	}
-	return exchangeCookieWithTLSClient(ctx, tlsClient, cookie)
 }
 
 func normalizeCookie(v string) string {

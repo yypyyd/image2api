@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	xproxy "golang.org/x/net/proxy"
 )
 
 const (
@@ -415,15 +418,36 @@ func exchangeBuildToken(ctx context.Context, client *http.Client, endpoint strin
 
 func (c *Client) newBuildHTTPClient(timeout time.Duration) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if proxyRaw := strings.TrimSpace(c.proxy); proxyRaw != "" {
+	// Empty global proxy means direct local egress, regardless of process-level
+	// HTTP_PROXY/HTTPS_PROXY environment variables.
+	transport.Proxy = nil
+	if proxyRaw := c.proxyValue(); proxyRaw != "" {
 		proxyURL, err := url.Parse(proxyRaw)
-		if err != nil {
-			return nil, err
+		if err != nil || proxyURL.Host == "" {
+			return nil, errors.New("invalid global proxy configuration")
 		}
-		if proxyURL.Scheme != "http" && proxyURL.Scheme != "https" {
-			return nil, fmt.Errorf("unsupported build proxy scheme %q", proxyURL.Scheme)
+		switch strings.ToLower(proxyURL.Scheme) {
+		case "http", "https":
+			transport.Proxy = http.ProxyURL(proxyURL)
+		case "socks5", "socks5h":
+			var auth *xproxy.Auth
+			if proxyURL.User != nil {
+				password, _ := proxyURL.User.Password()
+				auth = &xproxy.Auth{User: proxyURL.User.Username(), Password: password}
+			}
+			dialer, dialErr := xproxy.SOCKS5("tcp", proxyURL.Host, auth, &net.Dialer{Timeout: timeout})
+			if dialErr != nil {
+				return nil, errors.New("invalid global proxy configuration")
+			}
+			transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+				if contextDialer, ok := dialer.(xproxy.ContextDialer); ok {
+					return contextDialer.DialContext(ctx, network, address)
+				}
+				return dialer.Dial(network, address)
+			}
+		default:
+			return nil, errors.New("unsupported global proxy scheme")
 		}
-		transport.Proxy = http.ProxyURL(proxyURL)
 	}
 	return &http.Client{
 		Transport: transport,

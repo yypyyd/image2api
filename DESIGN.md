@@ -1,5 +1,47 @@
 # Design Notes
 
+### 2026-08-14 - Unified global upstream egress and unrestricted Adobe submits
+
+**Change**: The persisted administrator setting `proxy.url` is now the one
+runtime egress rule for every account type: Adobe, ChatGPT, Runway, Leonardo,
+Krea, Imagine, Grok (including headless Statsig capture and Build OAuth), and
+custom OpenAI-compatible upstreams. It applies to account import, credential
+refresh, quota/profile calls, reference upload, generation submit, polling,
+artifact download, and the gateway's no-store media relay. A non-empty value
+routes all of those calls through the proxy; an empty or missing value clears
+all client proxy state and connects directly from the local server. Legacy
+provider-specific proxy environment settings no longer participate in runtime
+routing.
+
+Adobe submit lanes, adaptive inter-submit spacing, and the endpoint circuit
+breaker have been removed. A submit is dispatched as soon as its selected
+account has an available account-level concurrency slot. Adobe's `system under
+load`/`timeout_error` remains a normal temporary upstream error and follows the
+existing bounded failover/retry behavior; it can no longer open a gateway-wide
+breaker that makes downstream requests fail immediately.
+
+**Reason**: A prior Adobe overload response opened a five-minute client-side
+breaker after one failure and blocked all downstream calls, while split proxy
+paths made some providers use the global route and others silently use local or
+environment-configured egress. The intended operational control is a single
+admin-selected exit route, not per-provider exceptions.
+
+**Impact**: There is no gateway submit rate limit or circuit breaker for Adobe.
+Per-account concurrency limits and user concurrency groups remain unchanged,
+so an account still cannot exceed its configured simultaneous-job capacity.
+Removing the global guard increases the chance that a large burst reaches Adobe
+and receives provider-side overload/rate-limit errors; scaling should therefore
+use account concurrency and upstream capacity, not a hidden global throttle.
+
+**Security boundary**: `proxy.url` is administrator-controlled and may contain
+credentials. It is visible only through the authenticated administrator setting
+surface and must never be returned by user/provider APIs, inserted into
+event/error logs, or copied into support output. The proxy becomes a single
+egress point that can observe destination metadata; restrict its access to the
+application server and use an authenticated, trusted endpoint. Custom upstream URLs remain
+administrator-controlled and retain the existing SSRF/egress-filtering
+deployment responsibility.
+
 ### 2026-08-11 - Public cross-origin image delivery
 
 **Change**: Generated image API responses now always use the opaque gateway URL

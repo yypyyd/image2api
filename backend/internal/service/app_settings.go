@@ -52,9 +52,9 @@ type CreditSettings struct {
 // 画图台 — charged on top of the model's image price when the toggle is on.
 type DeAISettings struct {
 	Enabled bool `json:"enabled"`
-	Price1K int `json:"price_1k"`
-	Price2K int `json:"price_2k"`
-	Price4K int `json:"price_4k"`
+	Price1K int  `json:"price_1k"`
+	Price2K int  `json:"price_2k"`
+	Price4K int  `json:"price_4k"`
 }
 
 type ProxySettings struct {
@@ -294,6 +294,17 @@ func (s *AppSettingsService) Proxy(ctx context.Context) (*ProxySettings, error) 
 
 func (s *AppSettingsService) SaveProxy(ctx context.Context, proxy string) (*ProxySettings, error) {
 	proxy = strings.TrimSpace(proxy)
+	if proxy != "" {
+		parsed, err := url.Parse(proxy)
+		if err != nil || parsed.Host == "" {
+			return nil, errors.New("代理地址格式不正确")
+		}
+		switch strings.ToLower(parsed.Scheme) {
+		case "http", "https", "socks5", "socks5h":
+		default:
+			return nil, errors.New("代理协议仅支持 HTTP、HTTPS 或 SOCKS5")
+		}
+	}
 	if err := s.settings.UpsertValue(ctx, "proxy.url", proxy); err != nil {
 		return nil, err
 	}
@@ -313,6 +324,11 @@ func (s *AppSettingsService) TestProxy(ctx context.Context, proxy string) (map[s
 	if err != nil || parsed.Host == "" {
 		return nil, fmt.Errorf("代理地址格式不正确(应形如 http://user:pass@host:port)")
 	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		return nil, errors.New("代理协议仅支持 HTTP、HTTPS 或 SOCKS5")
+	}
 
 	transport := &http.Transport{Proxy: http.ProxyURL(parsed)}
 	defer transport.CloseIdleConnections()
@@ -325,7 +341,9 @@ func (s *AppSettingsService) TestProxy(ctx context.Context, proxy string) (map[s
 	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("通过代理请求失败:%v", err)
+		// The transport error can embed a credential-bearing proxy URL. Keep it
+		// out of API responses and logs.
+		return nil, errors.New("通过代理请求失败，请检查代理地址、凭据和网络连通性")
 	}
 	defer resp.Body.Close()
 	elapsed := int(time.Since(start).Milliseconds())
@@ -422,10 +440,10 @@ func (s *AppSettingsService) SaveCredits(ctx context.Context, in CreditSettings)
 		in.InviteReward = 0
 	}
 	if err := s.settings.UpsertValues(ctx, map[string]string{
-		"credits.checkin_enabled":   strconv.FormatBool(in.CheckinEnabled),
-		"credits.checkin_reward":    strconv.Itoa(in.CheckinReward),
-		"credits.invite_enabled":    strconv.FormatBool(in.InviteEnabled),
-		"credits.invite_reward":     strconv.Itoa(in.InviteReward),
+		"credits.checkin_enabled":    strconv.FormatBool(in.CheckinEnabled),
+		"credits.checkin_reward":     strconv.Itoa(in.CheckinReward),
+		"credits.invite_enabled":     strconv.FormatBool(in.InviteEnabled),
+		"credits.invite_reward":      strconv.Itoa(in.InviteReward),
 		"credits.cdk_redeem_enabled": strconv.FormatBool(in.CDKRedeemEnabled),
 	}); err != nil {
 		return nil, err

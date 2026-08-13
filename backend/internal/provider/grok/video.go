@@ -294,7 +294,7 @@ func (c *Client) createPost(ctx context.Context, client tlsclient.HttpClient, to
 	return postID, userID, nil
 }
 
-// waitForAsset polls a generated-asset URL (ranged GET on the local IP —
+// waitForAsset polls a generated-asset URL (ranged GET through the global proxy
 // assets.grok.com is not anti-bot gated) until grok finishes rendering it.
 // 404 means "still rendering"; auth failures abort.
 func (c *Client) waitForAsset(ctx context.Context, client tlsclient.HttpClient, token, url string) error {
@@ -401,7 +401,8 @@ func (c *Client) OpenAsset(ctx context.Context, token, url string) (io.ReadClose
 	if token == "" {
 		return nil, "", ErrAuth
 	}
-	// Asset streaming is pure bandwidth (no anti-bot) — egress on the local IP.
+	// Asset streaming follows the global proxy too, so all account traffic has one
+	// predictable egress route.
 	client, err := c.newDirectTLSClient()
 	if err != nil {
 		return nil, "", err

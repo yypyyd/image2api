@@ -106,7 +106,7 @@
 - 把任意 **OpenAI 兼容的 v1 端点**当成一个账号接入(填 `base_url` + `key`),无需写代码
 - **按 model id 自动路由**:上游声明支持哪些 id,生成该 id 时即走对应上游(可覆盖内置 provider);id 留空 = 全部
 - 模型管理里自由新建自定义模型(id / 文本·图像·视频类型 / 每请求价 / 分辨率·价 / 时长·价 / 多媒体参考能力),按本地价计费
-- 调用**直连不走代理**;上游可配权重与并发,与内置池统一调度
+- 与内置账号一样遵循后台全局代理：配置 `proxy.url` 时所有请求走该代理，留空时从本机直连；上游可配权重与并发,与内置池统一调度
 
 #### 🔐 Token 自动保活
 - 一次性轮换 token(Krea / Imagine)**到期前 10 分钟主动续期**,新 token 自动落库
@@ -193,7 +193,7 @@ curl https://你的域名/v1/images/edits \
 
 > 域名 + HTTPS 由你自己的反向代理处理(本项目不内置证书签发)。
 
-**Docker(推荐)**:`docker compose up -d --build` 一条命令拉起 PostgreSQL + Redis + RustFS + 后端 + 前端(nginx **HTTP 监听容器 2000 端口**),把你的反向代理指到 `http://<本机>:2000`(端口用 `WEB_PORT` 改;要改密码 / 密钥 / `CORS_ORIGINS`(反代走 HTTPS 时把 `COOKIE_SECURE` 设为 `true`),直接改 `docker-compose.yml` 里对应值即可)。服务器无法稳定直连 ChatGPT 时可设置专用 `CHATGPT_PROXY_URL=http://user:password@proxy:port`,它覆盖 ChatGPT 的 bootstrap、额度查询、上传、生成、轮询和媒体下载，但不影响 Adobe 等其他供应商。服务器无法直连 Grok/xAI 时可设置 `GROK_PROXY_URL=http://proxy:port`;该代理仅用于 Grok，并覆盖 Web 账号校验、Statsig、生成、媒体下载以及 Build OAuth/对话链路。Web 链路仍兼容原有 SOCKS 配置,Build OAuth/对话使用 HTTP(S) 代理。
+**Docker(推荐)**:`docker compose up -d --build` 一条命令拉起 PostgreSQL + Redis + RustFS + 后端 + 前端(nginx **HTTP 监听容器 2000 端口**),把你的反向代理指到 `http://<本机>:2000`(端口用 `WEB_PORT` 改;要改密码 / 密钥 / `CORS_ORIGINS`(反代走 HTTPS 时把 `COOKIE_SECURE` 设为 `true`),直接改 `docker-compose.yml` 里对应值即可)。出站代理只由后台“全局代理”(`proxy.url`)控制：填写 `http://user:password@proxy:port`、HTTPS 或 SOCKS5 地址后，Adobe、ChatGPT、Runway、Leonardo、Krea、Imagine、Grok（含 Statsig/Build OAuth）和自定义 OpenAI 兼容账号的导入、刷新、配额、上传、生成、轮询与媒体下载都会走它；清空后全部从本机直连。该值可能含凭据，请仅授予管理员、不要写入日志，并将代理出口限制为应用服务器。
 
 也可**从源码手动构建**,自备 **PostgreSQL · Redis · RustFS(或任意 S3)· 反向代理**:
 
@@ -275,7 +275,7 @@ backend/                       后端源码(Go)
 │   │   ├── leonardo/          Leonardo
 │   │   ├── krea/              Krea
 │   │   ├── imagine/           Imagine.art
-│   │   ├── custom/            自定义上游(OpenAI 兼容 v1,按 id 路由,直连不走代理)
+│   │   ├── custom/            自定义上游(OpenAI 兼容 v1,按 id 路由,遵循全局代理)
 │   │   └── epay/              易支付(mapi 下单 + 回调 MD5 验签,积分充值)
 │   ├── repo/                  数据访问层(用户 / 模型 / 账号 / 日志 / CDK / 订单 / 并发组…)
 │   ├── service/              业务逻辑(生成调度、计费、账号池、保活、维护)

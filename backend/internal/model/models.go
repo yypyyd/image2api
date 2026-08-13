@@ -186,7 +186,7 @@ type TokenAccount struct {
 	Status    string `gorm:"size:32;index;not null"`
 	Fails     int    `gorm:"not null;default:0"`
 	FailTotal int    `gorm:"not null;default:0"`
-	// Provider-side failures (overload / 5xx / circuit open) are tracked apart
+	// Provider-side failures (overload / 5xx) are tracked apart
 	// from Fails/FailTotal: every account fails the same way during an upstream
 	// outage, so they say nothing about this account's health.
 	UpstreamFails         int               `gorm:"not null;default:0"`

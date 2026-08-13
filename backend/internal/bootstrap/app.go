@@ -123,18 +123,32 @@ func NewApp(ctx context.Context) (*App, error) {
 	appSettingsSvc := service.NewAppSettingsService(siteRepo, eventRepo, smtpSvc, rustfsClient)
 	imageAccessSvc := service.NewImageAccessService(cfg.GeneratedRoot, showcaseRepo, authSvc)
 	adobeClient := adobe.NewClient("clio-playground-web", "")
-	chatGPTClient := chatgpt.NewClient(cfg.ChatGPTProxyURL)
+	// Runtime egress is controlled exclusively by the persisted site-wide
+	// proxy.url setting; an empty value means direct local egress for all pools.
+	chatGPTClient := chatgpt.NewClient("")
 	runwayClient := runway.NewClient("")
 	leonardoClient := leonardo.NewClient("")
 	kreaClient := krea.NewClient("")
 	imagineClient := imagine.NewClient("")
 	grokClient := grok.NewClient("")
+	globalProxy, err := siteRepo.GetValue(context.Background(), "proxy.url")
+	if err != nil {
+		return nil, fmt.Errorf("load global proxy setting: %w", err)
+	}
+	adobeClient.SetProxy(globalProxy)
+	chatGPTClient.SetProxy(globalProxy)
+	runwayClient.SetProxy(globalProxy)
+	leonardoClient.SetProxy(globalProxy)
+	kreaClient.SetProxy(globalProxy)
+	imagineClient.SetProxy(globalProxy)
+	grokClient.SetProxy(globalProxy)
 	// Keep grok's x-statsig-id anti-bot recipe current by reading grok's own
 	// headless-browser signer output. Event-driven: seed from the persisted
 	// recipe, capture once at startup, then re-capture only on an anti-bot 403
 	// (a reship made the recipe stale). No polling.
 	startGrokStatsigRefresh(siteRepo)
 	customClient := custom.NewClient()
+	customClient.SetProxy(globalProxy)
 	v1Svc := service.NewV1Service(cfg, modelRepo, userRepo, eventRepo, tokenRepo, siteRepo, cgroupRepo, concSvc, adobeClient, chatGPTClient, runwayClient, leonardoClient, kreaClient, imagineClient, grokClient, customClient, rustfsClient)
 	siteSvc := service.NewSiteService(siteRepo, cfg.AppTitle)
 	showcaseSvc := service.NewShowcaseService(showcaseRepo)
@@ -142,8 +156,8 @@ func NewApp(ctx context.Context) (*App, error) {
 	adminWriteSvc := service.NewAdminWriteService(userRepo, showcaseRepo, modelRepo, eventRepo, apiKeyRepo, tokenRepo, orderRepo)
 	cdkSvc := service.NewCDKService(cdkRepo, userRepo, siteRepo, orderRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo)
-	tokenSvc := service.NewTokenService(tokenRepo, refreshRepo, eventRepo, siteRepo, adobeClient, chatGPTClient, runwayClient, leonardoClient, kreaClient, imagineClient, grokClient)
-	refreshSvc := service.NewRefreshProfileService(refreshRepo, tokenRepo, adobeClient)
+	tokenSvc := service.NewTokenService(tokenRepo, refreshRepo, eventRepo, siteRepo, adobeClient, chatGPTClient, runwayClient, leonardoClient, kreaClient, imagineClient, grokClient, customClient)
+	refreshSvc := service.NewRefreshProfileService(refreshRepo, tokenRepo, siteRepo, adobeClient)
 	// Enable refresh-then-retry on a mid-request Adobe 401 (re-mint access token
 	// from the cookie). Wired post-construction to avoid a ctor init cycle.
 	v1Svc.SetRefresh(refreshSvc)

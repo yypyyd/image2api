@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"backend/internal/model"
-	"backend/internal/provider/adobe"
 )
 
 func poolIDs(items []model.TokenAccount) []string {
@@ -90,20 +89,5 @@ func TestRotateRoundRobinRespectsWeight(t *testing.T) {
 	high := map[string]bool{"high1": true, "high2": true}
 	if !high[got[0]] || !high[got[1]] {
 		t.Fatalf("high-weight accounts not first: %v", got)
-	}
-}
-
-// The breaker-open sentinel must classify as a temporary upstream error (for
-// existing handling) AND as upstream-busy (to stop cross-account failover).
-func TestUpstreamBusyClassification(t *testing.T) {
-	if !isUpstreamBusy(adobe.ErrUpstreamBusy) {
-		t.Fatal("ErrUpstreamBusy not detected as upstream-busy")
-	}
-	_, _, temp, _ := adobeErrClass(adobe.ErrUpstreamBusy)
-	if !temp {
-		t.Fatal("ErrUpstreamBusy must unwrap to ErrTemporaryUpstream")
-	}
-	if isUpstreamBusy(adobe.ErrTemporaryUpstream) {
-		t.Fatal("plain temporary errors must not read as breaker-open")
 	}
 }
