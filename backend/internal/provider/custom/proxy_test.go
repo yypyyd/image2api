@@ -40,3 +40,15 @@ func TestInvalidProxyErrorDoesNotLeakCredentials(t *testing.T) {
 		t.Fatalf("error = %q, want sanitized configuration error", got)
 	}
 }
+
+func TestDirectMediaClientIgnoresConfiguredProxy(t *testing.T) {
+	client := NewClient()
+	client.SetProxy("http://broken@")
+	direct, err := client.httpClientP(false)
+	if err != nil {
+		t.Fatalf("direct media client used configured proxy: %v", err)
+	}
+	if direct.Transport.(*http.Transport).Proxy != nil {
+		t.Fatal("direct media client must disable configured and environment proxies")
+	}
+}

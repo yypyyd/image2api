@@ -100,7 +100,7 @@ func (c *Client) GetSession(ctx context.Context, cookie string) (*Session, error
 	}
 	c.mu.Unlock()
 
-	client, err := c.newDirectTLSClient()
+	client, err := c.newTLSClient()
 	if err != nil {
 		return nil, err
 	}
@@ -240,7 +240,7 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, cookie string) (map[st
 		"variables":     map[string]any{"sub": sess.CognitoSub},
 		"query":         qGetTokens,
 	})
-	body, status, err := c.graphqlP(ctx, sess.AccessToken, payload, false)
+	body, status, err := c.graphqlP(ctx, sess.AccessToken, payload, true)
 	if err != nil {
 		return unknownBalance("network: " + err.Error()), nil
 	}
@@ -284,9 +284,8 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, cookie string) (map[st
 	}, nil
 }
 
-// graphql runs a GraphQL call through the proxy. graphqlP lets callers pick the
-// Egress is uniform: reference upload, submit and polling all follow the global
-// proxy when configured.
+// graphql runs a control-plane GraphQL call through the proxy. graphqlP lets
+// callers pick the route for presigned media-related operations.
 func (c *Client) graphql(ctx context.Context, accessToken string, payload []byte) ([]byte, int, error) {
 	return c.graphqlP(ctx, accessToken, payload, true)
 }
@@ -343,8 +342,7 @@ func unknownBalance(reason string) map[string]any {
 
 func (c *Client) newTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
 
-// newDirectTLSClient preserves historical call sites; the global proxy still
-// applies whenever configured.
+// newDirectTLSClient is reserved for generated artifact downloads.
 func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(false) }
 
 func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
@@ -355,8 +353,10 @@ func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
 		tlsclient.WithTimeoutSeconds(60),
 		tlsclient.WithClientProfile(profiles.Chrome_120),
 	}
-	if proxy := c.proxyValue(); proxy != "" {
-		options = append(options, tlsclient.WithProxyUrl(proxy))
+	if useProxy {
+		if proxy := c.proxyValue(); proxy != "" {
+			options = append(options, tlsclient.WithProxyUrl(proxy))
+		}
 	}
 	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
 }

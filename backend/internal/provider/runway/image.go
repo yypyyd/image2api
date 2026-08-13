@@ -35,8 +35,8 @@ func (c *Client) GenerateImage(ctx context.Context, token, teamID, modelID, prom
 		imageSize = "1K"
 	}
 
-	// Reference upload, task create, polling and download all follow the global
-	// proxy setting.
+	// Control APIs use the global proxy; presigned media PUTs and artifact reads
+	// use direct local egress.
 	submitClient, err := c.newTLSClient()
 	if err != nil {
 		return nil, nil, err
@@ -53,7 +53,7 @@ func (c *Client) GenerateImage(ctx context.Context, token, teamID, modelID, prom
 			continue
 		}
 		filename := fmt.Sprintf("ref_%s_%d.png", time.Now().UTC().Format("20060102_150405"), i+1)
-		assetID, url, upErr := c.uploadReference(ctx, directClient, token, teamID, filename, raw)
+		assetID, url, upErr := c.uploadReference(ctx, submitClient, directClient, token, teamID, filename, raw)
 		if upErr != nil {
 			return nil, nil, upErr
 		}
@@ -82,7 +82,7 @@ func (c *Client) GenerateImage(ctx context.Context, token, teamID, modelID, prom
 	if err != nil {
 		return nil, nil, err
 	}
-	artifactURL, err := c.pollTask(ctx, directClient, token, teamID, taskID)
+	artifactURL, err := c.pollTask(ctx, submitClient, token, teamID, taskID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -107,21 +107,21 @@ func (c *Client) GenerateImage(ctx context.Context, token, teamID, modelID, prom
 // uploadReference uploads one reference image through the dataset pipeline
 // (DATASET_PREVIEW + DATASET uploads → /v1/datasets) and returns its asset id
 // (= dataset id) and the cloudfront URL the task references.
-func (c *Client) uploadReference(ctx context.Context, client tlsclient.HttpClient, token, teamID, filename string, data []byte) (string, string, error) {
+func (c *Client) uploadReference(ctx context.Context, controlClient, dataClient tlsclient.HttpClient, token, teamID, filename string, data []byte) (string, string, error) {
 	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
 		return "", "", errors.New("runway: failed to decode reference image")
 	}
-	previewUploadID, _, err := c.uploadFile(ctx, client, token, teamID, filename, "DATASET_PREVIEW", data)
+	previewUploadID, _, err := c.uploadFile(ctx, controlClient, dataClient, token, teamID, filename, "DATASET_PREVIEW", data)
 	if err != nil {
 		return "", "", err
 	}
 	// The DATASET upload's completed URL is exactly what the task references.
-	datasetUploadID, refURL, err := c.uploadFile(ctx, client, token, teamID, filename, "DATASET", data)
+	datasetUploadID, refURL, err := c.uploadFile(ctx, controlClient, dataClient, token, teamID, filename, "DATASET", data)
 	if err != nil {
 		return "", "", err
 	}
-	assetID, _, err := c.createDataset(ctx, client, token, teamID, filename, datasetUploadID, previewUploadID, cfg.Width, cfg.Height)
+	assetID, _, err := c.createDataset(ctx, controlClient, token, teamID, filename, datasetUploadID, previewUploadID, cfg.Width, cfg.Height)
 	if err != nil {
 		return "", "", err
 	}

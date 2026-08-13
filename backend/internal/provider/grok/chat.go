@@ -32,11 +32,7 @@ func (c *Client) GenerateText(ctx context.Context, token, prompt, mode string) (
 	if err != nil {
 		return "", err
 	}
-	directClient, err := c.newDirectTLSClient()
-	if err != nil {
-		return "", err
-	}
-	c.ensureChallenge(ctx, directClient, token)
+	c.ensureChallenge(ctx, submitClient, token)
 
 	payload := map[string]any{
 		"collectionIds":        []any{},

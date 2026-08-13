@@ -121,7 +121,7 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, token string) (map[str
 	if token == "" {
 		return unknownBalance("empty token"), nil
 	}
-	client, err := c.newDirectTLSClient()
+	client, err := c.newTLSClient()
 	if err != nil {
 		return nil, err
 	}
@@ -204,7 +204,7 @@ func (c *Client) FetchSubscription(ctx context.Context, token string) (*Subscrip
 	if token == "" {
 		return nil, ErrAuth
 	}
-	client, err := c.newDirectTLSClient()
+	client, err := c.newTLSClient()
 	if err != nil {
 		return nil, err
 	}
@@ -268,7 +268,7 @@ func (c *Client) FetchSession(ctx context.Context, token string) (email, userID 
 	if token == "" {
 		return "", "", ErrAuth
 	}
-	client, err := c.newDirectTLSClient()
+	client, err := c.newTLSClient()
 	if err != nil {
 		return "", "", err
 	}
@@ -742,12 +742,9 @@ func (c *Client) applyHeaders(req *http.Request, token string, extra map[string]
 
 func (c *Client) newTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
 
-// newDirectTLSClient keeps direct egress when no Grok proxy is configured. When
-// When the shared proxy setting is present, every Grok endpoint
-// must use it: session/quota probes, the Statsig challenge, media upload, submit,
-// polling, and artifact download all fail on networks where grok.com is blocked.
+// newDirectTLSClient is reserved for reference uploads and generated artifacts.
 func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) {
-	return c.newTLSClientP(c.proxyValue() != "")
+	return c.newTLSClientP(false)
 }
 
 func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
@@ -758,8 +755,10 @@ func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
 		tlsclient.WithClientProfile(profiles.Chrome_133),
 		tlsclient.WithRandomTLSExtensionOrder(),
 	}
-	if proxy := c.proxyValue(); proxy != "" {
-		options = append(options, tlsclient.WithProxyUrl(proxy))
+	if useProxy {
+		if proxy := c.proxyValue(); proxy != "" {
+			options = append(options, tlsclient.WithProxyUrl(proxy))
+		}
 	}
 	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
 }

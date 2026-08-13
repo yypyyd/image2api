@@ -1874,7 +1874,7 @@ func (s *V1Service) VideoJob(ctx context.Context, principal *APIPrincipal, id st
 // OpenVideoContent streams a completed job's video by proxying the stored
 // upstream URL (downloaded on demand — never persisted).
 func (s *V1Service) OpenVideoContent(ctx context.Context, principal *APIPrincipal, id string) (io.ReadCloser, string, error) {
-	proxy := s.applyGlobalProxy(ctx)
+	_ = s.applyGlobalProxy(ctx)
 	ev, err := s.videoEventForUser(ctx, principal, id)
 	if err != nil {
 		return nil, "", err
@@ -1897,12 +1897,13 @@ func (s *V1Service) OpenVideoContent(ctx context.Context, principal *APIPrincipa
 		}
 		return s.grok.OpenAsset(ctx, acct.Value, ev.File)
 	}
-	// Other providers return publicly-fetchable URLs — proxy directly.
+	// Other providers return publicly-fetchable URLs. Artifact bytes are the data
+	// plane and always use direct local egress to preserve the proxy allowance.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ev.File, nil)
 	if err != nil {
 		return nil, "", err
 	}
-	client, err := globalProxyHTTPClient(proxy, 5*time.Minute)
+	client, err := globalProxyHTTPClient("", 5*time.Minute)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1928,7 +1929,7 @@ func (s *V1Service) OpenVideoContent(ctx context.Context, principal *APIPrincipa
 // an API key or web session: this is the directly-downloadable URL returned by
 // the image API, and the event ID is a random opaque identifier.
 func (s *V1Service) OpenImageContent(ctx context.Context, principal *APIPrincipal, id string) (io.ReadCloser, string, error) {
-	proxy := s.applyGlobalProxy(ctx)
+	_ = s.applyGlobalProxy(ctx)
 	ev, err := s.events.GetByID(ctx, strings.TrimSpace(id))
 	if err != nil {
 		return nil, "", err
@@ -1987,7 +1988,7 @@ func (s *V1Service) OpenImageContent(ctx context.Context, principal *APIPrincipa
 	if err != nil {
 		return nil, "", err
 	}
-	client, err := globalProxyHTTPClient(proxy, 5*time.Minute)
+	client, err := globalProxyHTTPClient("", 5*time.Minute)
 	if err != nil {
 		return nil, "", err
 	}

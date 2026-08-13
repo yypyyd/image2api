@@ -129,7 +129,7 @@ func (c *Client) pollVideo(ctx context.Context, accessToken, genID string) (stri
 	}
 
 	for {
-		body, status, err := c.graphqlP(ctx, accessToken, payload, false)
+		body, status, err := c.graphqlP(ctx, accessToken, payload, true)
 		if err != nil {
 			return "", fmt.Errorf("%w: poll: %s", ErrTemporaryUpstream, err.Error())
 		}

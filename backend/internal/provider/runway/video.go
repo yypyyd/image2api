@@ -69,8 +69,8 @@ func (c *Client) GenerateVideo(ctx context.Context, token, teamID, prompt, aspec
 		return nil, nil, errors.New("runway: failed to decode first-frame image")
 	}
 
-	// Every phase follows the global proxy setting: reference upload, dataset
-	// create, submit, polling and download.
+	// Control APIs use the global proxy; presigned media PUTs and artifact reads
+	// use direct local egress.
 	submitClient, err := c.newTLSClient()
 	if err != nil {
 		return nil, nil, err
@@ -81,16 +81,16 @@ func (c *Client) GenerateVideo(ctx context.Context, token, teamID, prompt, aspec
 	}
 
 	filename := "frame_" + time.Now().UTC().Format("20060102_150405") + ".png"
-	previewUploadID, _, err := c.uploadFile(ctx, directClient, token, teamID, filename, "DATASET_PREVIEW", frame)
+	previewUploadID, _, err := c.uploadFile(ctx, submitClient, directClient, token, teamID, filename, "DATASET_PREVIEW", frame)
 	if err != nil {
 		return nil, nil, err
 	}
-	datasetUploadID, _, err := c.uploadFile(ctx, directClient, token, teamID, filename, "DATASET", frame)
+	datasetUploadID, _, err := c.uploadFile(ctx, submitClient, directClient, token, teamID, filename, "DATASET", frame)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	assetID, imageURL, err := c.createDataset(ctx, directClient, token, teamID, filename, datasetUploadID, previewUploadID, cfg.Width, cfg.Height)
+	assetID, imageURL, err := c.createDataset(ctx, submitClient, token, teamID, filename, datasetUploadID, previewUploadID, cfg.Width, cfg.Height)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -108,7 +108,7 @@ func (c *Client) GenerateVideo(ctx context.Context, token, teamID, prompt, aspec
 		return nil, nil, err
 	}
 
-	artifactURL, err := c.pollTask(ctx, directClient, token, teamID, taskID)
+	artifactURL, err := c.pollTask(ctx, submitClient, token, teamID, taskID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -130,8 +130,8 @@ func (c *Client) GenerateVideo(ctx context.Context, token, teamID, prompt, aspec
 
 // uploadFile mirrors gen_video.upload_file: register the upload, PUT the bytes to
 // the returned S3 URL, then complete. Returns the upload id and final url.
-func (c *Client) uploadFile(ctx context.Context, client tlsclient.HttpClient, token, teamID, filename, uploadType string, data []byte) (string, string, error) {
-	info, err := c.apiJSON(ctx, client, token, teamID, http.MethodPost, "/v1/uploads", map[string]any{
+func (c *Client) uploadFile(ctx context.Context, controlClient, dataClient tlsclient.HttpClient, token, teamID, filename, uploadType string, data []byte) (string, string, error) {
+	info, err := c.apiJSON(ctx, controlClient, token, teamID, http.MethodPost, "/v1/uploads", map[string]any{
 		"filename":      filename,
 		"numberOfParts": 1,
 		"type":          uploadType,
@@ -152,12 +152,12 @@ func (c *Client) uploadFile(ctx context.Context, client tlsclient.HttpClient, to
 		}
 	}
 
-	etag, err := c.putBytes(ctx, client, putURL, contentType, data)
+	etag, err := c.putBytes(ctx, dataClient, putURL, contentType, data)
 	if err != nil {
 		return "", "", err
 	}
 
-	res, err := c.apiJSON(ctx, client, token, teamID, http.MethodPost, "/v1/uploads/"+uploadID+"/complete", map[string]any{
+	res, err := c.apiJSON(ctx, controlClient, token, teamID, http.MethodPost, "/v1/uploads/"+uploadID+"/complete", map[string]any{
 		"parts": []map[string]any{{"PartNumber": 1, "ETag": etag}},
 	})
 	if err != nil {

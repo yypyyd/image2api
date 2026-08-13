@@ -84,7 +84,7 @@ func (c *Client) proxyValue() string {
 // assistant text. The web backend always speaks SSE; callers may reshape the
 // completed text into either OpenAI JSON or SSE.
 func (c *Client) GenerateText(ctx context.Context, accessToken, prompt, model string) (string, error) {
-	direct, err := c.newDirectSession(accessToken)
+	direct, err := c.newSession(accessToken)
 	if err != nil {
 		return "", err
 	}
@@ -375,9 +375,13 @@ func applyAssistantEvent(raw []byte, current string, active bool) (string, bool,
 }
 
 func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, aspectRatio, resolution string, refs [][]byte, downloadResult bool) ([]byte, map[string]any, error) {
-	// With the global proxy configured, every phase uses the same egress. This
-	// prevents Cloudflare from seeing an impossible mid-session region change.
-	session, err := c.newDirectSession(accessToken)
+	// Control-plane requests use the global proxy. Large file PUTs and artifact
+	// downloads use a separate direct session to keep proxy traffic small.
+	session, err := c.newSession(accessToken)
+	if err != nil {
+		return nil, nil, err
+	}
+	directSession, err := c.newDirectSession(accessToken)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -400,7 +404,7 @@ func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, 
 		return nil, nil, err
 	}
 	effectivePrompt := injectSizeHint(prompt, aspectRatio, resolution)
-	uploadedRefs, err := c.uploadReferenceImages(ctx, session, accessToken, refs)
+	uploadedRefs, err := c.uploadReferenceImages(ctx, session, directSession, accessToken, refs)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -444,7 +448,7 @@ func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, 
 	if !downloadResult {
 		return nil, meta, nil
 	}
-	images, err := c.downloadBytes(ctx, session, accessToken, urls)
+	images, err := c.downloadBytes(ctx, directSession, accessToken, urls)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -498,7 +502,7 @@ func ExtractAccountInfo(token string) map[string]any {
 }
 
 func (c *Client) FetchImageQuota(ctx context.Context, accessToken string) (map[string]any, error) {
-	session, err := c.newDirectSession(accessToken)
+	session, err := c.newSession(accessToken)
 	if err != nil {
 		return nil, err
 	}
@@ -508,7 +512,7 @@ func (c *Client) FetchImageQuota(ctx context.Context, accessToken string) (map[s
 // FetchImageQuotaDirect preserves the historical API name. Its egress follows
 // the same global proxy setting as every other ChatGPT request.
 func (c *Client) FetchImageQuotaDirect(ctx context.Context, accessToken string) (map[string]any, error) {
-	session, err := c.newDirectSession(accessToken)
+	session, err := c.newSession(accessToken)
 	if err != nil {
 		return nil, err
 	}
@@ -576,10 +580,9 @@ func (c *Client) newSession(accessToken string) (tlsclient.HttpClient, error) {
 	return c.newSessionP(accessToken, true)
 }
 
-// newDirectSession preserves the historical call sites but uses the dedicated
-// ChatGPT proxy when configured. Without one it remains a direct session.
+// newDirectSession is reserved for presigned uploads and generated artifacts.
 func (c *Client) newDirectSession(accessToken string) (tlsclient.HttpClient, error) {
-	return c.newSessionP(accessToken, c.proxyValue() != "")
+	return c.newSessionP(accessToken, false)
 }
 
 func (c *Client) newSessionP(accessToken string, useProxy bool) (tlsclient.HttpClient, error) {
@@ -590,8 +593,10 @@ func (c *Client) newSessionP(accessToken string, useProxy bool) (tlsclient.HttpC
 		tlsclient.WithClientProfile(profiles.Chrome_110),
 		tlsclient.WithRandomTLSExtensionOrder(),
 	}
-	if proxy := c.proxyValue(); proxy != "" {
-		options = append(options, tlsclient.WithProxyUrl(proxy))
+	if useProxy {
+		if proxy := c.proxyValue(); proxy != "" {
+			options = append(options, tlsclient.WithProxyUrl(proxy))
+		}
 	}
 	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
 	if err != nil {
@@ -783,7 +788,7 @@ func (c *Client) imageHeaders(accessToken, path string, reqs *chatRequirements, 
 	return h
 }
 
-func (c *Client) uploadReferenceImages(ctx context.Context, session tlsclient.HttpClient, accessToken string, refs [][]byte) ([]uploadedReference, error) {
+func (c *Client) uploadReferenceImages(ctx context.Context, controlSession, directSession tlsclient.HttpClient, accessToken string, refs [][]byte) ([]uploadedReference, error) {
 	if len(refs) == 0 {
 		return nil, nil
 	}
@@ -793,14 +798,14 @@ func (c *Client) uploadReferenceImages(ctx context.Context, session tlsclient.Ht
 		if err != nil {
 			return nil, err
 		}
-		entry, err := c.createFileEntry(ctx, session, accessToken, meta)
+		entry, err := c.createFileEntry(ctx, controlSession, accessToken, meta)
 		if err != nil {
 			return nil, err
 		}
-		if err := c.uploadRawFile(ctx, session, entry.UploadURL, meta.MimeType, ref); err != nil {
+		if err := c.uploadRawFile(ctx, directSession, entry.UploadURL, meta.MimeType, ref); err != nil {
 			return nil, err
 		}
-		libraryFileID, err := c.processUploadStream(ctx, session, accessToken, entry.FileID, meta.FileName)
+		libraryFileID, err := c.processUploadStream(ctx, controlSession, accessToken, entry.FileID, meta.FileName)
 		if err != nil {
 			return nil, err
 		}

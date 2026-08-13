@@ -273,7 +273,7 @@ func (c *Client) RefreshIfNeeded(ctx context.Context, cred string) (string, bool
 }
 
 func (c *Client) refreshPost(ctx context.Context, refreshToken string) ([]byte, int, error) {
-	client, err := c.newDirectTLSClient()
+	client, err := c.newTLSClient()
 	if err != nil {
 		return nil, 0, err
 	}
@@ -314,7 +314,7 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, cred string) (map[stri
 		return unknownBalance("bad credential"), nil
 	}
 	userID := userIDFromToken(cr.Token)
-	body, status, err := c.apiGetP(ctx, cr.Token, apiBase+"/v1/credit?org_id="+userID, false)
+	body, status, err := c.apiGetP(ctx, cr.Token, apiBase+"/v1/credit?org_id="+userID, true)
 	if err != nil {
 		return unknownBalance("network: " + err.Error()), nil
 	}
@@ -382,8 +382,7 @@ func (c *Client) apiGetP(ctx context.Context, token, url string, useProxy bool) 
 
 func (c *Client) newTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
 
-// newDirectTLSClient preserves historical call sites; the global proxy still
-// applies whenever configured.
+// newDirectTLSClient is reserved for generated artifact downloads.
 func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(false) }
 
 func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
@@ -391,8 +390,10 @@ func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
 		tlsclient.WithTimeoutSeconds(60),
 		tlsclient.WithClientProfile(profiles.Chrome_120),
 	}
-	if proxy := c.proxyValue(); proxy != "" {
-		options = append(options, tlsclient.WithProxyUrl(proxy))
+	if useProxy {
+		if proxy := c.proxyValue(); proxy != "" {
+			options = append(options, tlsclient.WithProxyUrl(proxy))
+		}
 	}
 	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
 }

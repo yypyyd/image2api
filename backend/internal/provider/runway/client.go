@@ -234,7 +234,7 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, token string) (map[str
 		return unknownBalance("no team id"), nil
 	}
 
-	client, err := c.newDirectTLSClient()
+	client, err := c.newTLSClient()
 	if err != nil {
 		return nil, err
 	}
@@ -299,8 +299,7 @@ func unknownBalance(reason string) map[string]any {
 
 func (c *Client) newTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
 
-// newDirectTLSClient preserves historical call sites; global proxy egress is
-// still applied by newTLSClientP whenever one is configured.
+// newDirectTLSClient is used for presigned media uploads and artifact downloads.
 func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(false) }
 
 func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
@@ -313,8 +312,10 @@ func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
 		tlsclient.WithClientProfile(profiles.Chrome_133),
 		tlsclient.WithRandomTLSExtensionOrder(),
 	}
-	if proxy := c.proxyValue(); proxy != "" {
-		options = append(options, tlsclient.WithProxyUrl(proxy))
+	if useProxy {
+		if proxy := c.proxyValue(); proxy != "" {
+			options = append(options, tlsclient.WithProxyUrl(proxy))
+		}
 	}
 	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
 }

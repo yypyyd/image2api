@@ -82,6 +82,19 @@ func TestSystemUnderLoadRemainsTemporaryWithoutBreaker(t *testing.T) {
 	}
 }
 
+func TestAdobeMediaSessionStaysDirectWhenProxyConfigured(t *testing.T) {
+	// A malformed proxy is useful here: control-plane construction must validate
+	// it, while the media session must remain constructible because it never uses
+	// the proxy at all.
+	client := NewClient("test", "http://%zz")
+	if _, err := client.newDirectTLSClient(); err != nil {
+		t.Fatalf("direct media session unexpectedly used configured proxy: %v", err)
+	}
+	if _, err := client.newTLSClient(); err == nil {
+		t.Fatal("control-plane session accepted malformed configured proxy")
+	}
+}
+
 func TestContentRejectionClassification(t *testing.T) {
 	privacyBody := `{"error_code":"reference_image_privacy_error","message":"The reference image contains a real person's face and cannot be used to generate content."}`
 	if !isContentRejection(451, privacyBody) {

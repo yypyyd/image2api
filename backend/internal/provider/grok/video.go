@@ -60,8 +60,8 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 		seconds = 10
 	}
 
-	// Separate clients keep the long-lived submit and media operations isolated.
-	// With a Grok proxy configured, both use it so the full flow stays reachable.
+	// Control requests use the proxy; reference uploads and generated assets use
+	// direct local egress.
 	submitClient, err := c.newTLSClient()
 	if err != nil {
 		return nil, nil, err
@@ -76,9 +76,9 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 	// which go stale on a new grok web build and make conversations/new answer
 	// 403 (anti-bot). The challenge uses the configured Grok proxy when present;
 	// failure is non-fatal (statsigID then uses defaults).
-	c.ensureChallenge(ctx, directClient, token)
+	c.ensureChallenge(ctx, submitClient, token)
 
-	// Image-to-video: upload each reference frame and collect its asset URL.
+	// Image-to-video: upload each reference frame directly and collect its asset URL.
 	var imageRefs []string
 	for _, f := range frames {
 		if len(f) == 0 {
@@ -294,8 +294,8 @@ func (c *Client) createPost(ctx context.Context, client tlsclient.HttpClient, to
 	return postID, userID, nil
 }
 
-// waitForAsset polls a generated-asset URL (ranged GET through the global proxy
-// assets.grok.com is not anti-bot gated) until grok finishes rendering it.
+// waitForAsset polls a generated-asset URL with ranged direct GETs until Grok
+// finishes rendering it; assets.grok.com is not anti-bot gated.
 // 404 means "still rendering"; auth failures abort.
 func (c *Client) waitForAsset(ctx context.Context, client tlsclient.HttpClient, token, url string) error {
 	deadline := time.Now().Add(6 * time.Minute)

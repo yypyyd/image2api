@@ -169,7 +169,7 @@ func (c *Client) proxyValue() string {
 }
 
 func (c *Client) ExchangeCookie(ctx context.Context, cookie string) (*CookieExchangeResult, error) {
-	sess, err := c.newDirectTLSClient()
+	sess, err := c.newTLSClient()
 	if err != nil {
 		return nil, err
 	}
@@ -315,7 +315,11 @@ func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspe
 	if err != nil {
 		return nil, nil, err
 	}
-	pollSess, err := c.newDirectTLSClient()
+	pollSess, err := c.newTLSClient()
+	if err != nil {
+		return nil, nil, err
+	}
+	downloadSess, err := c.newDirectTLSClient()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -337,7 +341,7 @@ generationAttempts:
 		for _, payload := range candidates {
 			respBody, pollURL, submitErr := c.submitImage(ctx, submitSess, token, prompt, endpoint, payload)
 			if submitErr == nil {
-				meta, data, pollErr := c.pollImage(ctx, pollSess, token, pollURL, downloadResult)
+				meta, data, pollErr := c.pollImage(ctx, pollSess, downloadSess, token, pollURL, downloadResult)
 				if isRetryableGeneratedImageRejection(pollErr) {
 					lastErr = pollErr
 					continue generationAttempts
@@ -381,7 +385,11 @@ func (c *Client) GenerateVideo(ctx context.Context, token, engine, prompt, aspec
 	if err != nil {
 		return nil, nil, err
 	}
-	pollSess, err := c.newDirectTLSClient()
+	pollSess, err := c.newTLSClient()
+	if err != nil {
+		return nil, nil, err
+	}
+	downloadSess, err := c.newDirectTLSClient()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -396,7 +404,7 @@ func (c *Client) GenerateVideo(ctx context.Context, token, engine, prompt, aspec
 		return nil, nil, err
 	}
 	_ = respBody
-	meta, data, pollErr := c.pollVideo(ctx, pollSess, token, pollURL, downloadResult)
+	meta, data, pollErr := c.pollVideo(ctx, pollSess, downloadSess, token, pollURL, downloadResult)
 	if pollErr != nil {
 		return nil, nil, pollErr
 	}
@@ -408,7 +416,7 @@ func (c *Client) FetchAccountProfile(ctx context.Context, token string) (map[str
 	if token == "" {
 		return map[string]any{}, nil
 	}
-	sess, err := c.newDirectTLSClient()
+	sess, err := c.newTLSClient()
 	if err != nil {
 		return nil, err
 	}
@@ -493,7 +501,7 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, token string) (map[str
 		}, nil
 	}
 
-	sess, err := c.newDirectTLSClient()
+	sess, err := c.newTLSClient()
 	if err != nil {
 		return nil, err
 	}
@@ -673,7 +681,7 @@ func (c *Client) submitImage(ctx context.Context, sess *tlsSession, token, promp
 	return respBody, "", errors.New("submit ok but no poll url")
 }
 
-func (c *Client) pollImage(ctx context.Context, sess *tlsSession, token, pollURL string, downloadResult bool) (map[string]any, []byte, error) {
+func (c *Client) pollImage(ctx context.Context, sess, downloadSess *tlsSession, token, pollURL string, downloadResult bool) (map[string]any, []byte, error) {
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, fmt.Errorf("adobe generation timed out: %w", err)
@@ -734,7 +742,7 @@ func (c *Client) pollImage(ctx context.Context, sess *tlsSession, token, pollURL
 						if !downloadResult {
 							return payload, nil, nil
 						}
-						data, err := c.download(ctx, sess, url)
+						data, err := c.download(ctx, downloadSess, url)
 						if err != nil {
 							return nil, nil, err
 						}
@@ -861,7 +869,7 @@ func (c *Client) submitVideo(ctx context.Context, sess *tlsSession, token, endpo
 	return respBody, "", errors.New("video submit ok but no poll url")
 }
 
-func (c *Client) pollVideo(ctx context.Context, sess *tlsSession, token, pollURL string, downloadResult bool) (map[string]any, []byte, error) {
+func (c *Client) pollVideo(ctx context.Context, sess, downloadSess *tlsSession, token, pollURL string, downloadResult bool) (map[string]any, []byte, error) {
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, fmt.Errorf("adobe video generation timed out: %w", err)
@@ -924,7 +932,7 @@ func (c *Client) pollVideo(ctx context.Context, sess *tlsSession, token, pollURL
 						if !downloadResult {
 							return payload, nil, nil
 						}
-						data, err := c.download(ctx, sess, raw)
+						data, err := c.download(ctx, downloadSess, raw)
 						if err != nil {
 							return nil, nil, err
 						}
@@ -1060,15 +1068,15 @@ type tlsSession struct {
 	fp     fingerprint
 }
 
-// Every Adobe session follows the same global egress rule: use the configured
-// proxy when non-empty, otherwise connect directly from the local host. The
-// historical "direct" helper remains only to keep call sites readable.
+// Control-plane requests use the configured administrator proxy. Large media
+// uploads and artifact downloads deliberately use the direct helper below so a
+// small proxy allowance is not consumed by image/video bytes.
 func (c *Client) newTLSClient() (*tlsSession, error) {
 	return c.newTLSSession(randomFingerprint(), true)
 }
 
 func (c *Client) newDirectTLSClient() (*tlsSession, error) {
-	return c.newTLSSession(randomFingerprint(), c.proxyValue() != "")
+	return c.newTLSSession(randomFingerprint(), false)
 }
 
 func (c *Client) newTLSSession(fp fingerprint, useProxy bool) (*tlsSession, error) {

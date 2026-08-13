@@ -22,7 +22,7 @@ const (
 // ensureProject returns a flux project id for the account: the first existing
 // project, or a freshly created one. Generation requires a project.
 func (c *Client) ensureProject(ctx context.Context, cookie string) (string, error) {
-	body, status, err := c.apiGetP(ctx, cookie, "/api/flux-projects", false)
+	body, status, err := c.apiGetP(ctx, cookie, "/api/flux-projects", true)
 	if err != nil {
 		return "", fmt.Errorf("%w: list projects: %s", ErrTemporaryUpstream, err.Error())
 	}
@@ -193,7 +193,7 @@ func (c *Client) pollImage(ctx context.Context, cookie, jobID string) (string, e
 	}
 
 	for {
-		body, status, err := c.apiGetP(ctx, cookie, "/api/job-status?id="+jobID, false)
+		body, status, err := c.apiGetP(ctx, cookie, "/api/job-status?id="+jobID, true)
 		if err == nil && status == 200 {
 			var js struct {
 				Status string `json:"status"`
@@ -224,7 +224,7 @@ func (c *Client) pollImage(ctx context.Context, cookie, jobID string) (string, e
 
 // assetForJob finds the generated asset produced by a job and returns its URL.
 func (c *Client) assetForJob(ctx context.Context, cookie, jobID string) (string, error) {
-	body, status, err := c.apiGetP(ctx, cookie, "/api/assets?filter=generated&offset=0", false)
+	body, status, err := c.apiGetP(ctx, cookie, "/api/assets?filter=generated&offset=0", true)
 	if err != nil || status != 200 {
 		return "", fmt.Errorf("assets http %d", status)
 	}
@@ -280,8 +280,7 @@ func (c *Client) apiPost(ctx context.Context, cookie, path, contentType string, 
 	return c.apiPostP(ctx, cookie, path, contentType, body, true)
 }
 
-// apiPostP keeps the historical useProxy argument for call-site clarity; every
-// request follows the global proxy when configured.
+// apiPostP selects proxy egress for control requests and direct egress for media.
 func (c *Client) apiPostP(ctx context.Context, cookie, path, contentType string, body []byte, useProxy bool) ([]byte, int, error) {
 	client, err := c.newTLSClientP(useProxy)
 	if err != nil {
@@ -320,5 +319,5 @@ func (c *Client) apiPostP(ctx context.Context, cookie, path, contentType string,
 func (c *Client) apiPostJSON(ctx context.Context, cookie, path string, payload any) ([]byte, int, error) {
 	// Project bootstrap and generation both follow the global proxy setting.
 	b, _ := json.Marshal(payload)
-	return c.apiPostP(ctx, cookie, path, "application/json", b, false)
+	return c.apiPostP(ctx, cookie, path, "application/json", b, true)
 }

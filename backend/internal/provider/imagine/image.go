@@ -110,7 +110,7 @@ func (c *Client) pollImage(ctx context.Context, token, userID, batchID string) (
 
 	url := teamsBase + "/v1/org/" + userID + "/objects?batch=true&limit=50&service=image,chat-image"
 	for {
-		body, status, err := c.apiGetP(ctx, token, url, false)
+		body, status, err := c.apiGetP(ctx, token, url, true)
 		if err == nil && status == 200 {
 			var resp struct {
 				Data []struct {

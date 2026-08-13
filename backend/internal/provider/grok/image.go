@@ -29,8 +29,7 @@ func (c *Client) GenerateImage(ctx context.Context, token, prompt, aspectRatio s
 	}
 	aspectRatio = normalizeImageAspectRatio(aspectRatio)
 
-	// Separate clients keep the submit/download lifecycles independent. With a
-	// Grok proxy configured, both clients use it so the full flow has one egress.
+	// Control requests use the proxy; generated asset downloads use direct egress.
 	submitClient, err := c.newTLSClient()
 	if err != nil {
 		return nil, nil, err
@@ -39,14 +38,14 @@ func (c *Client) GenerateImage(ctx context.Context, token, prompt, aspectRatio s
 	if err != nil {
 		return nil, nil, err
 	}
-	c.ensureChallenge(ctx, directClient, token)
+	c.ensureChallenge(ctx, submitClient, token)
 
 	// The web client's own conversation payload; modeId "fast" is Lite.
 	payload := map[string]any{
 		// The current Grok Imagine API reads image generation options from
 		// mediaGenInput.  Keeping the explicit modelName is important: the older
 		// enableImageGeneration flag alone silently falls back to a square image.
-		"modelName": "imagine-image-gen",
+		"modelName":            "imagine-image-gen",
 		"collectionIds":        []any{},
 		"disabledConnectorIds": []any{},
 		"deviceEnvInfo": map[string]any{
@@ -76,21 +75,21 @@ func (c *Client) GenerateImage(ctx context.Context, token, prompt, aspectRatio s
 				// Do not pass the UI/catalog ratio pair (e.g. [16, 9]) here: the
 				// upstream parser rejects it with "invalid value for string field
 				// aspectRatio: [".
-				"aspectRatio": aspectRatio,
+				"aspectRatio":    aspectRatio,
 				"resolutionName": "1k",
-				"mode":        "fast",
+				"mode":           "fast",
 			},
 		},
-		"modeId":                      "fast",
+		"modeId": "fast",
 		"responseMetadata": map[string]any{
 			"modelConfigOverride": map[string]any{
 				"modelMap": map[string]any{"imageEditModel": "imagine"},
 			},
 		},
-		"returnImageBytes":            false,
-		"returnRawGrokInXaiRequest":   false,
-		"sendFinalMetadata":           true,
-		"temporary":                   true,
+		"returnImageBytes":          false,
+		"returnRawGrokInXaiRequest": false,
+		"sendFinalMetadata":         true,
+		"temporary":                 true,
 	}
 
 	// body may be partial when psErr != nil — the artifact often already appeared.

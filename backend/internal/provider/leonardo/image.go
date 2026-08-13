@@ -57,7 +57,7 @@ func (c *Client) uploadInitImage(ctx context.Context, accessToken string, img []
 		"query":         mUploadImage,
 		"variables":     map[string]any{"uploadImageInput": map[string]any{"uploadType": "INIT", "extension": "png"}},
 	})
-	body, status, err := c.graphqlP(ctx, accessToken, payload, false)
+	body, status, err := c.graphqlP(ctx, accessToken, payload, true)
 	if err != nil {
 		return "", fmt.Errorf("%w: upload-init: %s", ErrTemporaryUpstream, err.Error())
 	}
@@ -264,7 +264,7 @@ func (c *Client) pollImage(ctx context.Context, accessToken, genID string) (stri
 	}
 
 	for {
-		body, status, err := c.graphqlP(ctx, accessToken, payload, false)
+		body, status, err := c.graphqlP(ctx, accessToken, payload, true)
 		if err != nil {
 			return "", fmt.Errorf("%w: poll: %s", ErrTemporaryUpstream, err.Error())
 		}

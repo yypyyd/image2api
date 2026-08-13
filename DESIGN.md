@@ -1,17 +1,21 @@
 # Design Notes
 
-### 2026-08-14 - Unified global upstream egress and unrestricted Adobe submits
+### 2026-08-14 - Control-plane proxy, direct media egress, and unrestricted Adobe submits
 
 **Change**: The persisted administrator setting `proxy.url` is now the one
 runtime egress rule for every account type: Adobe, ChatGPT, Runway, Leonardo,
 Krea, Imagine, Grok (including headless Statsig capture and Build OAuth), and
 custom OpenAI-compatible upstreams. It applies to account import, credential
-refresh, quota/profile calls, reference upload, generation submit, polling,
-artifact download, and the gateway's no-store media relay. A non-empty value
-routes all of those calls through the proxy; an empty or missing value clears
-all client proxy state and connects directly from the local server. Legacy
-provider-specific proxy environment settings no longer participate in runtime
-routing.
+refresh, quota/profile calls, generation submit, polling, and other
+control-plane requests. Large reference-media uploads and generated artifact
+downloads use direct local egress for every provider, and the no-store media
+relay also fetches provider artifacts directly. Providers that combine media
+bytes with control fields in one multipart request send that whole request
+directly because HTTPS cannot split headers and body across routes. A non-empty
+value routes control-plane calls through the proxy; an empty or missing value
+clears all client proxy state and connects directly from the local server.
+Legacy provider-specific proxy environment settings no longer participate in
+runtime routing.
 
 Adobe submit lanes, adaptive inter-submit spacing, and the endpoint circuit
 breaker have been removed. A submit is dispatched as soon as its selected

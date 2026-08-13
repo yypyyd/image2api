@@ -68,6 +68,10 @@ func sanitizeErr(err error) string {
 }
 
 func (c *Client) httpClient() (*http.Client, error) {
+	return c.httpClientP(true)
+}
+
+func (c *Client) httpClientP(useProxy bool) (*http.Client, error) {
 	c.mu.RLock()
 	proxyRaw := c.proxy
 	c.mu.RUnlock()
@@ -76,7 +80,7 @@ func (c *Client) httpClient() (*http.Client, error) {
 	// Do not inherit HTTP_PROXY/HTTPS_PROXY from the process: an empty admin
 	// setting means explicit local egress for every account type.
 	transport.Proxy = nil
-	if proxyRaw != "" {
+	if useProxy && proxyRaw != "" {
 		proxyURL, err := url.Parse(proxyRaw)
 		if err != nil || proxyURL.Host == "" {
 			return nil, errors.New("invalid global proxy configuration")
@@ -92,7 +96,11 @@ func (c *Client) httpClient() (*http.Client, error) {
 }
 
 func (c *Client) do(req *http.Request) (*http.Response, error) {
-	client, err := c.httpClient()
+	return c.doP(req, true)
+}
+
+func (c *Client) doP(req *http.Request, useProxy bool) (*http.Response, error) {
+	client, err := c.httpClientP(useProxy)
 	if err != nil {
 		return nil, err
 	}
@@ -281,7 +289,7 @@ func (c *Client) GenerateImage(ctx context.Context, baseURL, apiKey, model, prom
 	req = req.WithContext(ctx)
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
-	resp, err := c.do(req)
+	resp, err := c.doP(req, len(refs) == 0)
 	if err != nil {
 		return nil, "", fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
 	}
@@ -324,7 +332,7 @@ func (c *Client) GenerateVideo(ctx context.Context, baseURL, apiKey, model, prom
 			_, _ = fw.Write(f)
 		}
 		_ = w.Close()
-		created, err = c.doMultipart(ctx, baseURL+"/v1/videos", apiKey, body, w.FormDataContentType())
+		created, err = c.doMultipartP(ctx, baseURL+"/v1/videos", apiKey, body, w.FormDataContentType(), false)
 	} else {
 		payload := map[string]any{"model": model, "prompt": prompt}
 		if size != "" {
@@ -383,6 +391,10 @@ func (c *Client) GenerateVideo(ctx context.Context, baseURL, apiKey, model, prom
 }
 
 func (c *Client) doJSON(ctx context.Context, method, url, apiKey string, body []byte) (map[string]any, error) {
+	return c.doJSONP(ctx, method, url, apiKey, body, true)
+}
+
+func (c *Client) doJSONP(ctx context.Context, method, url, apiKey string, body []byte, useProxy bool) (map[string]any, error) {
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
@@ -396,7 +408,7 @@ func (c *Client) doJSON(ctx context.Context, method, url, apiKey string, body []
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := c.do(req)
+	resp, err := c.doP(req, useProxy)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
 	}
@@ -416,6 +428,10 @@ func (c *Client) doJSON(ctx context.Context, method, url, apiKey string, body []
 }
 
 func (c *Client) doMultipart(ctx context.Context, url, apiKey string, body io.Reader, contentType string) (map[string]any, error) {
+	return c.doMultipartP(ctx, url, apiKey, body, contentType, true)
+}
+
+func (c *Client) doMultipartP(ctx context.Context, url, apiKey string, body io.Reader, contentType string, useProxy bool) (map[string]any, error) {
 	req, err := http.NewRequest(http.MethodPost, url, body)
 	if err != nil {
 		return nil, err
@@ -423,7 +439,7 @@ func (c *Client) doMultipart(ctx context.Context, url, apiKey string, body io.Re
 	req = req.WithContext(ctx)
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", contentType)
-	resp, err := c.do(req)
+	resp, err := c.doP(req, useProxy)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
 	}
@@ -446,7 +462,7 @@ func (c *Client) download(ctx context.Context, url, apiKey string) ([]byte, erro
 	req, _ := http.NewRequest(http.MethodGet, url, nil)
 	req = req.WithContext(ctx)
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	resp, err := c.do(req)
+	resp, err := c.doP(req, false)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
 	}
@@ -487,7 +503,7 @@ func (c *Client) imageFromResponse(ctx context.Context, body []byte, downloadRes
 		return nil, url, nil
 	}
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	resp, err := c.do(req)
+	resp, err := c.doP(req, false)
 	if err != nil {
 		return nil, "", fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
 	}

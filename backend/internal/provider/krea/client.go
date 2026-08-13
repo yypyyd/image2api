@@ -140,7 +140,7 @@ func (c *Client) RefreshIfNeeded(ctx context.Context, cookie string) (string, bo
 }
 
 func (c *Client) refreshPost(ctx context.Context, refreshToken string) ([]byte, int, error) {
-	client, err := c.newDirectTLSClient()
+	client, err := c.newTLSClient()
 	if err != nil {
 		return nil, 0, err
 	}
@@ -316,7 +316,7 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, cookie string) (map[st
 	defer cancel()
 	// NOTE: no /app here — the heavy SSR activation is done separately (on recovery
 	// and at generation via Activate). This probe just reads the current balance.
-	body, status, err := c.apiGetP(probeCtx, cookie, "/api/billing-data", false)
+	body, status, err := c.apiGetP(probeCtx, cookie, "/api/billing-data", true)
 	if err != nil {
 		return unknownBalance("network: " + err.Error()), nil
 	}
@@ -375,7 +375,7 @@ func (c *Client) Activate(ctx context.Context, cookie string) {
 	}
 	actCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
 	defer cancel()
-	_, _, _ = c.apiGetP(actCtx, cookie, "/app", false)
+	_, _, _ = c.apiGetP(actCtx, cookie, "/app", true)
 	c.mu.Lock()
 	c.actAt[key] = time.Now().Unix()
 	c.mu.Unlock()
@@ -406,8 +406,7 @@ func (c *Client) apiGet(ctx context.Context, cookie, path string) ([]byte, int, 
 	return c.apiGetP(ctx, cookie, path, true)
 }
 
-// apiGetP keeps the historical useProxy argument for call-site clarity; the
-// global proxy is applied whenever configured, including polling and assets.
+// apiGetP selects proxy egress for control requests.
 func (c *Client) apiGetP(ctx context.Context, cookie, path string, useProxy bool) ([]byte, int, error) {
 	client, err := c.newTLSClientP(useProxy)
 	if err != nil {
@@ -443,8 +442,7 @@ func (c *Client) apiGetP(ctx context.Context, cookie, path string, useProxy bool
 
 func (c *Client) newTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
 
-// newDirectTLSClient preserves historical call sites; the global proxy still
-// applies whenever configured.
+// newDirectTLSClient is reserved for generated artifact downloads.
 func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(false) }
 
 func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
@@ -452,8 +450,10 @@ func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {
 		tlsclient.WithTimeoutSeconds(60),
 		tlsclient.WithClientProfile(profiles.Chrome_120),
 	}
-	if proxy := c.proxyValue(); proxy != "" {
-		options = append(options, tlsclient.WithProxyUrl(proxy))
+	if useProxy {
+		if proxy := c.proxyValue(); proxy != "" {
+			options = append(options, tlsclient.WithProxyUrl(proxy))
+		}
 	}
 	return tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), options...)
 }
