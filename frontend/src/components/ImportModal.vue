@@ -16,7 +16,7 @@ const fileItems = ref([])
 const fileNames = ref([])
 
 // type → token pool (for the post-import weight PATCH).
-const TYPE_POOL = { openai: 'chatgpt', adobe: 'adobe', runway: 'runway', leonardo: 'leonardo', krea: 'krea', imagine: 'imagine', grok: 'grok' }
+const TYPE_POOL = { openai: 'chatgpt', adobe: 'adobe', runway: 'runway', leonardo: 'leonardo', krea: 'krea', imagine: 'imagine', grok: 'grok', oreate: 'oreate' }
 
 // Live preview of what the parser would extract — updates as the user types
 // so they can see whether their paste was understood before clicking import.
@@ -29,7 +29,8 @@ const detected = computed(() => {
   const krea = items.filter((x) => x.type === 'krea').length
   const imagine = items.filter((x) => x.type === 'imagine').length
   const grok = items.filter((x) => x.type === 'grok').length
-  return { total: items.length, openai, adobe, runway, leonardo, krea, imagine, grok }
+  const oreate = items.filter((x) => x.type === 'oreate').length
+  return { total: items.length, openai, adobe, runway, leonardo, krea, imagine, grok, oreate }
 })
 
 const importItems = computed(() => uniqueImportItems([...parseImportInput(input.value), ...fileItems.value]))
@@ -53,6 +54,15 @@ async function doSmartImport() {
     try {
       const r = it.type === 'openai'
         ? await api('/tokens/import-chatgpt-token', jsonBody('POST', { access_token: it.value }))
+        : it.type === 'oreate'
+          ? await api('/tokens/import-oreate-account', jsonBody('POST', {
+            cookie: it.value,
+            email: it.meta?.email || '',
+            ouid: it.meta?.ouid || '',
+            user_agent: it.meta?.user_agent || '',
+            reg_ts: Number(it.meta?.reg_ts || 0),
+            vip: it.meta?.vip || '0',
+          }))
         : it.type === 'grok'
           ? await api('/tokens/import-grok-token', jsonBody('POST', { access_token: it.value }))
         : it.type === 'runway'
@@ -139,6 +149,7 @@ function clearFiles() {
           <strong class="text-slate-700">Krea Cookie</strong>(含 sb-superb-auth)、
           <strong class="text-slate-700">Imagine Token</strong>(<code class="px-1 bg-slate-100 rounded">{"token","refreshToken","email","parentId"}</code>)、
           <strong class="text-slate-700">Grok SSO</strong>(grok.com 的 <code class="px-1 bg-slate-100 rounded">sso</code> 值或 grok2api JSON,仅含 session_id,自动与 ChatGPT/Runway 区分)、
+          <strong class="text-slate-700">OreateAI 账号 JSON</strong>(只导入 Cookie，不保存密码)、
           <strong class="text-slate-700">多个 JWT</strong>(换行分隔)。
           全粘进来即可，无需任何前缀。
         </p>
@@ -177,6 +188,9 @@ function clearFiles() {
             </span>
             <span v-if="detected.grok" class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-slate-700 bg-slate-100 ring-1 ring-slate-300">
               Grok · <span class="tabular-nums">{{ detected.grok }}</span>
+            </span>
+            <span v-if="detected.oreate" class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-cyan-700 bg-cyan-50 ring-1 ring-cyan-200">
+              OreateAI · <span class="tabular-nums">{{ detected.oreate }}</span>
             </span>
           </template>
           <span v-else class="text-rose-600">未识别到任何 Cookie 或 JWT</span>

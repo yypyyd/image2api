@@ -17,7 +17,7 @@
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](#-部署)
 [![OpenAI Compatible](https://img.shields.io/badge/OpenAI-compatible-412991?logo=openai&logoColor=white)](#-openai-兼容-api)
 [![HTTPS](https://img.shields.io/badge/HTTPS-反代自理-lightgrey)](#-部署)
-[![Providers](https://img.shields.io/badge/供应商-7%20平台-orange)](#-支持的模型--供应商)
+[![Providers](https://img.shields.io/badge/供应商-8%20平台-orange)](#-支持的模型--供应商)
 [![Self-hosted](https://img.shields.io/badge/self--hosted-yes-success)](#-部署)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#-license)
 
@@ -47,13 +47,13 @@
 
 ## ✨ 简介
 
-**image2api** 把 Adobe Firefly、OpenAI、Runway、Grok、Leonardo、Krea、Imagine 等平台,以及**任意 OpenAI 兼容上游**的文本 / 图像 / 视频能力,统一封装成**一套 OpenAI 兼容的 API**;背后用多账号池自动调度 —— 权重优先 + 并发感知、额度耗尽自动换号、认证失效自动刷新或判死、临时错误自动重试、token 到期前主动续期 —— 对外提供稳定服务。
+**image2api** 把 Adobe Firefly、OpenAI、Runway、Grok、Leonardo、Krea、Imagine、OreateAI 等平台,以及**任意 OpenAI 兼容上游**的文本 / 图像 / 视频能力,统一封装成**一套 OpenAI 兼容的 API**;背后用多账号池自动调度 —— 权重优先 + 并发感知、额度耗尽自动换号、认证失效自动刷新或判死、临时错误自动重试、token 到期前主动续期 —— 对外提供稳定服务。
 
 它不只是 API 代理:自带**积分计费、CDK 充值、邀请奖励、用户体系、管理后台、现代化画图前端**,一条命令即可跑成一个对外运营的 AI 生成站点 —— 作者的线上实例 **[Vivid AI · vividai.run](https://vividai.run)**(品牌)即基于本项目搭建。
 
 > 💡 前后端**完全开源**(MIT),Go + Vue 3,可自由二开 / 自部署。
 
-**一句话亮点** 🔌 OpenAI 兼容 · 🤖 7 平台十余模型 · 🔁 自动换号 / Token 保活 · 💳 积分 + 在线充值(易支付)+ 代理价 · 🧩 并发分组 · 🎨 画图前端 + 管理后台 · 🐳 一键部署(TLS 反代自理)
+**一句话亮点** 🔌 OpenAI 兼容 · 🤖 8 平台十余模型 · 🔁 自动换号 / Token 保活 · 💳 积分 + 在线充值(易支付)+ 代理价 · 🧩 并发分组 · 🎨 画图前端 + 管理后台 · 🐳 一键部署(TLS 反代自理)
 
 ## 🖼️ 界面预览
 
@@ -85,14 +85,14 @@
 #### 🎨 生成能力
 - 生图 + 生视频一站式,支持**图生图 / 参考图**(首帧、末帧、风格参考)，以及按模型声明的参考视频、参考音频与同步音频生成
 - 多分辨率(图像 1K / 2K / 4K · 视频 720p / 1080p)、多宽高比、视频多时长,按模型独立配置与定价
-- 7 大供应商、十余模型,后台**动态启用 / 下架 / 改价**,无需改代码
+- 8 大供应商、十余模型,后台**动态启用 / 下架 / 改价**,无需改代码
 - **模型别名**:同一模型可配多个对外 id,API 调用任意别名均可命中
 - **去AI特征**(可选):画图台一键开启,生成图片自动做去AI痕迹处理(细节微扰 + 去除元数据),按画质档位加收积分(默认 1K+1 / 2K+2 / 4K+3,后台可改价、可整体关闭);带标记的作品在画图台、创作记录、日志与后台图片管理中均有「去AI特征」标识
 
 #### 🔌 OpenAI 兼容
 - 文本对话 `/v1/chat/completions`(普通 JSON + SSE 流式,兼容 OpenAI SDK)
 - 可直接复用后台现有 ChatGPT 账号池并使用真实模型名(`gpt-5-5-mini` / `gpt-5-5-thinking`);Grok 账号既可运行 Web fast 对话,也会按需用 SSO 自动授权 Grok Build OAuth,通过真实 `grok-4.5` 模型对话;还可走自定义 OpenAI 兼容上游
-- 文生图 `/v1/images/generations` · 图生图 `/v1/images/edits`(multipart 上传参考图) · 视频 `/v1/videos`(Sora 式异步:创建→轮询→`/content` 下载，支持按模型上传参考视频/音频及生成同步音频) · `/v1/models`(默认严格 OpenAI 字段；`?extended=true` 可取参考图片/视频/音频、三类素材合计上限 `max_reference_media` 与音频输出等能力元数据，比例统一为 `W:H`)
+- 文生图 `/v1/images/generations` · 图生图 `/v1/images/edits`(multipart 上传参考图) · 视频 `/v1/videos`(Sora 式异步:创建→轮询→`/content` 下载，支持按模型上传参考视频/音频及生成同步音频) · `/v1/models`(默认返回比例、分辨率、时长、参考素材上限和音频输出等扩展能力；`?extended=false` 可取严格 OpenAI 四字段对象，比例统一为 `W:H`)
 - **严格 OpenAI 入参**:`size` **同时决定比例 + 分辨率档**(图像看长边 → 1K/2K/4K,视频看短边 → 720p/1080p),改个 `base_url` + `api_key` 即接现有 OpenAI SDK
 - 图片结果默认返回 **URL**,普通请求不下载、不做 base64 编码、不留存文件;显式传 `response_format=b64_json` 时才内联图片。携带 `Idempotency-Key` 的请求会把结果保存到账号私有存储,可在网关超时后通过任务查询恢复;站内 **/docs** 附「分辨率对照表」直接查 `size` 该传什么
 
@@ -146,6 +146,7 @@
 | **Leonardo.ai** | seedream-4.5 | 图像 |
 | **Krea.ai** | flux-klein-2 | 图像 |
 | **Imagine.art** | imagine-1.5 · imagine-1.5pro | 图像 |
+| **OreateAI** | oreate-seedance-2.0-mini · oreate-seedance-2.0-fast · oreate-seedance-1.5-pro · oreate-seedance-2.0 · oreate-seedance-2.5 | 视频(文生 / 图片参考 / 视频参考；2.5 支持 5/10/20/30 秒) |
 | **自定义上游** | 任意 OpenAI 兼容 v1 端点(按 id 路由) | 文本 / 图像 / 视频 |
 
 > 模型由管理后台动态启用并定价,可随时增删。自定义上游支持把任何 OpenAI 兼容服务接成账号,按 model id 路由调用。
@@ -187,13 +188,13 @@ curl https://你的域名/v1/images/edits \
   -F model="seedream-4.5" -F prompt="改成赛博朋克风格" -F image=@input.png
 ```
 
-文本请求原样透传 OpenAI Chat Completions 字段,支持普通 JSON 与 `stream:true` SSE。文本按管理端配置的每请求固定积分收费;上游业务错误、空响应或流未正常结束会记失败并自动退款。图片默认返回 OpenAI 风格 `{ "created": ..., "data": [{ "url": "..." }] }`;普通请求直接返回上游 URL,不下载、不做 base64 编码、不留存。ChatGPT/Grok 等鉴权素材会返回本站 `/content` 流式代理 URL。显式传 `"response_format":"b64_json"` 才返回内联图片。同步图片生成超过 10 秒时会发送 JSON 合法前置空白心跳并关闭 Nginx 响应缓冲，避免下游、反代和 Cloudflare 把仍在工作的请求判为闲置；最终 OpenAI JSON 结构不变，标准 JSON 解析器无需调整。携带 `Idempotency-Key` 时结果保存到账号私有存储,同步响应遇到网关超时后可轮询 `GET /v1/images/tasks?request_id=...` 恢复。发送 `Prefer: respond-async`（或 `?async=true`）则立即返回 `202` 任务对象并通过同一查询接口轮询；未发送该标志的现有下游保持同步响应不变。**视频**走异步:`POST /v1/videos` 建任务 → 轮询 `GET /v1/videos/{id}` 至 `completed` → `GET /v1/videos/{id}/content` 取 mp4。完整参数见站内 **/docs** 文档页。
+文本请求原样透传 OpenAI Chat Completions 字段,支持普通 JSON 与 `stream:true` SSE。文本按管理端配置的每请求固定积分收费;上游业务错误、空响应或流未正常结束会记失败并自动退款。图片默认返回 OpenAI 风格 `{ "created": ..., "data": [{ "url": "..." }] }`;普通请求直接返回上游 URL,不下载、不做 base64 编码、不留存。ChatGPT/Grok 等鉴权素材会返回本站 `/content` 流式代理 URL。显式传 `"response_format":"b64_json"` 才返回内联图片。同步图片生成超过 10 秒时会发送 JSON 合法前置空白心跳并关闭 Nginx 响应缓冲，避免下游、反代和 Cloudflare 把仍在工作的请求判为闲置；最终 OpenAI JSON 结构不变，标准 JSON 解析器无需调整。携带 `Idempotency-Key` 时结果保存到账号私有存储,同步响应遇到网关超时后可轮询 `GET /v1/images/tasks?request_id=...` 恢复。发送 `Prefer: respond-async`（或 `?async=true`）则立即返回 `202` 任务对象并通过同一查询接口轮询；未发送该标志的现有下游保持同步响应不变。**视频**走异步:`POST /v1/videos` 建任务 → 轮询 `GET /v1/videos/{id}` 至 `completed` → `GET /v1/videos/{id}/content` 取 mp4。`size` 保持 OpenAI 的 720p/1080p 映射；OreateAI 等带 480p 档位的模型可额外传 `"resolution":"480p"`。OreateAI 1.5/2.0 系列只开放 5/10 秒，Seedance 2.5 另开放 20/30 秒；实时账号配置确认 1.5 Pro 最多两张首尾帧，2.0/2.5 最多 9 张参考图和 3 段参考视频（视频总时长向上取整后须为 2–15 秒），当前不声明参考音频。完整参数见站内 **/docs** 文档页。
 
 ## 🚀 部署
 
 > 域名 + HTTPS 由你自己的反向代理处理(本项目不内置证书签发)。
 
-**Docker(推荐)**:`docker compose up -d --build` 一条命令拉起 PostgreSQL + Redis + RustFS + 后端 + 前端(nginx **HTTP 监听容器 2000 端口**),把你的反向代理指到 `http://<本机>:2000`(端口用 `WEB_PORT` 改;要改密码 / 密钥 / `CORS_ORIGINS`(反代走 HTTPS 时把 `COOKIE_SECURE` 设为 `true`),直接改 `docker-compose.yml` 里对应值即可)。出站代理只由后台“全局代理”(`proxy.url`)控制：填写 `http://user:password@proxy:port`、HTTPS 或 SOCKS5 地址后，登录/账号校验、Cookie/Token 交换与刷新、Profile/配额/订阅查询、必要的上游 bootstrap/challenge 以及生成 submit 请求走代理；项目/Session 准备、参考素材上传、状态轮询、结果下载、生成后的记录和 `/content` 均从服务器本机直连。Custom 带参考素材的 multipart 请求本身就是生成 submit，因此完整 HTTPS 请求走代理。清空后这些请求也从本机直连。该值可能含凭据，请仅授予管理员、不要写入日志，并将代理出口限制为应用服务器。
+**Docker(推荐)**:`docker compose up -d --build` 一条命令拉起 PostgreSQL + Redis + RustFS + 后端 + 前端(nginx **HTTP 监听容器 2000 端口**),把你的反向代理指到 `http://<本机>:2000`(端口用 `WEB_PORT` 改;要改密码 / 密钥 / `CORS_ORIGINS`(反代走 HTTPS 时把 `COOKIE_SECURE` 设为 `true`),直接改 `docker-compose.yml` 里对应值即可)。出站代理只由后台“全局代理”(`proxy.url`)控制：填写 `http://user:password@proxy:port`、HTTPS 或 SOCKS5 地址后，登录/账号校验、Cookie/Token 交换与刷新、Profile/配额/订阅查询、必要的上游 bootstrap/challenge 以及生成 submit 请求走代理；项目/Session 准备、参考素材上传、状态轮询、结果下载、生成后的记录和 `/content` 均从服务器本机直连。Custom 带参考素材的 multipart 请求本身就是生成 submit，因此完整 HTTPS 请求走代理。OreateAI 的上传令牌请求属于鉴权控制面并走全局代理，令牌签发后的 Google Storage 素材字节上传固定直连 `storage.googleapis.com`。OreateAI 运行镜像包含 Chromium，用于在临时浏览器配置中执行官网 Banti 签名。清空后这些请求也从本机直连。该值可能含凭据，请仅授予管理员、不要写入日志，并将代理出口限制为应用服务器。
 
 也可**从源码手动构建**,自备 **PostgreSQL · Redis · RustFS(或任意 S3)· 反向代理**:
 
@@ -275,6 +276,7 @@ backend/                       后端源码(Go)
 │   │   ├── leonardo/          Leonardo
 │   │   ├── krea/              Krea
 │   │   ├── imagine/           Imagine.art
+│   │   ├── oreate/            OreateAI Seedance(官网 Banti 签名)
 │   │   ├── custom/            自定义上游(OpenAI 兼容 v1,按 id 路由,生成 submit 走全局代理)
 │   │   └── epay/              易支付(mapi 下单 + 回调 MD5 验签,积分充值)
 │   ├── repo/                  数据访问层(用户 / 模型 / 账号 / 日志 / CDK / 订单 / 并发组…)

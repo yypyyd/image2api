@@ -54,6 +54,10 @@ export function looksLikeKreaCookie(s) {
   return /sb-superb-auth-token/.test(s || '')
 }
 
+export function looksLikeOreateCookie(s) {
+  return /(?:^|;\s*)OUID=[^;]+/.test(s || '') && /(?:^|;\s*)ouss=[^;]+/.test(s || '')
+}
+
 // An Imagine.art credential is a JSON object { token, refreshToken } (both JWTs).
 function isImagineObj(o) {
   return !!o && typeof o === 'object' &&
@@ -70,6 +74,7 @@ export function looksLikeImagineToken(s) {
 // JSON-shaped, so it must be checked before the cookie heuristics.
 function cookieType(v) {
   if (looksLikeImagineToken(v)) return 'imagine'
+  if (looksLikeOreateCookie(v)) return 'oreate'
   if (looksLikeKreaCookie(v)) return 'krea'
   if (looksLikeLeonardoCookie(v)) return 'leonardo'
   return 'adobe'
@@ -102,6 +107,24 @@ function classifyString(value) {
 function openAIItem(value) {
   const token = (value || '').replace(/^Bearer\s+/i, '').trim()
   return looksLikeJwt(token) ? [{ type: 'openai', value: token }] : []
+}
+
+function oreateItem(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const cookie = cookieFromAny(value)
+  const baseURL = String(value.base_url || value.baseUrl || '')
+  if (!looksLikeOreateCookie(cookie) || (baseURL && !/oreateai\.com/i.test(baseURL))) return null
+  return {
+    type: 'oreate',
+    value: cookie,
+    meta: {
+      email: String(value.email || '').trim(),
+      ouid: String(value.ouid || '').trim(),
+      user_agent: String(value.user_agent || value.userAgent || '').trim(),
+      reg_ts: Number(value.reg_ts || value.createTime || 0) || 0,
+      vip: String(value.vip || '0').trim(),
+    },
+  }
 }
 
 function grokItem(value) {
@@ -176,6 +199,11 @@ function parseJSONValue(j) {
   if (Array.isArray(j)) {
     const out = []
     for (const it of j) {
+      const oreate = oreateItem(it)
+      if (oreate) {
+        out.push(oreate)
+        continue
+      }
       const structured = structuredOpenAIItems(it)
       if (structured !== null) {
         out.push(...structured)
@@ -203,6 +231,8 @@ function parseJSONValue(j) {
   if (structured !== null) return structured
 
   if (j && typeof j === 'object') {
+    const oreate = oreateItem(j)
+    if (oreate) return [oreate]
     if (isImagineObj(j)) return [{ type: 'imagine', value: JSON.stringify(j) }]
     const v = cookieFromAny(j)
     return v ? [{ type: cookieType(v), value: v }] : []

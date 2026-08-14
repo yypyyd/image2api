@@ -54,7 +54,7 @@ const stats = ref({
   total: 0, dead_total: 0,
   openai: { ...EMPTY_TYPE }, adobe: { ...EMPTY_TYPE }, runway: { ...EMPTY_TYPE },
   leonardo: { ...EMPTY_TYPE }, krea: { ...EMPTY_TYPE }, imagine: { ...EMPTY_TYPE },
-  grok: { ...EMPTY_TYPE },
+  grok: { ...EMPTY_TYPE }, oreate: { ...EMPTY_TYPE },
 })
 
 // 异常账号 = 已失效(401)被锁定的号(红色锁定行)。用于「一键删除异常账号」。
@@ -68,6 +68,7 @@ function typePill(t) {
     leonardo: 'bg-amber-500/10 text-amber-300 ring-amber-400/30',
     krea: 'bg-sky-500/10 text-sky-300 ring-sky-400/30',
     imagine: 'bg-teal-500/10 text-teal-300 ring-teal-400/30',
+    oreate: 'bg-cyan-500/10 text-cyan-300 ring-cyan-400/30',
   }[t] || 'bg-white/[0.06] text-white/70 ring-white/15'
 }
 
@@ -185,7 +186,7 @@ async function reconcile() {
   // probed here — the pending poll just reads the store until the worker writes
   // their quota/email. OLD accounts (active) get a real live /quota probe for
   // up-to-date remaining + refresh time.
-  const quotaRows = visible.filter((r) => !r.pending && r.status === 'active' && (r.type === 'openai' || r.type === 'adobe' || r.type === 'runway' || r.type === 'leonardo' || r.type === 'krea' || r.type === 'imagine' || r.type === 'grok'))
+  const quotaRows = visible.filter((r) => !r.pending && r.status === 'active' && (r.type === 'openai' || r.type === 'adobe' || r.type === 'runway' || r.type === 'leonardo' || r.type === 'krea' || r.type === 'imagine' || r.type === 'grok' || r.type === 'oreate'))
   const adobeNeedEmail = visible.filter((r) => !r.pending && r.type === 'adobe' && !r.email)
   const total = quotaRows.length + adobeNeedEmail.length
   if (total === 0) { quotaStatus.value = ''; return }
@@ -341,13 +342,13 @@ onMounted(() => { loadAccounts(); loadModelList() })
 <template>
   <section class="space-y-4">
     <!-- KPI strip — 每个类型显示 成功/失败/限额 三个数(绿/红/琥珀) -->
-    <div class="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-7 gap-3">
+    <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 2xl:grid-cols-9 gap-3">
       <div class="card p-4">
         <div class="text-[11px] uppercase tracking-wider text-white/45">账号总数</div>
         <div class="text-2xl font-semibold mt-1 tabular-nums">{{ stats.total }}</div>
         <div class="text-[10px] text-white/35 mt-0.5">成功/失败/限额</div>
       </div>
-      <div v-for="t in [['openai','OpenAI','text-emerald-300/80'],['adobe','Adobe','text-rose-300/80'],['runway','Runway','text-violet-300/80'],['leonardo','Leonardo','text-amber-300/80'],['krea','Krea','text-sky-300/80'],['imagine','Imagine','text-teal-300/80'],['grok','Grok','text-slate-300/80']]"
+      <div v-for="t in [['openai','OpenAI','text-emerald-300/80'],['adobe','Adobe','text-rose-300/80'],['runway','Runway','text-violet-300/80'],['leonardo','Leonardo','text-amber-300/80'],['krea','Krea','text-sky-300/80'],['imagine','Imagine','text-teal-300/80'],['grok','Grok','text-slate-300/80'],['oreate','OreateAI','text-cyan-300/80']]"
            :key="t[0]" class="card p-4">
         <div class="text-[11px] uppercase tracking-wider" :class="t[2]">{{ t[1] }}</div>
         <div class="text-2xl font-semibold mt-1 tabular-nums">
@@ -381,6 +382,9 @@ onMounted(() => { loadAccounts(); loadModelList() })
         </button>
         <button @click="setFilter(() => typeFilter = 'grok')" class="fp" :class="typeFilter === 'grok' && 'fp-on'">
           <span class="w-1.5 h-1.5 rounded-full bg-slate-400"></span>Grok
+        </button>
+        <button @click="setFilter(() => typeFilter = 'oreate')" class="fp" :class="typeFilter === 'oreate' && 'fp-sky'">
+          <span class="w-1.5 h-1.5 rounded-full bg-cyan-400"></span>OreateAI
         </button>
       </div>
       <div class="w-px h-5 bg-white/10"></div>
@@ -503,7 +507,7 @@ onMounted(() => { loadAccounts(); loadModelList() })
             <td class="px-3 py-3.5 align-middle text-right text-sm tabular-nums whitespace-nowrap">
               <!-- quota column: 数字 / —  (never "未知"/"失败"/"检测中") -->
               <!-- remaining === -1 is the provider "unlimited" sentinel → show — not a scary red -1 -->
-              <span v-if="(a.type === 'openai' || a.type === 'adobe' || a.type === 'runway' || a.type === 'leonardo' || a.type === 'krea' || a.type === 'imagine' || a.type === 'grok') && a.remaining != null && a.remaining !== -1"
+              <span v-if="(a.type === 'openai' || a.type === 'adobe' || a.type === 'runway' || a.type === 'leonardo' || a.type === 'krea' || a.type === 'imagine' || a.type === 'grok' || a.type === 'oreate') && a.remaining != null && a.remaining !== -1"
                     class="font-mono font-semibold"
                     :class="a.remaining > 0 ? 'text-emerald-300' : 'text-rose-300'"
                     :title="a.type === 'adobe' && a.quota_total != null ? `剩余 ${a.remaining} / 总额 ${a.quota_total}` : ''">{{ a.remaining }}{{ a.type === 'grok' ? '%' : '' }}</span>

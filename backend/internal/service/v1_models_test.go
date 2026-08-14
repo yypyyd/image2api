@@ -61,6 +61,9 @@ func TestV1ModelEntryExtendedCapabilities(t *testing.T) {
 	if !reflect.DeepEqual(got["supported_durations"], []string{"5s", "8s"}) {
 		t.Fatalf("supported_durations = %#v", got["supported_durations"])
 	}
+	if !reflect.DeepEqual(got["supportedDurations"], []string{"5s", "8s"}) || !reflect.DeepEqual(got["durationTiers"], []string{"5s", "8s"}) {
+		t.Fatalf("camelCase duration aliases = %#v/%#v", got["supportedDurations"], got["durationTiers"])
+	}
 	if got["max_reference_images"] != 2 {
 		t.Fatalf("max_reference_images = %#v, want 2", got["max_reference_images"])
 	}
@@ -75,6 +78,12 @@ func TestV1ModelEntryExtendedCapabilities(t *testing.T) {
 	}
 	if got["reference_mode"] != "frame" {
 		t.Fatalf("reference_mode = %#v, want frame", got["reference_mode"])
+	}
+	if got["maxReferenceImages"] != 2 || got["maxReferenceVideos"] != 1 || got["maxReferenceAudios"] != 1 || got["maxReferenceMedia"] != 3 {
+		t.Fatalf("camelCase media capabilities = %#v", got)
+	}
+	if got["supportsAudioOutput"] != true || got["referenceMode"] != "frame" {
+		t.Fatalf("camelCase output/reference capabilities = %#v", got)
 	}
 }
 
@@ -126,6 +135,32 @@ func TestV1ModelEntryExtendedReferenceDefaults(t *testing.T) {
 	}
 	if got["reference_mode"] != "none" {
 		t.Fatalf("reference_mode = %#v, want none", got["reference_mode"])
+	}
+}
+
+func TestV1ModelEntryOreateSeedance25Capabilities(t *testing.T) {
+	item := model.ModelConfig{
+		ID: "oreate-seedance-2.5", Provider: "oreate", Type: "video",
+		Ratios:             datatypes.JSON([]byte(`["16:9","1:1","3:4","4:3","9:16","21:9"]`)),
+		Resolutions:        datatypes.JSON([]byte(`["480p","720p"]`)),
+		Durations:          datatypes.JSON([]byte(`["5s","10s","20s","30s"]`)),
+		MaxReferenceImages: 9, MaxReferenceVideos: 3, MaxReferenceMedia: 12,
+		SupportsAudioOutput: true, ReferenceMode: "asset", UpstreamModel: "seedance-2.5",
+	}
+	got := v1ModelEntry(item, 123, true)
+	for _, key := range []string{"supported_durations", "durations", "supportedDurations", "durationTiers"} {
+		if !reflect.DeepEqual(got[key], []string{"5s", "10s", "20s", "30s"}) {
+			t.Fatalf("%s = %#v", key, got[key])
+		}
+	}
+	if got["max_reference_images"] != 9 || got["max_reference_videos"] != 3 || got["max_reference_media"] != 12 || got["max_reference_audios"] != 0 {
+		t.Fatalf("snake_case Oreate capabilities = %#v", got)
+	}
+	if got["maxReferenceImages"] != 9 || got["maxReferenceVideos"] != 3 || got["maxReferenceMedia"] != 12 || got["maxReferenceAudios"] != 0 {
+		t.Fatalf("camelCase Oreate capabilities = %#v", got)
+	}
+	if got["supportsAudioOutput"] != true || got["referenceMode"] != "asset" || got["upstreamModel"] != "seedance-2.5" {
+		t.Fatalf("Oreate output/reference mapping = %#v", got)
 	}
 }
 

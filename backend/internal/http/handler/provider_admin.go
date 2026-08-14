@@ -133,6 +133,28 @@ func (h *ProviderAdminHandler) ImportGrokToken(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "id": item.ID, "status": item.Status, "pending": item.Status == "pending"})
 }
 
+func (h *ProviderAdminHandler) ImportOreateAccount(c *gin.Context) {
+	var body struct {
+		Cookie    string `json:"cookie"`
+		Email     string `json:"email"`
+		OUID      string `json:"ouid"`
+		UserAgent string `json:"user_agent"`
+		RegTS     int64  `json:"reg_ts"`
+		VIP       string `json:"vip"`
+		ID        string `json:"id"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": "invalid request body"})
+		return
+	}
+	item, err := h.tokens.ImportOreateAccount(c.Request.Context(), body.Cookie, body.Email, body.OUID, body.UserAgent, body.RegTS, body.VIP, body.ID)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "id": item.ID, "status": item.Status, "pending": item.Status == "pending"})
+}
+
 func (h *ProviderAdminHandler) ImportCustomAccount(c *gin.Context) {
 	var body struct {
 		BaseURL     string `json:"base_url"`
@@ -375,7 +397,7 @@ func (h *ProviderAdminHandler) AccountsList(c *gin.Context) {
 // accountsStats reproduces the 账号 KPI strip: per-type 正常/失效/限额 counts plus a
 // grand total and total dead count (drives 「删除异常账号 (N)」).
 func accountsStats(rows []map[string]any) gin.H {
-	types := []string{"openai", "adobe", "runway", "leonardo", "krea", "imagine", "grok"}
+	types := []string{"openai", "adobe", "runway", "leonardo", "krea", "imagine", "grok", "oreate"}
 	by := map[string]*struct{ N, Ok, Dead, Quota int }{}
 	for _, t := range types {
 		by[t] = &struct{ N, Ok, Dead, Quota int }{}

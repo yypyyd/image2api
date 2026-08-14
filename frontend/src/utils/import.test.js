@@ -96,3 +96,29 @@ test('keeps existing credential types in mixed JSON arrays', () => {
   assert.equal(items[1].type, 'imagine')
   assert.equal(items[2].type, 'leonardo')
 })
+
+test('parses OreateAI export without retaining its password', () => {
+  const exported = {
+    base_url: 'https://www.oreateai.com/',
+    cookie: 'OUID=device-id; ouss=session-cookie',
+    email: 'oreate@example.com',
+    ouid: 'device-id',
+    user_agent: 'test-agent',
+    password: 'must-not-survive',
+    points: 124,
+  }
+  const items = parseImportFileBytes(strToU8(JSON.stringify(exported)), 'oreate-account.json')
+  assert.deepEqual(items, [{
+    type: 'oreate',
+    value: exported.cookie,
+    meta: {
+      email: exported.email,
+      ouid: exported.ouid,
+      user_agent: exported.user_agent,
+      reg_ts: 0,
+      vip: '0',
+    },
+  }])
+  assert.equal(JSON.stringify(items).includes(exported.password), false)
+  assert.equal(JSON.stringify(items).includes('password'), false)
+})

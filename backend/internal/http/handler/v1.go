@@ -342,7 +342,7 @@ func (h *V1Handler) CreateVideo(c *gin.Context) {
 		h.writeAuthError(c, err)
 		return
 	}
-	var modelID, prompt, seconds, size string
+	var modelID, prompt, seconds, size, resolutionOverride string
 	var refs []string
 	var videos, audios []service.MediaReference
 	var generateAudio bool
@@ -358,6 +358,7 @@ func (h *V1Handler) CreateVideo(c *gin.Context) {
 		prompt = c.PostForm("prompt")
 		seconds = c.PostForm("seconds")
 		size = c.PostForm("size")
+		resolutionOverride = c.PostForm("resolution")
 		var readErr error
 		refs, readErr = readMultipartImagesStrict(c, "input_reference", "input_reference[]", "reference_images", "reference_images[]")
 		if readErr == nil {
@@ -378,6 +379,9 @@ func (h *V1Handler) CreateVideo(c *gin.Context) {
 			Prompt  string          `json:"prompt"`
 			Seconds json.RawMessage `json:"seconds"`
 			Size    string          `json:"size"`
+			// Resolution is a gateway extension for provider tiers that OpenAI's
+			// standard 720p/1080p size mapping cannot express (for example 480p).
+			Resolution string `json:"resolution"`
 			// Reference frames (image-to-video / first-last frames) as base64 or
 			// data-URI strings — the JSON equivalent of multipart input_reference.
 			InputReference  []string `json:"input_reference"`
@@ -392,6 +396,7 @@ func (h *V1Handler) CreateVideo(c *gin.Context) {
 			return
 		}
 		modelID, prompt, size = body.Model, body.Prompt, body.Size
+		resolutionOverride = body.Resolution
 		seconds = rawToString(body.Seconds)
 		refs = append(body.InputReference, body.ReferenceImages...)
 		videos, err = decodeJSONMedia(body.ReferenceVideos, "video/mp4")
@@ -410,6 +415,9 @@ func (h *V1Handler) CreateVideo(c *gin.Context) {
 		duration += "s"
 	}
 	aspect, resolution := videoSizeToInternal(size)
+	if override := normalizeVideoResolutionOverride(resolutionOverride); override != "" {
+		resolution = override
+	}
 	resp, err := h.v1.StartVideoJob(c.Request.Context(), principal, service.V1VideoRequest{
 		Model:           modelID,
 		Prompt:          prompt,
@@ -428,6 +436,20 @@ func (h *V1Handler) CreateVideo(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, resp)
+}
+
+func normalizeVideoResolutionOverride(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return ""
+	}
+	if strings.HasSuffix(value, "p") {
+		return value
+	}
+	if _, err := strconv.Atoi(value); err == nil {
+		return value + "p"
+	}
+	return value
 }
 
 // GetVideo — OpenAI GET /v1/videos/{id}. Returns the job status object.

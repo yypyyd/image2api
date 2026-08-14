@@ -22,6 +22,9 @@ This is an in-progress rewrite. The current skeleton already includes:
 - session-based auth endpoint: `/admin/api/auth/me`
 - typed image/video/audio reference uploads for Adobe video generation, with
   model capability checks and bounded multipart requests
+- OreateAI Seedance text/image/reference-video generation through an isolated
+  Chromium Banti signer, including Seedance 2.5 and discoverable model limits,
+  with Cookie-only account imports and no persisted account passwords
 
 ## Environment
 

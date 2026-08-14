@@ -18,6 +18,14 @@ Start the backend separately:
 python app.py      # http://0.0.0.0:6060
 ```
 
+The account importer recognizes OreateAI account-export JSON. It forwards only
+the Cookie and required profile metadata; exported passwords are discarded in
+the browser and are never submitted to the backend.
+
+The extended `/v1/models` catalog exposes OreateAI Seedance 2.5 durations and
+the per-model image/video reference limits in both snake_case and camelCase for
+downstream importers. OreateAI currently advertises no reference-audio slots.
+
 If the backend runs elsewhere, set `VITE_BACKEND` before `npm run dev`:
 
 ```bash

@@ -13,12 +13,41 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/api ./c
 # --- Stage 2: minimal runtime image ---
 FROM alpine:3.20
 # ca-certificates: outbound HTTPS to the AI providers. tzdata: POSTGRES_DSN sets
-# TimeZone=Asia/Shanghai. wget: container healthcheck.
-RUN apk add --no-cache ca-certificates tzdata wget
+# TimeZone=Asia/Shanghai. wget: container healthcheck. chromium executes
+# OreateAI's official browser-side Banti signer for each Seedance request.
+# cdn.oreateai.com omits its GlobalSign intermediate certificate. Keep
+# Chromium verification enabled and install the exact AIA certificate with a
+# pinned digest instead of using --ignore-certificate-errors. Chromium 131 uses
+# NSS independently of Alpine's CA bundle, so keep the intermediate (without
+# root trust) in the dedicated browser user's NSS database as well.
+RUN apk add --no-cache ca-certificates tzdata wget chromium openssl nss-tools \
+    && addgroup -S chrome \
+    && adduser -S -G chrome chrome \
+    && wget -q https://secure.globalsign.com/cacert/gsgccr3dvtlsca2020.crt \
+        -O /tmp/globalsign-gcc-r3-dv-tls-ca-2020.der \
+    && echo "762538439509c411c437d3c567563e1378671281fc4a1464add031870843676e  /tmp/globalsign-gcc-r3-dv-tls-ca-2020.der" | sha256sum -c - \
+    && openssl x509 -inform DER \
+        -in /tmp/globalsign-gcc-r3-dv-tls-ca-2020.der \
+        -out /usr/local/share/ca-certificates/globalsign-gcc-r3-dv-tls-ca-2020.crt \
+    && update-ca-certificates \
+    && mkdir -p /home/chrome/.pki/nssdb \
+    && certutil -N -d sql:/home/chrome/.pki/nssdb --empty-password \
+    && certutil -A -d sql:/home/chrome/.pki/nssdb \
+        -n oreate-globalsign-intermediate -t ",," \
+        -i /usr/local/share/ca-certificates/globalsign-gcc-r3-dv-tls-ca-2020.crt \
+    && certutil -L -d sql:/home/chrome/.pki/nssdb \
+        -n oreate-globalsign-intermediate >/dev/null \
+    && chown -R chrome:chrome /home/chrome/.pki \
+    && rm -f /tmp/globalsign-gcc-r3-dv-tls-ca-2020.der \
+    && apk del openssl nss-tools
 WORKDIR /app
 COPY --from=build /out/api /app/api
+COPY scripts/oreate-chromium /usr/local/bin/oreate-chromium
 # Local fallback for generated media / reference uploads (RustFS/S3 is primary).
-RUN mkdir -p /app/data/generated && chmod +x /app/api
+RUN mkdir -p /app/data/generated \
+    && chmod +x /app/api /usr/local/bin/oreate-chromium
+ENV OREATE_CHROME=/usr/local/bin/oreate-chromium
+ENV OREATE_NO_SANDBOX=true
 ENV HTTP_ADDR=0.0.0.0:6666
 EXPOSE 6666
 ENTRYPOINT ["/app/api"]

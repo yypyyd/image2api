@@ -4,7 +4,7 @@
 
 <h1>image2api</h1>
 
-**Multi-provider AI image / video generation gateway — one OpenAI-compatible API, seven platforms aggregated, a ready-to-run operations system**
+**Multi-provider AI image / video generation gateway — one OpenAI-compatible API, eight platforms aggregated, a ready-to-run operations system**
 
 <sub>Live instance (brand): [Vivid AI · vividai.run](https://vividai.run)</sub>
 
@@ -17,7 +17,7 @@
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](#-deployment)
 [![OpenAI Compatible](https://img.shields.io/badge/OpenAI-compatible-412991?logo=openai&logoColor=white)](#-openai-compatible-api)
 [![HTTPS](https://img.shields.io/badge/HTTPS-your--proxy-lightgrey)](#-deployment)
-[![Providers](https://img.shields.io/badge/providers-7-orange)](#-supported-models--providers)
+[![Providers](https://img.shields.io/badge/providers-8-orange)](#-supported-models--providers)
 [![Self-hosted](https://img.shields.io/badge/self--hosted-yes-success)](#-deployment)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#-license)
 
@@ -47,7 +47,7 @@
 
 ## ✨ Overview
 
-**image2api** wraps the image / video capabilities of Adobe Firefly, OpenAI, Runway, Grok, Leonardo, Krea and Imagine into **a single OpenAI-compatible API**. Behind it, multi-account pools are scheduled automatically — out of quota → switch account, auth expired → refresh or kill, transient errors → retry, tokens proactively renewed before they expire — to deliver a stable service.
+**image2api** wraps the image / video capabilities of Adobe Firefly, OpenAI, Runway, Grok, Leonardo, Krea, Imagine and OreateAI into **a single OpenAI-compatible API**. Behind it, multi-account pools are scheduled automatically — out of quota → switch account, auth expired → refresh or kill, transient errors → retry, tokens proactively renewed before they expire — to deliver a stable service.
 
 It's more than an API proxy: it ships with **credit billing, CDK top-ups, referral rewards, a user system, an admin console, and a modern generation frontend**, so a single command turns it into a fully operational AI generation site — the author's live instance **[Vivid AI · vividai.run](https://vividai.run)** (brand) is built on this project.
 
@@ -85,12 +85,12 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 #### 🎨 Generation
 - Images + videos in one place, with **image-to-image / reference frames** (first frame, last frame, style reference)
 - Multiple resolutions (images 1K / 2K / 4K · videos 720p / 1080p), aspect ratios and video durations — configured and priced per model
-- 7 providers, 10+ models, **enable / disable / re-price from the admin console**, no code changes
+- 8 providers, 10+ models, **enable / disable / re-price from the admin console**, no code changes
 - **Model aliases**: one model can expose multiple public ids — API calls with any alias resolve to it
 - **De-AI fingerprint** (optional): one-click toggle on the playground — generated images get anti-AI-detection post-processing (subtle detail jitter + metadata stripping), charged as a per-tier surcharge (defaults 1K+1 / 2K+2 / 4K+3 credits, admin-configurable, can be disabled globally); processed works carry a "de-AI" badge across the playground, gallery, logs and admin image manager
 
 #### 🔌 OpenAI Compatible
-- Text-to-image `/v1/images/generations` · image-to-image `/v1/images/edits` (multipart ref upload) · video `/v1/videos` (Sora-style async: create → poll → `/content`, with model-gated video/audio references and generated audio) · `/v1/models` (strict OpenAI fields by default; `?extended=true` opts into image/video/audio reference limits and audio-output capability metadata, with ratios normalized as `W:H`)
+- Text-to-image `/v1/images/generations` · image-to-image `/v1/images/edits` (multipart ref upload) · video `/v1/videos` (Sora-style async: create → poll → `/content`, with model-gated video/audio references and generated audio) · `/v1/models` (extended ratios, resolutions, durations, reference limits, and audio-output capabilities by default; `?extended=false` returns strict four-field OpenAI objects, with ratios normalized as `W:H`)
 - **Strict OpenAI params**: `size` drives **both aspect ratio + resolution tier** (images by long edge → 1K/2K/4K, videos by short edge → 720p/1080p) — just swap `base_url` + `api_key` into an existing OpenAI SDK
 - Image results default to **URLs**. Ordinary API requests do not download, base64-encode, or store the upstream asset; explicitly request `response_format=b64_json` for inline bytes. The in-app **/docs** ships a size ↔ tier reference table
 
@@ -141,6 +141,7 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 | **Leonardo.ai** | seedream-4.5 | Image |
 | **Krea.ai** | flux-klein-2 | Image |
 | **Imagine.art** | imagine-1.5 · imagine-1.5pro | Image |
+| **OreateAI** | oreate-seedance-2.0-mini · oreate-seedance-2.0-fast · oreate-seedance-1.5-pro · oreate-seedance-2.0 · oreate-seedance-2.5 | Video (text, image, and video references) |
 
 > Models are enabled and priced dynamically from the admin console — add or remove anytime.
 
@@ -163,7 +164,7 @@ curl https://your-domain/v1/images/edits \
   -F model="seedream-4.5" -F prompt="make it cyberpunk" -F image=@input.png
 ```
 
-Images default to the OpenAI-style `{ "created": ..., "data": [{ "url": "..." }] }` response. Ordinary requests return the upstream URL without downloading, base64-encoding, or storing the asset; authenticated ChatGPT/Grok assets use this gateway's streaming `/content` URL. Explicitly pass `"response_format":"b64_json"` for inline image data. **Video** is async: `POST /v1/videos` → poll `GET /v1/videos/{id}` until `completed` → `GET /v1/videos/{id}/content` for the mp4. Full parameters are documented on the in-app **/docs** page.
+Images default to the OpenAI-style `{ "created": ..., "data": [{ "url": "..." }] }` response. Ordinary requests return the upstream URL without downloading, base64-encoding, or storing the asset; authenticated ChatGPT/Grok assets use this gateway's streaming `/content` URL. Explicitly pass `"response_format":"b64_json"` for inline image data. **Video** is async: `POST /v1/videos` → poll `GET /v1/videos/{id}` until `completed` → `GET /v1/videos/{id}/content` for the mp4. OreateAI 1.5/2.0 variants expose 5/10 seconds; Seedance 2.5 additionally exposes 20/30 seconds. The live account configuration allows two ordered frames for 1.5 Pro, or up to nine images and three videos (2–15 seconds total, rounded up) for 2.0/2.5. Full parameters are documented on the in-app **/docs** page.
 
 ## 🚀 Deployment
 
@@ -255,6 +256,7 @@ backend/                       Backend source (Go)
 │   │   ├── leonardo/          Leonardo
 │   │   ├── krea/              Krea
 │   │   ├── imagine/           Imagine.art
+│   │   ├── oreate/            OreateAI Seedance (website Banti signer)
 │   │   ├── custom/            Custom upstream (OpenAI-compatible v1, routed by id)
 │   │   └── epay/              易支付 / epay (mapi order + MD5-verified callback, top-ups)
 │   ├── repo/                  Data-access layer (users / models / accounts / logs / CDK / orders / concurrency groups…)

@@ -20,6 +20,7 @@ import (
 	"backend/internal/provider/imagine"
 	"backend/internal/provider/krea"
 	"backend/internal/provider/leonardo"
+	"backend/internal/provider/oreate"
 	"backend/internal/provider/runway"
 	"backend/internal/repo"
 
@@ -35,6 +36,7 @@ var validTokenPools = map[string]string{
 	"krea":     "krea",
 	"imagine":  "imagine",
 	"grok":     "grok",
+	"oreate":   "oreate",
 	"custom":   "custom",
 }
 
@@ -50,6 +52,7 @@ type TokenService struct {
 	krea     *krea.Client
 	imagine  *imagine.Client
 	grok     *grok.Client
+	oreate   *oreate.Client
 	custom   *custom.Client
 	// sem caps concurrent background pending-probe goroutines (mirrors Python's
 	// 10-worker _quota_check_pool) so a big paste doesn't fire hundreds of
@@ -60,7 +63,7 @@ type TokenService struct {
 	kreaActivating atomic.Bool
 }
 
-func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileRepository, events *repo.EventRepository, settings *repo.SiteSettingRepository, adobeClient *adobe.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, leonardoClient *leonardo.Client, kreaClient *krea.Client, imagineClient *imagine.Client, grokClient *grok.Client, customClient *custom.Client) *TokenService {
+func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileRepository, events *repo.EventRepository, settings *repo.SiteSettingRepository, adobeClient *adobe.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, leonardoClient *leonardo.Client, kreaClient *krea.Client, imagineClient *imagine.Client, grokClient *grok.Client, oreateClient *oreate.Client, customClient *custom.Client) *TokenService {
 	return &TokenService{
 		tokens:   tokens,
 		refresh:  refresh,
@@ -73,6 +76,7 @@ func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileR
 		krea:     kreaClient,
 		imagine:  imagineClient,
 		grok:     grokClient,
+		oreate:   oreateClient,
 		custom:   customClient,
 		sem:      make(chan struct{}, 10),
 	}
@@ -111,6 +115,9 @@ func (s *TokenService) applyProxy(ctx context.Context) {
 	}
 	if s.grok != nil {
 		s.grok.SetProxy(proxy)
+	}
+	if s.oreate != nil {
+		s.oreate.SetProxy(proxy)
 	}
 	if s.custom != nil {
 		s.custom.SetProxy(proxy)
@@ -1142,6 +1149,141 @@ func (s *TokenService) RefreshGrokLiveness(ctx context.Context) {
 	}
 }
 
+// ImportOreateAccount stores only the website cookie and non-secret profile
+// metadata. Passwords from account-export files are deliberately never accepted
+// by this boundary. A background probe validates the session and hydrates quota.
+func (s *TokenService) ImportOreateAccount(ctx context.Context, cookie, email, ouid, userAgent string, regTS int64, vip, tokenID string) (*model.TokenAccount, error) {
+	s.applyProxy(ctx)
+	cookie = strings.TrimSpace(cookie)
+	if !oreate.IsOreateCookie(cookie) {
+		return nil, errors.New("not an OreateAI cookie")
+	}
+	email = strings.TrimSpace(email)
+	if existing, _ := s.tokens.GetByPoolEmail(ctx, "oreate", email); email != "" && existing != nil {
+		tokenID = existing.ID
+	} else if strings.TrimSpace(tokenID) == "" {
+		tokenID = newTokenID("oreate")
+	}
+	meta := datatypes.JSONMap{
+		"pending_check": true,
+		"user_agent":    strings.TrimSpace(userAgent),
+		"ouid":          strings.TrimSpace(ouid),
+		"reg_ts":        regTS,
+		"vip":           strings.TrimSpace(vip),
+	}
+	item, err := s.createToken(ctx, "oreate", tokenID, cookie, "pending", meta)
+	if err != nil {
+		if !errors.Is(err, gorm.ErrDuplicatedKey) {
+			return nil, err
+		}
+		item, err = s.tokens.Update(ctx, "oreate", tokenID, map[string]any{
+			"value": cookie, "status": "pending", "dead": false, "meta": meta,
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	if email != "" {
+		if updated, updateErr := s.tokens.Update(ctx, "oreate", tokenID, map[string]any{"account_email": email}); updateErr == nil {
+			item = updated
+		}
+	}
+	account := oreate.Account{Cookie: cookie, Email: email, OUID: strings.TrimSpace(ouid), UserAgent: strings.TrimSpace(userAgent), RegTS: regTS, VIP: strings.TrimSpace(vip)}
+	go s.checkPendingOreate(tokenID, account)
+	return item, nil
+}
+
+func (s *TokenService) checkPendingOreate(tokenID string, account oreate.Account) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("token import: oreate pending check panicked for %s: %v", tokenID, r)
+		}
+	}()
+	s.sem <- struct{}{}
+	defer func() { <-s.sem }()
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	if s.oreate == nil {
+		s.finishPending(ctx, "oreate", tokenID, "active", false, nil)
+		return
+	}
+	s.applyProxy(ctx)
+	profile, profileErr := s.oreate.FetchProfile(ctx, account)
+	if errors.Is(profileErr, oreate.ErrAuth) {
+		s.finishPending(ctx, "oreate", tokenID, "disabled", true, nil)
+		return
+	}
+	if profileErr == nil {
+		patch := map[string]any{}
+		if profile.Email != "" {
+			patch["account_email"] = profile.Email
+			account.Email = profile.Email
+		}
+		item, _ := s.tokens.Get(ctx, "oreate", tokenID)
+		if item != nil {
+			meta := cloneJSONMap(item.Meta)
+			if profile.OUID != "" {
+				meta["ouid"] = profile.OUID
+				account.OUID = profile.OUID
+			}
+			if profile.VIP != "" {
+				meta["vip"] = profile.VIP
+				account.VIP = profile.VIP
+			}
+			if profile.RegTS != 0 {
+				meta["reg_ts"] = profile.RegTS
+				account.RegTS = profile.RegTS
+			}
+			patch["meta"] = meta
+		}
+		if len(patch) > 0 {
+			_, _ = s.tokens.Update(ctx, "oreate", tokenID, patch)
+		}
+	}
+	data, quotaErr := s.oreate.FetchCreditsBalance(ctx, account)
+	if errors.Is(quotaErr, oreate.ErrAuth) {
+		s.finishPending(ctx, "oreate", tokenID, "disabled", true, nil)
+		return
+	}
+	if quotaErr != nil {
+		// Network and upstream errors are inconclusive; keep the account usable and
+		// let the live quota path retry later.
+		s.finishPending(ctx, "oreate", tokenID, "active", false, nil)
+		return
+	}
+	quotaMeta := map[string]any{"cached_quota_at": int(time.Now().Unix())}
+	remaining, hasRemaining := data["remaining"].(int)
+	if hasRemaining {
+		quotaMeta["cached_quota_remaining"] = remaining
+	}
+	if total, ok := data["total"].(int); ok {
+		quotaMeta["cached_quota_total"] = total
+	}
+	status := "active"
+	if hasRemaining && remaining < oreateMinCredits {
+		status = "quota"
+	}
+	if reset := strings.TrimSpace(stringValue(data["reset_after"])); reset != "" {
+		_, _ = s.tokens.Update(ctx, "oreate", tokenID, map[string]any{"cached_quota_reset_after": reset})
+	}
+	s.finishPending(ctx, "oreate", tokenID, status, false, quotaMeta)
+}
+
+func oreateAccountFromToken(item model.TokenAccount) oreate.Account {
+	account := oreate.Account{Cookie: item.Value, Email: item.AccountEmail}
+	if item.Meta == nil {
+		return account
+	}
+	account.UserAgent = strings.TrimSpace(stringValue(item.Meta["user_agent"]))
+	account.OUID = strings.TrimSpace(stringValue(item.Meta["ouid"]))
+	account.BID = strings.TrimSpace(stringValue(item.Meta["bid"]))
+	account.VIP = strings.TrimSpace(stringValue(item.Meta["vip"]))
+	account.RegTS = int64(intValue(item.Meta["reg_ts"]))
+	return account
+}
+
+const oreateMinCredits = 30
+
 // ImportCustomAccount adds an upstream as a custom account: base_url + key, the
 // csv list of model ids it serves (empty = all), plus optional weight and
 // per-account concurrency. No probe — the account goes active immediately and is
@@ -1693,12 +1835,50 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 			"error":           data["error"],
 		}, nil
 	}
+	if poolToType(item.Pool) == "oreate" && s.oreate != nil {
+		data, err := s.oreate.FetchCreditsBalance(ctx, oreateAccountFromToken(*item))
+		if err != nil {
+			if errors.Is(err, oreate.ErrAuth) {
+				_, _ = s.tokens.Update(ctx, item.Pool, item.ID, map[string]any{
+					"status": "disabled", "dead": true, "fails": gorm.Expr("fails + 1"),
+				})
+			}
+			return nil, err
+		}
+		meta := cloneJSONMap(item.Meta)
+		meta["cached_quota_at"] = int(time.Now().Unix())
+		remaining, hasRemaining := data["remaining"].(int)
+		if hasRemaining {
+			meta["cached_quota_remaining"] = remaining
+		}
+		if total, ok := data["total"].(int); ok {
+			meta["cached_quota_total"] = total
+		}
+		patch := map[string]any{"meta": meta}
+		if reset := strings.TrimSpace(stringValue(data["reset_after"])); reset != "" {
+			patch["cached_quota_reset_after"] = reset
+			item.CachedQuotaResetAfter = reset
+		}
+		if hasRemaining && remaining < oreateMinCredits {
+			patch["status"] = "quota"
+		} else if hasRemaining && item.Status == "quota" {
+			patch["status"] = "active"
+		}
+		if updated, updateErr := s.tokens.Update(ctx, item.Pool, item.ID, patch); updateErr == nil {
+			item = updated
+		}
+		return map[string]any{
+			"supported": true, "remaining": data["remaining"], "used": data["used"], "total": data["total"],
+			"reset_after": emptyToNil(item.CachedQuotaResetAfter), "quota_cached_at": meta["cached_quota_at"],
+			"unchanged": false, "unknown": false, "error": data["error"],
+		}, nil
+	}
 	remaining, hasRemaining := jsonMapInt(item.Meta, "cached_quota_remaining")
 	quotaAt, _ := jsonMapInt(item.Meta, "cached_quota_at")
 	typeLabel := poolToType(item.Pool)
 	return map[string]any{
-		"supported":       typeLabel == "openai" || typeLabel == "adobe" || typeLabel == "runway" || typeLabel == "grok",
-		"remaining":       valueOrNil((typeLabel == "openai" || typeLabel == "runway" || typeLabel == "grok") && hasRemaining, remaining),
+		"supported":       typeLabel == "openai" || typeLabel == "adobe" || typeLabel == "runway" || typeLabel == "grok" || typeLabel == "oreate",
+		"remaining":       valueOrNil((typeLabel == "openai" || typeLabel == "runway" || typeLabel == "grok" || typeLabel == "oreate") && hasRemaining, remaining),
 		"total":           nil,
 		"reset_after":     emptyToNil(item.CachedQuotaResetAfter),
 		"quota_cached_at": valueOrNil(quotaAt != 0, quotaAt),
@@ -1737,6 +1917,29 @@ func (s *TokenService) Email(ctx context.Context, pool, id string) (map[string]a
 			return map[string]any{"email": extracted, "cached": false}, nil
 		}
 		return map[string]any{"email": nil, "cached": false}, nil
+	}
+	if poolToType(item.Pool) == "oreate" {
+		email := strings.TrimSpace(item.AccountEmail)
+		if email != "" {
+			return map[string]any{"email": email, "cached": true}, nil
+		}
+		if s.oreate == nil {
+			return map[string]any{"email": nil, "cached": false}, nil
+		}
+		profile, err := s.oreate.FetchProfile(ctx, oreateAccountFromToken(*item))
+		if err != nil {
+			if errors.Is(err, oreate.ErrAuth) {
+				_, _ = s.tokens.Update(ctx, item.Pool, item.ID, map[string]any{
+					"status": "disabled", "dead": true, "fails": gorm.Expr("fails + 1"),
+				})
+			}
+			return nil, err
+		}
+		email = strings.TrimSpace(profile.Email)
+		if email != "" {
+			_, _ = s.tokens.Update(ctx, item.Pool, item.ID, map[string]any{"account_email": email})
+		}
+		return map[string]any{"email": emptyToNil(email), "cached": false}, nil
 	}
 	if poolToType(item.Pool) != "adobe" {
 		return map[string]any{"email": nil}, nil
@@ -1812,7 +2015,7 @@ func accountRow(item model.TokenAccount, inFlight int64) map[string]any {
 	if item.Meta != nil {
 		teamID = strings.TrimSpace(stringValue(item.Meta["team_id"]))
 	}
-	hasQuota := typeLabel == "openai" || typeLabel == "adobe" || typeLabel == "runway" || typeLabel == "leonardo" || typeLabel == "krea" || typeLabel == "imagine" || typeLabel == "grok"
+	hasQuota := typeLabel == "openai" || typeLabel == "adobe" || typeLabel == "runway" || typeLabel == "leonardo" || typeLabel == "krea" || typeLabel == "imagine" || typeLabel == "grok" || typeLabel == "oreate"
 	paidPlan, _ := jsonMapBool(item.Meta, "paid_account")
 	return map[string]any{
 		"id":              item.ID,
@@ -2029,6 +2232,9 @@ func newTokenID(pool string) string {
 	}
 	if pool == "imagine" {
 		prefix = "IM"
+	}
+	if pool == "oreate" {
+		prefix = "OR"
 	}
 	return prefix + randomUpper(10)
 }

@@ -1,5 +1,105 @@
 # Design Notes
 
+### 2026-08-15 - OreateAI Seedance 2.5 and reference-media contract
+
+**Change**: Expanded the OreateAI provider from four text-only Seedance routes
+to five video routes by adding `oreate-seedance-2.5`. The 1.5/2.0 models retain
+5/10 second outputs; only 2.5 exposes 20/30 seconds in addition to 5/10. The
+provider now reproduces the authenticated website's text/image, first/last
+frame, and reference image/video scenes, including its separate reference
+`aiType` table and attachment schema. Existing database rows receive a
+capability-only startup backfill, while operator enablement, aliases, prices,
+weights, and generation counts remain untouched. Extended `/v1/models`
+metadata is the default catalog contract; strict OpenAI objects remain
+available with `?extended=false`.
+
+**Reason**: The live OreateAI account configuration now exposes Seedance 2.5
+and reference scenes, but the gateway still seeded zero reference limits. The
+fields were present downstream, so clients correctly rendered no reference
+slots based on incorrect persisted values. The authenticated configuration is
+more reliable than marketing copy and currently declares two ordered images
+for 1.5 Pro, or nine images plus three videos for 2.0/2.5; it exposes no
+reference-audio slot.
+
+**Impact**: Downstream catalogs receive six ratios, per-model resolutions and
+durations, generated-audio support, and non-zero reference limits in both
+snake_case and camelCase. Reference videos must be MP4/MOV and total 2-15
+seconds after actual movie-header durations are summed and rounded up. 2.5
+pricing seeds at zero like the other Oreate models and remains an operator
+decision.
+
+**Security boundary**: Oreate's upload-token request follows the configured
+control-plane proxy, while the assigned media bytes upload directly to Google
+Storage. The gateway generates its own filenames, bounds token responses,
+never logs or returns the short-lived bearer token, and accepts resumable
+locations only from HTTPS `storage.googleapis.com`. An in-process ISO BMFF
+parser reads only bounded uploaded bytes and rejects malformed or missing
+`mvhd` duration data; no external media process or client-selected upload host
+is invoked.
+
+### 2026-08-14 - OreateAI Seedance website provider
+
+**Change**: Added an independent `oreate` account pool and a website-protocol
+client for four Seedance video models: Seedance 2.0 Mini, Seedance 2.0 Fast,
+Seedance 1.5 Pro, and Seedance 2.0. The first release supports text-to-video
+only. Each generation creates an OreateAI video chat, obtains a fresh Banti
+`jt` from the site's official Paris runtime in an ephemeral headless Chromium
+profile, submits the SSE request, and returns or downloads the resulting MP4.
+The runtime image installs Chromium and launches only the browser child as a
+dedicated unprivileged user with a sanitized environment and ephemeral profile.
+
+**Reason**: OreateAI does not provide an OpenAI-compatible Seedance API. Its
+website request requires both the authenticated cookie and a short-lived token
+computed by browser JavaScript, so a normal HTTP-only custom upstream cannot
+represent this integration.
+
+**Impact**: The model catalog exposes only the four confirmed Seedance models,
+their confirmed resolution/duration/aspect-ratio combinations, and optional
+audio output. Reference images, reference video/audio, first/last frames, and
+motion controls remain disabled. The signer waits for the matching Banti `/dr`
+report to finish successfully before it submits the token; missing, oversized,
+or incompletely reported tokens are temporary failures and use the bounded pool
+retry window. Only a definitive authentication failure disables an account,
+while insufficient points moves it to quota state. Seed prices seed at zero and
+remain an operator decision. `POST /v1/videos` retains its existing OpenAI
+`size` mapping and adds an optional `resolution` extension so the confirmed
+480p tier is addressable.
+
+**Security boundary**: The admin import endpoint accepts only Cookie and
+non-secret account metadata. Oreate export passwords and precomputed Banti
+tokens are never accepted or persisted. Cookie values remain in the private
+token-account value column and are not returned by account APIs or written to
+event logs. Chromium profiles and `jt` values are ephemeral. Official site code
+runs in an unprivileged Chromium child process whose environment excludes the
+backend's database, Redis, object-store, and proxy credentials. For an
+authenticated HTTP(S) egress proxy, the signer strips userinfo before creating
+Chrome's `--proxy-server` argument and starts a short-lived loopback-only proxy
+bridge. The bridge injects `Proxy-Authorization` only on its upstream proxy
+connection, handles ordinary requests and HTTPS CONNECT, and never forwards
+that header to the destination website. This keeps proxy credentials out of
+process arguments, site requests, errors, and logs while the browser signer and
+SSE submit retain the same configured egress. Container egress should still be
+restricted to the expected OreateAI/CDN/Banti hosts because that remote code is
+outside the gateway trust boundary. OreateAI's CDN currently omits its
+GlobalSign GCC R3 DV TLS CA 2020 intermediate certificate. The runtime image
+installs that public intermediate from its certificate AIA URL only after
+checking a pinned SHA-256 digest. It is added to both Alpine's system bundle and
+the dedicated Chromium user's NSS database as an untrusted chain certificate,
+allowing the existing trusted GlobalSign root, normal hostname checks, and
+certificate validation to remain in force. The certificate expires in March
+2029 and the pin must be reviewed if GlobalSign rotates the intermediate before
+then.
+
+**Known risk**: The integration depends on undocumented website endpoints and
+anti-abuse JavaScript that OreateAI can change without notice. Repeated Banti
+report failures can add latency until the bounded retry window expires. Docker's
+default seccomp profile blocks the namespace operations required by
+Chromium's Linux sandbox, so the container wrapper uses `--no-sandbox` after
+dropping to the dedicated UID. This is weaker than Chromium's normal renderer
+sandbox. The dedicated UID, empty environment, temporary profile, and restricted
+egress are therefore mandatory compensating controls; do not run the browser as
+root or grant the backend `SYS_ADMIN` merely to enable namespaces.
+
 ### 2026-08-14 - Unified control-plane and submit proxy, direct media egress, and unrestricted Adobe submits
 
 **Change**: The persisted administrator setting `proxy.url` is the single
@@ -7,7 +107,7 @@ provider egress rule. Authentication and account validation, cookie/token
 exchange and refresh, profile/quota/subscription calls, necessary upstream
 bootstrap/challenge requests, and the request that creates a generation job use
 the configured proxy for Adobe, ChatGPT, Runway, Leonardo, Krea, Imagine, Grok
-Web/Build, and custom OpenAI-compatible upstreams. Project/session preparation,
+Web/Build, OreateAI, and custom OpenAI-compatible upstreams. Project/session preparation,
 reference-media uploads, generation polling, artifact downloads, post-submit
 bookkeeping, and `/content` relays use direct local egress to keep metered proxy
 traffic bounded. A custom multipart image/video request carrying references is
@@ -176,7 +276,7 @@ be set to the canonical Cloudflare/CDN HTTPS hostname in production.
 
 ## Account credential import
 
-The account-management import parser accepts pasted credentials as well as CPA (`type: codex`) JSON, CPA multi-account ZIP archives, Sub2API account bundles, and grok2api `sso*` pool exports. These formats are normalized in the browser to provider-specific `{ type, value }` items, so persistence, duplicate-account updates, and asynchronous quota checks continue to use the established provider import endpoints.
+The account-management import parser accepts pasted credentials as well as CPA (`type: codex`) JSON, CPA multi-account ZIP archives, Sub2API account bundles, grok2api `sso*` pool exports, and OreateAI account exports. These formats are normalized in the browser to provider-specific `{ type, value, meta? }` items, so persistence, duplicate-account updates, and asynchronous quota checks continue to use the established provider import endpoints. OreateAI exports are reduced to Cookie, email, device ID, user agent, registration timestamp, and VIP metadata; the export password and cached point details are discarded before the browser sends the import request.
 
 ZIP processing is memory-only and never extracts paths to disk. It accepts JSON entries only, caps the archive at 1,000 JSON files, each uncompressed JSON entry at 2 MiB, and total uncompressed JSON data at 20 MiB. Duplicate credentials are removed before requests are sent. Agent Identity-only records are skipped because the image provider requires a ChatGPT `access_token`; when a file contains no supported credential, the UI reports that limitation explicitly.
 

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -29,6 +30,7 @@ import (
 	"backend/internal/provider/imagine"
 	"backend/internal/provider/krea"
 	"backend/internal/provider/leonardo"
+	"backend/internal/provider/oreate"
 	"backend/internal/provider/runway"
 	"backend/internal/repo"
 	"backend/internal/storage"
@@ -91,6 +93,7 @@ type V1Service struct {
 	krea     *krea.Client
 	imagine  *imagine.Client
 	grok     *grok.Client
+	oreate   *oreate.Client
 	custom   *custom.Client
 	store    *storage.Client
 	proxyMu  sync.RWMutex
@@ -354,7 +357,7 @@ type MediaReference struct {
 	Filename    string
 }
 
-func NewV1Service(cfg *config.Config, models *repo.ModelRepository, users *repo.UserRepository, events *repo.EventRepository, tokens *repo.TokenRepository, settings *repo.SiteSettingRepository, cgroups *repo.ConcurrencyGroupRepository, conc *ConcurrencyService, adobeClient *adobe.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, leonardoClient *leonardo.Client, kreaClient *krea.Client, imagineClient *imagine.Client, grokClient *grok.Client, customClient *custom.Client, store *storage.Client) *V1Service {
+func NewV1Service(cfg *config.Config, models *repo.ModelRepository, users *repo.UserRepository, events *repo.EventRepository, tokens *repo.TokenRepository, settings *repo.SiteSettingRepository, cgroups *repo.ConcurrencyGroupRepository, conc *ConcurrencyService, adobeClient *adobe.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, leonardoClient *leonardo.Client, kreaClient *krea.Client, imagineClient *imagine.Client, grokClient *grok.Client, oreateClient *oreate.Client, customClient *custom.Client, store *storage.Client) *V1Service {
 	service := &V1Service{
 		cfg:      cfg,
 		models:   models,
@@ -371,6 +374,7 @@ func NewV1Service(cfg *config.Config, models *repo.ModelRepository, users *repo.
 		krea:     kreaClient,
 		imagine:  imagineClient,
 		grok:     grokClient,
+		oreate:   oreateClient,
 		custom:   customClient,
 		store:    store,
 		inflight: &InflightRegistry{},
@@ -440,6 +444,9 @@ func (s *V1Service) setProviderProxy(proxy string) string {
 	}
 	if s.grok != nil {
 		s.grok.SetProxy(proxy)
+	}
+	if s.oreate != nil {
+		s.oreate.SetProxy(proxy)
 	}
 	if s.custom != nil {
 		s.custom.SetProxy(proxy)
@@ -662,6 +669,8 @@ func v1ModelEntry(item model.ModelConfig, created int64, extended bool) map[stri
 		}
 		entry["supported_durations"] = durations
 		entry["durations"] = durations
+		entry["supportedDurations"] = durations
+		entry["durationTiers"] = durations
 	}
 	return entry
 }
@@ -1658,6 +1667,8 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 		videoBytes, videoURL, execErr = s.generateLeonardoVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), !urlOnly)
 	case "grok":
 		videoBytes, videoURL, execErr = s.generateGrokVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), !urlOnly)
+	case "oreate":
+		videoBytes, videoURL, execErr = s.generateOreateVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), !urlOnly)
 	case "custom":
 		videoBytes, videoURL, execErr = s.generateCustomVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), !urlOnly)
 	default:
@@ -1671,13 +1682,13 @@ func (s *V1Service) prepareVideoExecution(ctx context.Context, principal *APIPri
 		switch {
 		case errors.Is(execErr, ErrNoProviderAccount):
 			return nil, ErrNoProviderAccount
-		case errors.Is(execErr, adobe.ErrAuth), errors.Is(execErr, runway.ErrAuth), errors.Is(execErr, grok.ErrAuth), errors.Is(execErr, custom.ErrAuth):
+		case errors.Is(execErr, adobe.ErrAuth), errors.Is(execErr, runway.ErrAuth), errors.Is(execErr, grok.ErrAuth), errors.Is(execErr, oreate.ErrAuth), errors.Is(execErr, custom.ErrAuth):
 			return nil, ErrProviderAuth
-		case errors.Is(execErr, adobe.ErrQuotaExhausted), errors.Is(execErr, runway.ErrQuotaExhausted), errors.Is(execErr, grok.ErrQuotaExhausted), errors.Is(execErr, custom.ErrQuotaExhausted):
+		case errors.Is(execErr, adobe.ErrQuotaExhausted), errors.Is(execErr, runway.ErrQuotaExhausted), errors.Is(execErr, grok.ErrQuotaExhausted), errors.Is(execErr, oreate.ErrQuotaExhausted), errors.Is(execErr, custom.ErrQuotaExhausted):
 			return nil, ErrProviderQuota
-		case errors.Is(execErr, adobe.ErrTemporaryUpstream), errors.Is(execErr, runway.ErrTemporaryUpstream), errors.Is(execErr, grok.ErrTemporaryUpstream), errors.Is(execErr, custom.ErrTemporaryUpstream):
+		case errors.Is(execErr, adobe.ErrTemporaryUpstream), errors.Is(execErr, runway.ErrTemporaryUpstream), errors.Is(execErr, grok.ErrTemporaryUpstream), errors.Is(execErr, oreate.ErrTemporaryUpstream), errors.Is(execErr, oreate.ErrRiskControl), errors.Is(execErr, custom.ErrTemporaryUpstream):
 			return nil, ErrProviderTemporary
-		case errors.Is(execErr, adobe.ErrContentRejected):
+		case errors.Is(execErr, adobe.ErrContentRejected), errors.Is(execErr, oreate.ErrContentRejected):
 			return nil, execErr
 		default:
 			return nil, fmt.Errorf("%w: %v", ErrProviderExecution, execErr)
@@ -1819,6 +1830,8 @@ func (s *V1Service) runVideoJob(ctx context.Context, principal *APIPrincipal, in
 		_, videoURL, execErr = s.generateLeonardoVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), false)
 	case "grok":
 		_, videoURL, execErr = s.generateGrokVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), false)
+	case "oreate":
+		_, videoURL, execErr = s.generateOreateVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), false)
 	case "custom":
 		_, videoURL, execErr = s.generateCustomVideo(genCtx, eventID, modelItem, in, aspectRatio, resolution, parseDurationSeconds(duration), false)
 	default:
@@ -3194,6 +3207,118 @@ func upstreamQuality(resolution string) string {
 		return "low"
 	}
 	return ""
+}
+
+// generateOreateVideo runs OreateAI's Seedance video flow. Oreate's
+// website requires a fresh browser-generated Banti token for every attempt, so
+// risk-control failures are temporary and participate in the bounded retry loop.
+func (s *V1Service) generateOreateVideo(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1VideoRequest, aspectRatio, resolution string, durationSeconds int, downloadResult bool) ([]byte, string, error) {
+	if s.oreate == nil {
+		return nil, "", errors.New("oreate client not configured")
+	}
+	if len(in.ReferenceAudios) > 0 {
+		return nil, "", fmt.Errorf("%w: OreateAI Seedance does not currently expose reference-audio slots", ErrUnsupportedParams)
+	}
+	decodedImages, err := decodeReferenceImages(in.ReferenceImages, max(1, modelItem.MaxReferenceImages))
+	if err != nil {
+		return nil, "", err
+	}
+	imageRefs := make([]oreate.MediaReference, 0, len(decodedImages))
+	for i, data := range decodedImages {
+		contentType := strings.ToLower(strings.TrimSpace(strings.Split(http.DetectContentType(data), ";")[0]))
+		switch contentType {
+		case "image/jpeg", "image/png", "image/webp":
+		default:
+			return nil, "", fmt.Errorf("%w: OreateAI reference images must be JPEG, PNG, or WebP", ErrUnsupportedParams)
+		}
+		imageRefs = append(imageRefs, oreate.MediaReference{Data: data, ContentType: contentType, Filename: fmt.Sprintf("reference-image-%d", i+1)})
+	}
+	videoRefs := make([]oreate.MediaReference, 0, len(in.ReferenceVideos))
+	totalReferenceDuration := 0.0
+	for _, ref := range in.ReferenceVideos {
+		seconds, parseErr := oreate.MP4DurationSeconds(ref.Data)
+		if parseErr != nil {
+			return nil, "", fmt.Errorf("%w: %v", ErrUnsupportedParams, parseErr)
+		}
+		totalReferenceDuration += seconds
+		videoRefs = append(videoRefs, oreate.MediaReference{
+			Data: ref.Data, ContentType: ref.ContentType, Filename: ref.Filename, DurationSec: seconds,
+		})
+	}
+	upstreamModel := strings.TrimSpace(modelItem.UpstreamModel)
+	if upstreamModel == "" {
+		upstreamModel = strings.TrimSpace(modelItem.ID)
+	}
+	if len(videoRefs) > 0 {
+		if _, _, _, err := oreate.SeedanceReferenceConfig(upstreamModel, resolution, durationSeconds, int(math.Ceil(totalReferenceDuration))); err != nil {
+			return nil, "", fmt.Errorf("%w: %v", ErrUnsupportedParams, err)
+		}
+	}
+	s.applyGlobalProxy(ctx)
+	items, err := s.tokens.ListByPool(ctx, "oreate")
+	if err != nil {
+		return nil, "", err
+	}
+	active := make([]model.TokenAccount, 0, len(items))
+	for _, item := range items {
+		if item.Status != "active" || item.Dead || item.VideoLimited || strings.TrimSpace(item.Value) == "" {
+			continue
+		}
+		if remaining, ok := jsonMapInt(item.Meta, "cached_quota_remaining"); ok && remaining < oreateMinCredits {
+			continue
+		}
+		active = append(active, item)
+	}
+	active = pinTestAccount(items, active, in.AccountID)
+	if len(active) == 0 {
+		return nil, "", ErrNoProviderAccount
+	}
+	s.rotateRoundRobin("oreate", active)
+	var videoURL string
+	data, err := s.runPoolWithFailover(ctx, eventID, "oreate", active, "video", func(token model.TokenAccount) ([]byte, error) {
+		blob, meta, genErr := s.oreate.GenerateVideo(ctx, oreateAccountFromToken(token), oreate.VideoOptions{
+			ModelID: upstreamModel, Prompt: in.Prompt, Ratio: aspectRatio, Resolution: resolution,
+			Duration: durationSeconds, Audio: in.GenerateAudio, DownloadResult: downloadResult,
+			ReferenceImages: imageRefs, ReferenceVideos: videoRefs,
+		})
+		if genErr != nil {
+			return nil, genErr
+		}
+		videoURL = strings.TrimSpace(stringValue(meta["video_url"]))
+		s.reconcileOreateCredits(ctx, token)
+		return blob, nil
+	}, func(e error) (bool, bool, bool, bool) {
+		return errors.Is(e, oreate.ErrAuth), errors.Is(e, oreate.ErrQuotaExhausted), errors.Is(e, oreate.ErrTemporaryUpstream) || errors.Is(e, oreate.ErrRiskControl), false
+	}, nil, true)
+	return data, videoURL, err
+}
+
+func (s *V1Service) reconcileOreateCredits(ctx context.Context, token model.TokenAccount) {
+	data, err := s.oreate.FetchCreditsBalance(ctx, oreateAccountFromToken(token))
+	if err != nil {
+		return
+	}
+	item, err := s.tokens.Get(ctx, "oreate", token.ID)
+	if err != nil {
+		return
+	}
+	meta := cloneJSONMap(item.Meta)
+	meta["cached_quota_at"] = int(time.Now().Unix())
+	remaining, hasRemaining := data["remaining"].(int)
+	if hasRemaining {
+		meta["cached_quota_remaining"] = remaining
+	}
+	if total, ok := data["total"].(int); ok {
+		meta["cached_quota_total"] = total
+	}
+	patch := map[string]any{"meta": meta}
+	if reset := strings.TrimSpace(stringValue(data["reset_after"])); reset != "" {
+		patch["cached_quota_reset_after"] = reset
+	}
+	if hasRemaining && remaining < oreateMinCredits {
+		patch["status"] = "quota"
+	}
+	_, _ = s.tokens.Update(ctx, "oreate", token.ID, patch)
 }
 
 // generateGrokVideo runs grok's imagine video pipeline across the grok pool.

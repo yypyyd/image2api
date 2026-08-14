@@ -108,7 +108,70 @@ func seedDefaults(ctx context.Context, db *gorm.DB) error {
 		 '{"720p":0}'::jsonb, '["720p"]'::jsonb, false,
 		 '{"6s":10,"10s":15}'::jsonb, '{}'::jsonb, '{}'::jsonb,
 		 '["6s","10s"]'::jsonb, 6, 0, 0, 0, false, 'asset', '',
-		 0, 0, now(), now()) ON CONFLICT (id) DO NOTHING`).Error; err != nil {
+			0, 0, now(), now()) ON CONFLICT (id) DO NOTHING`).Error; err != nil {
+		return err
+	}
+	// OreateAI Seedance capabilities mirror the authenticated account model and
+	// scene configuration. Prices default to zero so deployments can set their
+	// own retail pricing without seed updates overwriting it.
+	if err := db.WithContext(ctx).Exec(`INSERT INTO model_configs
+		(id, type, name, alias, provider, enabled, ratios, prices, resolutions,
+		 image_to_image, duration_prices, prices_agent, duration_prices_agent,
+		 durations, max_reference_images, max_reference_videos, max_reference_audios,
+		 max_reference_media, supports_audio_output, reference_mode, upstream_model,
+		 weight, generation_count, created_at, updated_at)
+		VALUES
+		 ('oreate-seedance-2.0-mini', 'video', 'Seedance 2.0 Mini', '', 'oreate', true,
+		  '["16:9","1:1","3:4","4:3","9:16","21:9"]'::jsonb,
+		  '{"480p":0,"720p":0}'::jsonb, '["480p","720p"]'::jsonb, false,
+		  '{"5s":0,"10s":0}'::jsonb, '{}'::jsonb, '{}'::jsonb, '["5s","10s"]'::jsonb,
+		  9, 3, 0, 12, true, 'asset', 'seedance-2.0-mini', 0, 0, now(), now()),
+		 ('oreate-seedance-2.0-fast', 'video', 'Seedance 2.0 Fast', '', 'oreate', true,
+		  '["16:9","1:1","3:4","4:3","9:16","21:9"]'::jsonb,
+		  '{"480p":0,"720p":0}'::jsonb, '["480p","720p"]'::jsonb, false,
+		  '{"5s":0,"10s":0}'::jsonb, '{}'::jsonb, '{}'::jsonb, '["5s","10s"]'::jsonb,
+		  9, 3, 0, 12, true, 'asset', 'seedance-2.0-fast', 0, 0, now(), now()),
+		 ('oreate-seedance-1.5-pro', 'video', 'Seedance 1.5 Pro', '', 'oreate', true,
+		  '["16:9","1:1","3:4","4:3","9:16","21:9"]'::jsonb,
+		  '{"480p":0,"720p":0,"1080p":0}'::jsonb, '["480p","720p","1080p"]'::jsonb, false,
+		  '{"5s":0,"10s":0}'::jsonb, '{}'::jsonb, '{}'::jsonb, '["5s","10s"]'::jsonb,
+		  2, 0, 0, 2, true, 'frame', 'seedance-1.5-pro', 0, 0, now(), now()),
+		 ('oreate-seedance-2.0', 'video', 'Seedance 2.0', '', 'oreate', true,
+		  '["16:9","1:1","3:4","4:3","9:16","21:9"]'::jsonb,
+		  '{"480p":0,"720p":0,"1080p":0}'::jsonb, '["480p","720p","1080p"]'::jsonb, false,
+		  '{"5s":0,"10s":0}'::jsonb, '{}'::jsonb, '{}'::jsonb, '["5s","10s"]'::jsonb,
+		  9, 3, 0, 12, true, 'asset', 'seedance-2.0', 0, 0, now(), now()),
+		 ('oreate-seedance-2.5', 'video', 'Seedance 2.5', '', 'oreate', true,
+		  '["16:9","1:1","3:4","4:3","9:16","21:9"]'::jsonb,
+		  '{"480p":0,"720p":0}'::jsonb, '["480p","720p"]'::jsonb, false,
+		  '{"5s":0,"10s":0,"20s":0,"30s":0}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+		  '["5s","10s","20s","30s"]'::jsonb,
+		  9, 3, 0, 12, true, 'asset', 'seedance-2.5', 0, 0, now(), now())
+		ON CONFLICT (id) DO NOTHING`).Error; err != nil {
+		return err
+	}
+	// Capability-only backfill for existing deployments. Operator-controlled
+	// enablement, aliases, prices, weights, and counters are deliberately kept.
+	if err := db.WithContext(ctx).Exec(`UPDATE model_configs AS m SET
+		ratios = v.ratios::jsonb,
+		resolutions = v.resolutions::jsonb,
+		durations = v.durations::jsonb,
+		max_reference_images = v.max_images,
+		max_reference_videos = v.max_videos,
+		max_reference_audios = 0,
+		max_reference_media = v.max_media,
+		supports_audio_output = true,
+		reference_mode = v.reference_mode,
+		upstream_model = v.upstream_model,
+		updated_at = now()
+		FROM (VALUES
+		 ('oreate-seedance-2.0-mini', '["16:9","1:1","3:4","4:3","9:16","21:9"]', '["480p","720p"]', '["5s","10s"]', 9, 3, 12, 'asset', 'seedance-2.0-mini'),
+		 ('oreate-seedance-2.0-fast', '["16:9","1:1","3:4","4:3","9:16","21:9"]', '["480p","720p"]', '["5s","10s"]', 9, 3, 12, 'asset', 'seedance-2.0-fast'),
+		 ('oreate-seedance-1.5-pro', '["16:9","1:1","3:4","4:3","9:16","21:9"]', '["480p","720p","1080p"]', '["5s","10s"]', 2, 0, 2, 'frame', 'seedance-1.5-pro'),
+		 ('oreate-seedance-2.0', '["16:9","1:1","3:4","4:3","9:16","21:9"]', '["480p","720p","1080p"]', '["5s","10s"]', 9, 3, 12, 'asset', 'seedance-2.0'),
+		 ('oreate-seedance-2.5', '["16:9","1:1","3:4","4:3","9:16","21:9"]', '["480p","720p"]', '["5s","10s","20s","30s"]', 9, 3, 12, 'asset', 'seedance-2.5')
+		) AS v(id, ratios, resolutions, durations, max_images, max_videos, max_media, reference_mode, upstream_model)
+		WHERE m.id = v.id`).Error; err != nil {
 		return err
 	}
 	// Older releases incorrectly treated a missing ACTIVE subscription as a
