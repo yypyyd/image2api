@@ -38,6 +38,15 @@ The Docker runtime also supplies a dedicated unprivileged `chrome` user and a
 pinned GlobalSign intermediate in both the system and Chromium NSS certificate
 stores. See [DESIGN.md](DESIGN.md) for the security boundary.
 
+## Account Lifecycle
+
+The service layer permanently removes an Oreate account when a successful
+balance response contains an integer `remaining` value below 60. A balance of
+exactly 60 is retained. Missing values, malformed responses, timeouts, proxy
+failures, and other inconclusive probes never trigger deletion. This policy is
+applied after import validation, an administrator quota refresh, and successful
+or quota-exhausted generation reconciliation.
+
 ## Internal Usage
 
 ```go

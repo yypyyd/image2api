@@ -1,5 +1,22 @@
 # Design Notes
 
+### 2026-08-15 - Retire low-credit OreateAI accounts
+
+**Change**: A successful OreateAI balance read now permanently deletes the
+account when `remaining < 60`. The shared lifecycle check runs after import,
+administrator quota refresh, and successful or quota-exhausted generation
+reconciliation. Exactly
+60 remains, and missing, malformed, timed-out, or otherwise failed balance reads
+never delete an account.
+
+**Reason**: Oreate accounts below the operating reserve should leave the pool
+instead of remaining as quota rows that can be recovered or selected later.
+
+**Impact**: Account removal is destructive but limited to an authoritative,
+typed upstream balance. Concurrent reconciliation is idempotent, manual refresh
+reports the deletion to the account page, and a post-generation delete failure
+does not turn an already successful customer generation into an error.
+
 ### 2026-08-15 - OreateAI Seedance 2.5 and reference-media contract
 
 **Change**: Expanded the OreateAI provider from four text-only Seedance routes

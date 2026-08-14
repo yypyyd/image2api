@@ -207,7 +207,10 @@ async function reconcile() {
   for (const row of quotaRows) {
     jobs.push(async () => {
       const result = await fetchOneQuota(row.pool, row.id)
-      if (result && result.auth_failed) {
+      if (result && result.deleted) {
+        rows.value = rows.value.filter((item) => item.pool !== row.pool || item.id !== row.id)
+        updates++
+      } else if (result && result.auth_failed) {
         // backend auto-disabled this dead (401) token — reflect it immediately
         row.status = result.status || 'disabled'
         row.dead = true

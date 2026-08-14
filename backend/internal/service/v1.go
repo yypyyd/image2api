@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"math/rand"
 	"net/http"
@@ -3264,7 +3265,7 @@ func (s *V1Service) generateOreateVideo(ctx context.Context, eventID string, mod
 		if item.Status != "active" || item.Dead || item.VideoLimited || strings.TrimSpace(item.Value) == "" {
 			continue
 		}
-		if remaining, ok := jsonMapInt(item.Meta, "cached_quota_remaining"); ok && remaining < oreateMinCredits {
+		if remaining, ok := jsonMapInt(item.Meta, "cached_quota_remaining"); ok && remaining < oreateDeleteBelowCredits {
 			continue
 		}
 		active = append(active, item)
@@ -3282,6 +3283,9 @@ func (s *V1Service) generateOreateVideo(ctx context.Context, eventID string, mod
 			ReferenceImages: imageRefs, ReferenceVideos: videoRefs,
 		})
 		if genErr != nil {
+			if errors.Is(genErr, oreate.ErrQuotaExhausted) {
+				s.reconcileOreateCredits(ctx, token)
+			}
 			return nil, genErr
 		}
 		videoURL = strings.TrimSpace(stringValue(meta["video_url"]))
@@ -3296,6 +3300,14 @@ func (s *V1Service) generateOreateVideo(ctx context.Context, eventID string, mod
 func (s *V1Service) reconcileOreateCredits(ctx context.Context, token model.TokenAccount) {
 	data, err := s.oreate.FetchCreditsBalance(ctx, oreateAccountFromToken(token))
 	if err != nil {
+		return
+	}
+	deleteRequired, deleteErr := deleteOreateAccountBelowCreditFloor(ctx, s.tokens, token.ID, data)
+	if deleteRequired {
+		if deleteErr != nil {
+			log.Printf("oreate reconciliation: could not delete low-credit account %s: %v", token.ID, deleteErr)
+			_, _ = s.tokens.Update(ctx, "oreate", token.ID, map[string]any{"status": "disabled"})
+		}
 		return
 	}
 	item, err := s.tokens.Get(ctx, "oreate", token.ID)
@@ -3314,9 +3326,6 @@ func (s *V1Service) reconcileOreateCredits(ctx context.Context, token model.Toke
 	patch := map[string]any{"meta": meta}
 	if reset := strings.TrimSpace(stringValue(data["reset_after"])); reset != "" {
 		patch["cached_quota_reset_after"] = reset
-	}
-	if hasRemaining && remaining < oreateMinCredits {
-		patch["status"] = "quota"
 	}
 	_, _ = s.tokens.Update(ctx, "oreate", token.ID, patch)
 }

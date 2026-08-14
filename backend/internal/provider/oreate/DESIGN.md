@@ -74,6 +74,22 @@ The authenticated scene configuration currently allows:
 Image-only reference scenes continue to use `SeedanceConfig`, matching the
 official frontend.
 
+## Account Lifecycle
+
+Oreate accounts are disposable once their confirmed remaining balance can no
+longer cover the operational reserve. The service permanently deletes the
+account row when, and only when, a successful balance response contains an
+integer `remaining < 60`. Exactly 60 remains eligible. Network errors,
+authentication errors, missing fields, malformed types, and otherwise unknown
+balances do not enter the destructive path.
+
+One shared service-layer predicate owns the threshold and is used by import
+hydration, administrator quota refresh, and generation-time reconciliation.
+Deletion occurs before quota metadata or status is written back. A concurrent
+zero-row delete is treated as success, while a repository failure is surfaced
+to an administrator and prevents the account from being rescheduled after a
+generation.
+
 ## Proxy And Browser Isolation
 
 Chromium does not support credentials embedded in `--proxy-server`. For an
@@ -159,6 +175,14 @@ risk-control hosts.
   hostname allowlist.
 
 ## Change History
+
+### 2026-08-15 - Low-credit account retirement
+
+- Added permanent account deletion after an authoritative balance response
+  reports fewer than 60 remaining points.
+- Kept exactly 60 points and all unknown or failed balance reads non-destructive.
+- Applied the lifecycle rule consistently during import, manual quota refresh,
+  and successful or quota-exhausted generation reconciliation.
 
 ### 2026-08-15 - Seedance 2.5 and confirmed reference scenes
 

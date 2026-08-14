@@ -1251,6 +1251,16 @@ func (s *TokenService) checkPendingOreate(tokenID string, account oreate.Account
 		s.finishPending(ctx, "oreate", tokenID, "active", false, nil)
 		return
 	}
+	deleteRequired, deleteErr := deleteOreateAccountBelowCreditFloor(ctx, s.tokens, tokenID, data)
+	if deleteRequired {
+		if deleteErr != nil {
+			log.Printf("token import: could not delete low-credit oreate account %s: %v", tokenID, deleteErr)
+			// Keep an account that should have been deleted out of scheduling if the
+			// repository delete itself failed.
+			s.finishPending(ctx, "oreate", tokenID, "disabled", false, nil)
+		}
+		return
+	}
 	quotaMeta := map[string]any{"cached_quota_at": int(time.Now().Unix())}
 	remaining, hasRemaining := data["remaining"].(int)
 	if hasRemaining {
@@ -1259,14 +1269,10 @@ func (s *TokenService) checkPendingOreate(tokenID string, account oreate.Account
 	if total, ok := data["total"].(int); ok {
 		quotaMeta["cached_quota_total"] = total
 	}
-	status := "active"
-	if hasRemaining && remaining < oreateMinCredits {
-		status = "quota"
-	}
 	if reset := strings.TrimSpace(stringValue(data["reset_after"])); reset != "" {
 		_, _ = s.tokens.Update(ctx, "oreate", tokenID, map[string]any{"cached_quota_reset_after": reset})
 	}
-	s.finishPending(ctx, "oreate", tokenID, status, false, quotaMeta)
+	s.finishPending(ctx, "oreate", tokenID, "active", false, quotaMeta)
 }
 
 func oreateAccountFromToken(item model.TokenAccount) oreate.Account {
@@ -1282,7 +1288,33 @@ func oreateAccountFromToken(item model.TokenAccount) oreate.Account {
 	return account
 }
 
-const oreateMinCredits = 30
+const oreateDeleteBelowCredits = 60
+
+type oreateAccountDeleter interface {
+	Delete(ctx context.Context, pool, id string) (int64, error)
+}
+
+func shouldDeleteOreateAccount(data map[string]any) bool {
+	remaining, ok := data["remaining"].(int)
+	return ok && remaining < oreateDeleteBelowCredits
+}
+
+// deleteOreateAccountBelowCreditFloor applies the destructive account lifecycle
+// rule only to a successful, typed balance response. A zero-row delete is still
+// handled: another concurrent reconciliation may already have removed the row.
+func deleteOreateAccountBelowCreditFloor(ctx context.Context, tokens oreateAccountDeleter, tokenID string, data map[string]any) (bool, error) {
+	if !shouldDeleteOreateAccount(data) {
+		return false, nil
+	}
+	rows, err := tokens.Delete(ctx, "oreate", tokenID)
+	if err != nil {
+		return true, err
+	}
+	if rows > 0 {
+		log.Printf("oreate account %s deleted after confirmed balance fell below %d credits", tokenID, oreateDeleteBelowCredits)
+	}
+	return true, nil
+}
 
 // ImportCustomAccount adds an upstream as a custom account: base_url + key, the
 // csv list of model ids it serves (empty = all), plus optional weight and
@@ -1845,6 +1877,17 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 			}
 			return nil, err
 		}
+		deleted, deleteErr := deleteOreateAccountBelowCreditFloor(ctx, s.tokens, item.ID, data)
+		if deleteErr != nil {
+			return nil, deleteErr
+		}
+		if deleted {
+			return map[string]any{
+				"supported": true, "remaining": data["remaining"], "used": data["used"], "total": data["total"],
+				"reset_after": emptyToNil(strings.TrimSpace(stringValue(data["reset_after"]))), "quota_cached_at": int(time.Now().Unix()),
+				"unchanged": false, "unknown": false, "deleted": true, "error": data["error"],
+			}, nil
+		}
 		meta := cloneJSONMap(item.Meta)
 		meta["cached_quota_at"] = int(time.Now().Unix())
 		remaining, hasRemaining := data["remaining"].(int)
@@ -1859,9 +1902,7 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 			patch["cached_quota_reset_after"] = reset
 			item.CachedQuotaResetAfter = reset
 		}
-		if hasRemaining && remaining < oreateMinCredits {
-			patch["status"] = "quota"
-		} else if hasRemaining && item.Status == "quota" {
+		if hasRemaining && item.Status == "quota" {
 			patch["status"] = "active"
 		}
 		if updated, updateErr := s.tokens.Update(ctx, item.Pool, item.ID, patch); updateErr == nil {
