@@ -68,6 +68,10 @@ var (
 	ErrVideoJobNotFound  = errors.New("video job not found")
 	ErrVideoNotReady     = errors.New("video is not ready yet")
 	ErrImageTaskNotFound = errors.New("image task not found")
+	// A provider account can be unable to fund one expensive request while still
+	// remaining valid for cheaper work. It participates in quota failover but
+	// must not be moved to the pool-wide quota state.
+	errAccountTaskQuota = errors.New("provider account balance below current task cost")
 )
 
 // maxReferenceImageBytes bounds a single decoded reference image. 20 MB
@@ -2622,7 +2626,9 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 		}
 		isAuth, isQuota, isTemp, isDead := classify(err)
 		if isQuota {
-			s.markTokenFailure(ctx, pool, token, kind, false, true)
+			if shouldMarkAccountQuota(err) {
+				s.markTokenFailure(ctx, pool, token, kind, false, true)
+			}
 			return nil, err, true, false
 		}
 		if isAuth {
@@ -2665,6 +2671,10 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 		}
 		return nil, err, false, false // 参数错 / request-level
 	}
+}
+
+func shouldMarkAccountQuota(err error) bool {
+	return !errors.Is(err, errAccountTaskQuota)
 }
 
 func adobeErrClass(e error) (bool, bool, bool, bool) {
@@ -3250,10 +3260,13 @@ func (s *V1Service) generateOreateVideo(ctx context.Context, eventID string, mod
 	if upstreamModel == "" {
 		upstreamModel = strings.TrimSpace(modelItem.ID)
 	}
+	referenceDuration := 0
 	if len(videoRefs) > 0 {
-		if _, _, _, err := oreate.SeedanceReferenceConfig(upstreamModel, resolution, durationSeconds, int(math.Ceil(totalReferenceDuration))); err != nil {
-			return nil, "", fmt.Errorf("%w: %v", ErrUnsupportedParams, err)
-		}
+		referenceDuration = int(math.Ceil(totalReferenceDuration))
+	}
+	requiredCredits, err := oreate.SeedanceRequiredCredits(upstreamModel, resolution, durationSeconds, in.GenerateAudio, referenceDuration)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %v", ErrUnsupportedParams, err)
 	}
 	s.applyGlobalProxy(ctx)
 	items, err := s.tokens.ListByPool(ctx, "oreate")
@@ -3271,25 +3284,44 @@ func (s *V1Service) generateOreateVideo(ctx context.Context, eventID string, mod
 		active = append(active, item)
 	}
 	active = pinTestAccount(items, active, in.AccountID)
+	active, knownInsufficient := filterOreateAccountsByCredits(active, requiredCredits)
 	if len(active) == 0 {
+		if knownInsufficient {
+			return nil, "", oreate.ErrQuotaExhausted
+		}
 		return nil, "", ErrNoProviderAccount
 	}
 	s.rotateRoundRobin("oreate", active)
 	var videoURL string
 	data, err := s.runPoolWithFailover(ctx, eventID, "oreate", active, "video", func(token model.TokenAccount) ([]byte, error) {
+		// Reserve the exact request cost under the account row lock. This closes the
+		// gap between pool selection and submit when a preceding queued job has just
+		// consumed the same account's balance.
+		allowed, deducted, reserveErr := s.tokens.ReserveQuota(ctx, "oreate", token.ID, requiredCredits)
+		if reserveErr != nil {
+			return nil, fmt.Errorf("%w: reserve credits: %v", oreate.ErrTemporaryUpstream, reserveErr)
+		}
+		if !allowed {
+			return nil, fmt.Errorf("%w: %w", oreate.ErrQuotaExhausted, errAccountTaskQuota)
+		}
 		blob, meta, genErr := s.oreate.GenerateVideo(ctx, oreateAccountFromToken(token), oreate.VideoOptions{
 			ModelID: upstreamModel, Prompt: in.Prompt, Ratio: aspectRatio, Resolution: resolution,
 			Duration: durationSeconds, Audio: in.GenerateAudio, DownloadResult: downloadResult,
 			ReferenceImages: imageRefs, ReferenceVideos: videoRefs,
 		})
 		if genErr != nil {
+			if deducted {
+				_ = s.tokens.RefundQuota(ctx, "oreate", token.ID, requiredCredits)
+			}
 			if errors.Is(genErr, oreate.ErrQuotaExhausted) {
-				s.reconcileOreateCredits(ctx, token)
+				if remaining, known := s.reconcileOreateCredits(ctx, token); known && remaining >= oreateDeleteBelowCredits {
+					genErr = fmt.Errorf("%w: %w", genErr, errAccountTaskQuota)
+				}
 			}
 			return nil, genErr
 		}
 		videoURL = strings.TrimSpace(stringValue(meta["video_url"]))
-		s.reconcileOreateCredits(ctx, token)
+		_, _ = s.reconcileOreateCredits(ctx, token)
 		return blob, nil
 	}, func(e error) (bool, bool, bool, bool) {
 		return errors.Is(e, oreate.ErrAuth), errors.Is(e, oreate.ErrQuotaExhausted), errors.Is(e, oreate.ErrTemporaryUpstream) || errors.Is(e, oreate.ErrRiskControl), false
@@ -3297,26 +3329,43 @@ func (s *V1Service) generateOreateVideo(ctx context.Context, eventID string, mod
 	return data, videoURL, err
 }
 
-func (s *V1Service) reconcileOreateCredits(ctx context.Context, token model.TokenAccount) {
+// filterOreateAccountsByCredits keeps unknown balances eligible for backwards
+// compatibility, but never schedules an account whose confirmed cached balance
+// cannot cover this request. The latter is task-specific and does not change
+// account status: the same account may still serve a cheaper Seedance request.
+func filterOreateAccountsByCredits(items []model.TokenAccount, required int) ([]model.TokenAccount, bool) {
+	eligible := make([]model.TokenAccount, 0, len(items))
+	knownInsufficient := false
+	for _, item := range items {
+		if remaining, ok := jsonMapInt(item.Meta, "cached_quota_remaining"); ok && remaining < required {
+			knownInsufficient = true
+			continue
+		}
+		eligible = append(eligible, item)
+	}
+	return eligible, knownInsufficient
+}
+
+func (s *V1Service) reconcileOreateCredits(ctx context.Context, token model.TokenAccount) (int, bool) {
 	data, err := s.oreate.FetchCreditsBalance(ctx, oreateAccountFromToken(token))
 	if err != nil {
-		return
+		return 0, false
 	}
+	remaining, hasRemaining := data["remaining"].(int)
 	deleteRequired, deleteErr := deleteOreateAccountBelowCreditFloor(ctx, s.tokens, token.ID, data)
 	if deleteRequired {
 		if deleteErr != nil {
 			log.Printf("oreate reconciliation: could not delete low-credit account %s: %v", token.ID, deleteErr)
 			_, _ = s.tokens.Update(ctx, "oreate", token.ID, map[string]any{"status": "disabled"})
 		}
-		return
+		return remaining, hasRemaining
 	}
 	item, err := s.tokens.Get(ctx, "oreate", token.ID)
 	if err != nil {
-		return
+		return remaining, hasRemaining
 	}
 	meta := cloneJSONMap(item.Meta)
 	meta["cached_quota_at"] = int(time.Now().Unix())
-	remaining, hasRemaining := data["remaining"].(int)
 	if hasRemaining {
 		meta["cached_quota_remaining"] = remaining
 	}
@@ -3328,6 +3377,7 @@ func (s *V1Service) reconcileOreateCredits(ctx context.Context, token model.Toke
 		patch["cached_quota_reset_after"] = reset
 	}
 	_, _ = s.tokens.Update(ctx, "oreate", token.ID, patch)
+	return remaining, hasRemaining
 }
 
 // generateGrokVideo runs grok's imagine video pipeline across the grok pool.

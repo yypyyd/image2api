@@ -9,7 +9,7 @@ the authenticated website flow and its browser-generated Banti signature.
 
 - Validate Oreate account cookies and read profile and point balances.
 - Map the five public `oreate-seedance-*` model IDs to confirmed website model
-  names, resolutions, durations, aspect ratios, and audio options.
+  names, resolutions, durations, aspect ratios, audio options, and point costs.
 - Upload JPEG/PNG/WebP images and MP4/MOV videos with Oreate's short-lived
   Google Storage credentials, then construct text, ordered-frame, or reference
   scenes with the same attachment metadata as the official frontend.
@@ -46,6 +46,21 @@ exactly 60 is retained. Missing values, malformed responses, timeouts, proxy
 failures, and other inconclusive probes never trigger deletion. This policy is
 applied after import validation, an administrator quota refresh, and successful
 or quota-exhausted generation reconciliation.
+
+Before dispatch, the service resolves the request's official point cost from
+its `aiType` and excludes every account with a known cached balance below that
+cost. This is separate from account retirement: an 80-point account remains in
+the pool and can run a 30- or 60-point request, but cannot be selected for a
+100-point request. Unknown cached balances remain eligible until an
+authoritative balance probe fills them, preserving compatibility with legacy
+rows without treating missing data as zero.
+
+The selected account's exact request cost is atomically reserved immediately
+before submit and refunded on generation failure. This closes the queueing race
+where two requests could otherwise both observe the same stale balance. An
+upstream quota response only changes the account to the global quota state when
+balance reconciliation cannot establish that the account still has enough
+points to remain useful for cheaper requests.
 
 ## Internal Usage
 
@@ -84,7 +99,7 @@ standard input. They never create a video or print credentials or token bodies.
 ## Files
 
 - `client.go`: account, profile, balance, headers, and error classification.
-- `models.go`: strict Seedance capability mapping.
+- `models.go`: strict Seedance capability, `aiType`, and point-cost mapping.
 - `media_duration.go`: bounded ISO BMFF `mvhd` duration parser.
 - `upload.go`: Oreate upload-token exchange and fixed-host GCS resumable upload.
 - `video.go`: chat creation, SSE generation, parsing, and artifact download.

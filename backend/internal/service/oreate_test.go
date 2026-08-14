@@ -3,10 +3,12 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"backend/internal/model"
+	"backend/internal/provider/oreate"
 	"gorm.io/datatypes"
 )
 
@@ -113,4 +115,69 @@ func TestDeleteOreateAccountBelowCreditFloor(t *testing.T) {
 			t.Fatalf("deleteOreateAccountBelowCreditFloor() = (%v, %v), want (true, %v)", handled, err, wantErr)
 		}
 	})
+}
+
+func TestFilterOreateAccountsByCredits(t *testing.T) {
+	account := func(id string, remaining any) model.TokenAccount {
+		meta := datatypes.JSONMap{}
+		if remaining != nil {
+			meta["cached_quota_remaining"] = remaining
+		}
+		return model.TokenAccount{ID: id, Pool: "oreate", Status: "active", Value: "cookie", Meta: meta}
+	}
+
+	tests := []struct {
+		name             string
+		items            []model.TokenAccount
+		required         int
+		wantIDs          []string
+		wantInsufficient bool
+	}{
+		{name: "80 cannot run 100 point task", items: []model.TokenAccount{account("80", 80)}, required: 100, wantInsufficient: true},
+		{name: "exact balance is eligible", items: []model.TokenAccount{account("100", 100)}, required: 100, wantIDs: []string{"100"}},
+		{name: "80 can run cheap task", items: []model.TokenAccount{account("80", 80)}, required: 38, wantIDs: []string{"80"}},
+		{name: "unknown balance remains eligible", items: []model.TokenAccount{account("unknown", nil)}, required: 100, wantIDs: []string{"unknown"}},
+		{
+			name:     "mixed pool keeps only sufficient and unknown",
+			items:    []model.TokenAccount{account("low", 80), account("exact", 100), account("high", 124), account("unknown", nil)},
+			required: 100, wantIDs: []string{"exact", "high", "unknown"}, wantInsufficient: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, insufficient := filterOreateAccountsByCredits(tt.items, tt.required)
+			if insufficient != tt.wantInsufficient {
+				t.Fatalf("knownInsufficient = %v, want %v", insufficient, tt.wantInsufficient)
+			}
+			gotIDs := make([]string, 0, len(got))
+			for _, item := range got {
+				gotIDs = append(gotIDs, item.ID)
+			}
+			if strings.Join(gotIDs, ",") != strings.Join(tt.wantIDs, ",") {
+				t.Fatalf("eligible IDs = %v, want %v", gotIDs, tt.wantIDs)
+			}
+		})
+	}
+}
+
+func TestPinnedOreateAccountCannotBypassCreditCheck(t *testing.T) {
+	items := []model.TokenAccount{{
+		ID: "pinned", Pool: "oreate", Status: "disabled", Value: "cookie",
+		Meta: datatypes.JSONMap{"cached_quota_remaining": 80},
+	}}
+	pinned := pinTestAccount(items, nil, "pinned")
+	eligible, insufficient := filterOreateAccountsByCredits(pinned, 100)
+	if len(eligible) != 0 || !insufficient {
+		t.Fatalf("pinned credit filter = (%v, %v), want (empty, true)", eligible, insufficient)
+	}
+}
+
+func TestTaskSpecificQuotaDoesNotDisableAccount(t *testing.T) {
+	taskErr := fmt.Errorf("%w: %w", oreate.ErrQuotaExhausted, errAccountTaskQuota)
+	if shouldMarkAccountQuota(taskErr) {
+		t.Fatal("task-specific quota should not move the account to the global quota state")
+	}
+	if !shouldMarkAccountQuota(oreate.ErrQuotaExhausted) {
+		t.Fatal("upstream quota exhaustion should still update the account state")
+	}
 }

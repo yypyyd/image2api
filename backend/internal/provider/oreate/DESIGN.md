@@ -74,6 +74,25 @@ The authenticated scene configuration currently allows:
 Image-only reference scenes continue to use `SeedanceConfig`, matching the
 official frontend.
 
+`SeedanceRequiredCredits` maps the resulting `aiType` to the point price from
+the official `getmodelconfigv3` response. Prices are explicit rather than
+formula-derived because reference-duration bands contain irregular values.
+The service applies this price before round-robin selection: known balances
+below the request cost are skipped without changing account status, while an
+exact balance is eligible. This check is also applied to administrator-pinned
+accounts. If all otherwise selectable accounts are known insufficient, the
+request returns Oreate's quota-exhausted error instead of claiming that no
+provider account exists. Rows with no cached balance remain eligible so missing
+or inconclusive balance data is never silently interpreted as zero.
+
+Immediately before submit, the service atomically reserves the exact cost from
+the cached balance. This prevents queued or explicitly concurrent requests from
+both spending the same cached points. A failed generation refunds the hold; a
+successful generation replaces it with the authoritative upstream balance. If
+upstream reports insufficient points but reconciliation still shows at least
+the 60-point retention floor, the failure remains task-specific and does not
+move the account into the pool-wide quota state.
+
 ## Account Lifecycle
 
 Oreate accounts are disposable once their confirmed remaining balance can no
@@ -175,6 +194,15 @@ risk-control hosts.
   hostname allowlist.
 
 ## Change History
+
+### 2026-08-15 - Cost-aware account routing
+
+- Recorded the official point cost for every supported Seedance `aiType`.
+- Excluded accounts whose known balance cannot pay for the current request,
+  including administrator-pinned tests, without disabling accounts that can
+  still serve cheaper combinations.
+- Preserved exact-balance eligibility and the non-destructive treatment of
+  unknown balances.
 
 ### 2026-08-15 - Low-credit account retirement
 
