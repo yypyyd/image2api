@@ -1,21 +1,20 @@
 # Design Notes
 
-### 2026-08-14 - Control-plane proxy, direct media egress, and unrestricted Adobe submits
+### 2026-08-14 - Unified control-plane and submit proxy, direct media egress, and unrestricted Adobe submits
 
-**Change**: The persisted administrator setting `proxy.url` is now the one
-runtime egress rule for every account type: Adobe, ChatGPT, Runway, Leonardo,
-Krea, Imagine, Grok (including headless Statsig capture and Build OAuth), and
-custom OpenAI-compatible upstreams. It applies to account import, credential
-refresh, quota/profile calls, generation submit, polling, and other
-control-plane requests. Large reference-media uploads and generated artifact
-downloads use direct local egress for every provider, and the no-store media
-relay also fetches provider artifacts directly. Providers that combine media
-bytes with control fields in one multipart request send that whole request
-directly because HTTPS cannot split headers and body across routes. A non-empty
-value routes control-plane calls through the proxy; an empty or missing value
-clears all client proxy state and connects directly from the local server.
-Legacy provider-specific proxy environment settings no longer participate in
-runtime routing.
+**Change**: The persisted administrator setting `proxy.url` is the single
+provider egress rule. Authentication and account validation, cookie/token
+exchange and refresh, profile/quota/subscription calls, necessary upstream
+bootstrap/challenge requests, and the request that creates a generation job use
+the configured proxy for Adobe, ChatGPT, Runway, Leonardo, Krea, Imagine, Grok
+Web/Build, and custom OpenAI-compatible upstreams. Project/session preparation,
+reference-media uploads, generation polling, artifact downloads, post-submit
+bookkeeping, and `/content` relays use direct local egress to keep metered proxy
+traffic bounded. A custom multipart image/video request carrying references is
+itself the generation submit, so the complete HTTPS request uses the proxy;
+HTTPS cannot split headers and body across routes. An empty or missing
+`proxy.url` makes all of these proxy-eligible calls direct as well. Legacy
+provider-specific proxy environment settings do not participate in routing.
 
 Adobe submit lanes, adaptive inter-submit spacing, and the endpoint circuit
 breaker have been removed. A submit is dispatched as soon as its selected
@@ -25,15 +24,19 @@ existing bounded failover/retry behavior; it can no longer open a gateway-wide
 breaker that makes downstream requests fail immediately.
 
 **Reason**: A prior Adobe overload response opened a five-minute client-side
-breaker after one failure and blocked all downstream calls, while split proxy
-paths made some providers use the global route and others silently use local or
-environment-configured egress. The intended operational control is a single
-admin-selected exit route, not per-provider exceptions.
+breaker after one failure and blocked all downstream calls. The opposite split
+also left ChatGPT bootstrap and other edge-protected account routes on a blocked
+server exit, while routing media bytes and repeated polling through a metered
+proxy made traffic grow with job duration. The unified boundary protects
+authentication and edge bootstrap without paying proxy bandwidth for bulk media.
 
 **Impact**: There is no gateway submit rate limit or circuit breaker for Adobe.
 Per-account concurrency limits and user concurrency groups remain unchanged,
 so an account still cannot exceed its configured simultaneous-job capacity.
-Removing the global guard increases the chance that a large burst reaches Adobe
+Bulk media and polling no longer consume metered proxy bandwidth, but the server
+must be able to reach every provider's setup, upload, polling, and download
+endpoints directly. There is no automatic proxy fallback: if local egress to
+one of those endpoints is blocked, that phase fails. Removing the global Adobe guard increases the chance that a large burst reaches Adobe
 and receives provider-side overload/rate-limit errors; scaling should therefore
 use account concurrency and upstream capacity, not a hidden global throttle.
 

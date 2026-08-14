@@ -55,15 +55,17 @@ type Client struct {
 }
 
 func NewClient(proxy string) *Client {
-	return &Client{proxy: strings.TrimSpace(proxy)}
+	c := &Client{proxy: strings.TrimSpace(proxy)}
+	SetStatsigProxy(c.proxy)
+	return c
 }
 
 func (c *Client) SetProxy(proxy string) {
+	proxy = strings.TrimSpace(proxy)
 	c.proxyMu.Lock()
-	c.proxy = strings.TrimSpace(proxy)
-	current := c.proxy
+	c.proxy = proxy
 	c.proxyMu.Unlock()
-	SetStatsigProxy(current)
+	SetStatsigProxy(proxy)
 }
 
 func (c *Client) proxyValue() string {
@@ -121,7 +123,7 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, token string) (map[str
 	if token == "" {
 		return unknownBalance("empty token"), nil
 	}
-	client, err := c.newTLSClient()
+	client, err := c.newProxyTLSClient()
 	if err != nil {
 		return nil, err
 	}
@@ -204,7 +206,7 @@ func (c *Client) FetchSubscription(ctx context.Context, token string) (*Subscrip
 	if token == "" {
 		return nil, ErrAuth
 	}
-	client, err := c.newTLSClient()
+	client, err := c.newProxyTLSClient()
 	if err != nil {
 		return nil, err
 	}
@@ -268,7 +270,7 @@ func (c *Client) FetchSession(ctx context.Context, token string) (email, userID 
 	if token == "" {
 		return "", "", ErrAuth
 	}
-	client, err := c.newTLSClient()
+	client, err := c.newProxyTLSClient()
 	if err != nil {
 		return "", "", err
 	}
@@ -740,9 +742,13 @@ func (c *Client) applyHeaders(req *http.Request, token string, extra map[string]
 	req.Header = h
 }
 
-func (c *Client) newTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
+// newProxyTLSClient is used for authentication/account maintenance, bootstrap,
+// and generation-submit requests. Media and artifact transfers use direct.
+func (c *Client) newProxyTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
 
-// newDirectTLSClient is reserved for reference uploads and generated artifacts.
+func (c *Client) newSubmitTLSClient() (tlsclient.HttpClient, error) { return c.newProxyTLSClient() }
+
+// newDirectTLSClient is used for reference uploads, polling, and downloads.
 func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) {
 	return c.newTLSClientP(false)
 }

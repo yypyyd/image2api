@@ -5,10 +5,10 @@ import (
 	"testing"
 )
 
-func TestHTTPClientUsesAndClearsGlobalProxy(t *testing.T) {
+func TestSubmitClientUsesAndClearsGlobalProxy(t *testing.T) {
 	client := NewClient()
 	client.SetProxy(" http://proxy.example:8080 ")
-	proxied, err := client.httpClient()
+	proxied, err := client.submitHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -20,7 +20,7 @@ func TestHTTPClientUsesAndClearsGlobalProxy(t *testing.T) {
 	}
 
 	client.SetProxy("")
-	direct, err := client.httpClient()
+	direct, err := client.submitHTTPClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +32,7 @@ func TestHTTPClientUsesAndClearsGlobalProxy(t *testing.T) {
 func TestInvalidProxyErrorDoesNotLeakCredentials(t *testing.T) {
 	client := NewClient()
 	client.SetProxy("http://broken@")
-	_, err := client.httpClient()
+	_, err := client.submitHTTPClient()
 	if err == nil {
 		t.Fatal("invalid proxy accepted")
 	}
@@ -41,14 +41,14 @@ func TestInvalidProxyErrorDoesNotLeakCredentials(t *testing.T) {
 	}
 }
 
-func TestDirectMediaClientIgnoresConfiguredProxy(t *testing.T) {
+func TestDirectNonSubmitClientIgnoresConfiguredProxy(t *testing.T) {
 	client := NewClient()
 	client.SetProxy("http://broken@")
 	direct, err := client.httpClientP(false)
 	if err != nil {
-		t.Fatalf("direct media client used configured proxy: %v", err)
+		t.Fatalf("direct non-submit client used configured proxy: %v", err)
 	}
 	if direct.Transport.(*http.Transport).Proxy != nil {
-		t.Fatal("direct media client must disable configured and environment proxies")
+		t.Fatal("direct non-submit client must disable configured and environment proxies")
 	}
 }

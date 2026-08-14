@@ -99,9 +99,9 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 - **Out of quota → switch** · **auth expired → refresh & retry / kill** · **transient → retry same account ×3** · **bad params → fail fast**
 - **Pre-deducted credits**: atomic debit before generation, auto-refunded on failure, no over-spend under concurrency
 
-#### 🌐 Global Upstream Egress
-- Configure the admin **Global Proxy** (`proxy.url`) once to route every provider's control-plane request through it: account import, refresh, quota checks, generation submits, polling, Grok Statsig, and Build OAuth. Large reference-media uploads and generated artifact downloads use direct local egress by design so they do not consume the proxy allowance. When a provider combines reference bytes and control fields in one multipart request, the whole request uses direct egress because HTTPS cannot split its headers and body across routes.
-- Leave it empty to make control-plane requests connect directly from the local server. Provider-specific proxy environment variables are intentionally not used.
+#### 🌐 Unified Upstream Egress
+- When the admin **Global Proxy** (`proxy.url`) is configured, account validation/authentication, cookie or token exchange and refresh, profile/quota/subscription checks, required upstream bootstrap/challenge calls, and the request that creates a generation job use it for Adobe, ChatGPT, Runway, Leonardo, Krea, Imagine, Grok Web/Build, and custom OpenAI-compatible accounts. Project/session setup, reference uploads, polling, artifact downloads, post-submit bookkeeping, and `/content` relays use direct local egress to keep metered proxy traffic small. A custom multipart image/video request carrying references is itself the generation submit, so its complete HTTPS request uses the proxy.
+- Leave it empty to make proxy-eligible requests direct as well. Provider-specific proxy environment variables are intentionally not used.
 
 #### 🔐 Automatic Token Keep-alive
 - Single-use rotating tokens (Krea / Imagine) are **renewed proactively 10 minutes before expiry**; new tokens persisted automatically
@@ -171,7 +171,7 @@ Images default to the OpenAI-style `{ "created": ..., "data": [{ "url": "..." }]
 
 **Docker (recommended)**: `docker compose up -d --build` brings up PostgreSQL + Redis + RustFS + backend + frontend (nginx serving **HTTP on container port 2000**); point your reverse proxy at `http://<host>:2000` (port via `WEB_PORT`; edit the values (passwords / keys / `CORS_ORIGINS`, and `COOKIE_SECURE=true` when your proxy serves HTTPS) directly in `docker-compose.yml`).
 
-Configure outbound traffic in the admin **Global Proxy** (`proxy.url`), for example `http://user:password@proxy:port`. It applies to Adobe, ChatGPT, Runway, Leonardo, Krea, Imagine, Grok (including Statsig and Build OAuth), and custom OpenAI-compatible accounts for control-plane traffic. Large reference uploads and generated artifact downloads use direct local egress; combined multipart media/control requests are sent entirely direct. Clear the setting to use the local server egress for all requests. The URL can contain credentials: do not expose it in logs or documentation, and restrict the proxy to the application server.
+Configure the admin **Global Proxy** (`proxy.url`), for example `http://user:password@proxy:port`. Authentication, credential exchange/refresh, profile/quota/subscription checks, required upstream bootstrap/challenge calls, and generation submits use it. Project setup, reference uploads, polling, artifact downloads, post-submit bookkeeping, and `/content` relays connect directly from the server. A custom multipart request containing reference media is itself the generation submit and therefore uses the proxy as one complete HTTPS request. Clear the setting to make proxy-eligible requests direct too. The URL can contain credentials: do not expose it in logs or documentation, and restrict the proxy to the application server.
 
 Or **build from source** — bring your own **PostgreSQL · Redis · RustFS (or any S3) · reverse proxy**:
 

@@ -61,7 +61,7 @@ func (c *Client) GenerateVideo(ctx context.Context, cookie, model, prompt string
 		},
 	}
 	payload, _ := json.Marshal(genReq)
-	body, status, err := c.graphql(ctx, sess.AccessToken, payload)
+	body, status, err := c.submitGraphQL(ctx, sess.AccessToken, payload)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %s", ErrTemporaryUpstream, err.Error())
 	}
@@ -129,7 +129,7 @@ func (c *Client) pollVideo(ctx context.Context, accessToken, genID string) (stri
 	}
 
 	for {
-		body, status, err := c.graphqlP(ctx, accessToken, payload, true)
+		body, status, err := c.graphqlP(ctx, accessToken, payload, false)
 		if err != nil {
 			return "", fmt.Errorf("%w: poll: %s", ErrTemporaryUpstream, err.Error())
 		}

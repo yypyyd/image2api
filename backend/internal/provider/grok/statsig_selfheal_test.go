@@ -74,7 +74,7 @@ func TestSelfHealStatsigE2E(t *testing.T) {
 		t.Skip("no GROK_TOK")
 	}
 	c := NewClient("")
-	client, err := c.newTLSClient()
+	client, err := c.newSubmitTLSClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestStatsigEngineConcurrent(t *testing.T) {
 		t.Skip("no GROK_TOK")
 	}
 	c := NewClient("")
-	client, err := c.newTLSClient()
+	client, err := c.newSubmitTLSClient()
 	if err != nil {
 		t.Fatal(err)
 	}

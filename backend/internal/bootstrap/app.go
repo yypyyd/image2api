@@ -123,8 +123,9 @@ func NewApp(ctx context.Context) (*App, error) {
 	appSettingsSvc := service.NewAppSettingsService(siteRepo, eventRepo, smtpSvc, rustfsClient)
 	imageAccessSvc := service.NewImageAccessService(cfg.GeneratedRoot, showcaseRepo, authSvc)
 	adobeClient := adobe.NewClient("clio-playground-web", "")
-	// Runtime egress is controlled exclusively by the persisted site-wide
-	// proxy.url setting; an empty value means direct local egress for all pools.
+	// The persisted site-wide proxy.url is used for authentication, account
+	// maintenance, required upstream bootstrap, and generation submits. Bulk
+	// media, polling, and downloads explicitly use direct local egress.
 	chatGPTClient := chatgpt.NewClient("")
 	runwayClient := runway.NewClient("")
 	leonardoClient := leonardo.NewClient("")

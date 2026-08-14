@@ -273,7 +273,7 @@ func (c *Client) RefreshIfNeeded(ctx context.Context, cred string) (string, bool
 }
 
 func (c *Client) refreshPost(ctx context.Context, refreshToken string) ([]byte, int, error) {
-	client, err := c.newTLSClient()
+	client, err := c.newProxyTLSClient()
 	if err != nil {
 		return nil, 0, err
 	}
@@ -346,11 +346,11 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, cred string) (map[stri
 // ---------------------------------------------------------------------------
 
 func (c *Client) apiGet(ctx context.Context, token, url string) ([]byte, int, error) {
-	return c.apiGetP(ctx, token, url, true)
+	return c.apiGetP(ctx, token, url, false)
 }
 
-// apiGetP keeps the historical useProxy argument for call-site clarity; polling
-// and all other requests follow the global proxy when configured.
+// apiGetP keeps the route explicit: account refresh/quota can use the proxy,
+// while polling and asset retrieval remain direct.
 func (c *Client) apiGetP(ctx context.Context, token, url string, useProxy bool) ([]byte, int, error) {
 	client, err := c.newTLSClientP(useProxy)
 	if err != nil {
@@ -380,9 +380,12 @@ func (c *Client) apiGetP(ctx context.Context, token, url string, useProxy bool) 
 	return b, resp.StatusCode, err
 }
 
-func (c *Client) newTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
+// newProxyTLSClient is used for authentication/account maintenance and submit.
+func (c *Client) newProxyTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
 
-// newDirectTLSClient is reserved for generated artifact downloads.
+func (c *Client) newSubmitTLSClient() (tlsclient.HttpClient, error) { return c.newProxyTLSClient() }
+
+// newDirectTLSClient is used for project setup, polling, and downloads.
 func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(false) }
 
 func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {

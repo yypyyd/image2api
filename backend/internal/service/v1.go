@@ -395,9 +395,9 @@ func (s *V1Service) SetRefresh(r *RefreshProfileService) { s.refresh = r }
 // SetBannedWords wires the prompt blocklist in after construction.
 func (s *V1Service) SetBannedWords(r *repo.BannedWordRepository) { s.banned = r }
 
-// applyGlobalProxy snapshots the administrator's single outbound route onto
-// every provider. A missing/empty value explicitly means local direct egress;
-// provider-specific environment proxies never override this runtime setting.
+// applyGlobalProxy snapshots the administrator's proxy-eligible route onto
+// every provider. Providers keep bulk media, polling, and downloads direct; an
+// empty value makes proxy-eligible requests local as well.
 func (s *V1Service) applyGlobalProxy(ctx context.Context) string {
 	proxy := ""
 	if s.settings != nil {
@@ -2972,8 +2972,8 @@ func (s *V1Service) effectiveProvider(ctx context.Context, modelItem *model.Mode
 }
 
 // generateCustomImage forwards an image generation to an OpenAI-compatible
-// upstream. The upstream (custom account) is matched by model id and follows
-// the configured global proxy. Billing uses the local model price.
+// upstream. The generation submit follows proxy.url; result handling stays
+// direct. A multipart request carrying references is itself the submit.
 func (s *V1Service) generateCustomImage(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1ImageRequest, aspectRatio, resolution string, noStore bool) ([]byte, string, error) {
 	urlOnly := noStore
 	if s.custom == nil {
@@ -3049,8 +3049,8 @@ func (s *V1Service) generateCustomImage(ctx context.Context, eventID string, mod
 }
 
 // generateCustomVideo forwards a video generation to an OpenAI-compatible
-// (Sora-style) upstream, matched by model id and the configured global proxy;
-// local-price billing.
+// (Sora-style) upstream. Its generation submit follows proxy.url, while polling
+// and result downloads stay direct. Billing uses the local model price.
 func (s *V1Service) generateCustomVideo(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1VideoRequest, aspectRatio, resolution string, durationSeconds int, downloadResult bool) ([]byte, string, error) {
 	if s.custom == nil {
 		return nil, "", errors.New("custom client not configured")

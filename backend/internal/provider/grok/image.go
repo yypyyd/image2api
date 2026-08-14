@@ -29,8 +29,9 @@ func (c *Client) GenerateImage(ctx context.Context, token, prompt, aspectRatio s
 	}
 	aspectRatio = normalizeImageAspectRatio(aspectRatio)
 
-	// Control requests use the proxy; generated asset downloads use direct egress.
-	submitClient, err := c.newTLSClient()
+	// Account bootstrap/challenge and the conversations/new submit use the proxy;
+	// media and artifact transfers remain direct.
+	submitClient, err := c.newSubmitTLSClient()
 	if err != nil {
 		return nil, nil, err
 	}

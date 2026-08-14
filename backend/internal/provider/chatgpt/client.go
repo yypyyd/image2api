@@ -84,11 +84,15 @@ func (c *Client) proxyValue() string {
 // assistant text. The web backend always speaks SSE; callers may reshape the
 // completed text into either OpenAI JSON or SSE.
 func (c *Client) GenerateText(ctx context.Context, accessToken, prompt, model string) (string, error) {
-	direct, err := c.newSession(accessToken)
+	bootstrapSession, err := c.newProxySession(accessToken)
 	if err != nil {
 		return "", err
 	}
-	scriptSources, dataBuild, err := c.bootstrap(ctx, direct)
+	direct, err := c.newProxySession(accessToken)
+	if err != nil {
+		return "", err
+	}
+	scriptSources, dataBuild, err := c.bootstrap(ctx, bootstrapSession)
 	if err != nil {
 		return "", err
 	}
@@ -100,7 +104,7 @@ func (c *Client) GenerateText(ctx context.Context, accessToken, prompt, model st
 	if err != nil {
 		return "", err
 	}
-	submit, err := c.newSession(accessToken)
+	submit, err := c.newSubmitSession(accessToken)
 	if err != nil {
 		return "", err
 	}
@@ -375,9 +379,14 @@ func applyAssistantEvent(raw []byte, current string, active bool) (string, bool,
 }
 
 func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, aspectRatio, resolution string, refs [][]byte, downloadResult bool) ([]byte, map[string]any, error) {
-	// Control-plane requests use the global proxy. Large file PUTs and artifact
-	// downloads use a separate direct session to keep proxy traffic small.
-	session, err := c.newSession(accessToken)
+	// Every chatgpt.com call goes through the proxy: Cloudflare rejects the
+	// local egress with an HTML 403 on the sentinel/conversation/content
+	// endpoints. Only the raw blob upload host stays on direct local egress.
+	proxySession, err := c.newProxySession(accessToken)
+	if err != nil {
+		return nil, nil, err
+	}
+	session, err := c.newProxySession(accessToken)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -389,13 +398,13 @@ func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, 
 	// Fail over immediately when the account's image_gen allowance is spent:
 	// submitting anyway just burns the whole poll budget and surfaces as
 	// "image poll timeout". Unknown quota (init failed) proceeds as before.
-	if quota, qErr := c.fetchImageQuota(ctx, session, accessToken); qErr == nil && quota["unknown"] == false {
+	if quota, qErr := c.fetchImageQuota(ctx, proxySession, accessToken); qErr == nil && quota["unknown"] == false {
 		if remaining, ok := quota["remaining"].(int); ok && remaining <= 0 {
 			return nil, nil, fmt.Errorf("%w: image_gen remaining 0 (resets %s)", ErrQuotaExhausted, stringValue(quota["reset_after"]))
 		}
 	}
 
-	scriptSources, dataBuild, err := c.bootstrap(ctx, session)
+	scriptSources, dataBuild, err := c.bootstrap(ctx, proxySession)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -412,7 +421,7 @@ func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, 
 	if err != nil {
 		return nil, nil, err
 	}
-	submitSession, err := c.newSession(accessToken)
+	submitSession, err := c.newSubmitSession(accessToken)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -448,7 +457,7 @@ func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, 
 	if !downloadResult {
 		return nil, meta, nil
 	}
-	images, err := c.downloadBytes(ctx, directSession, accessToken, urls)
+	images, err := c.downloadBytes(ctx, session, accessToken, urls)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -458,11 +467,11 @@ func (c *Client) GenerateImage(ctx context.Context, accessToken, prompt, model, 
 	return images[0], meta, nil
 }
 
-// OpenAsset streams an auth-gated ChatGPT image URL (files.oaiusercontent.com)
-// using the generating account's token — a plain GET 403s. Mirrors downloadBytes
-// but returns a live stream instead of buffering.
+// OpenAsset streams an auth-gated ChatGPT image URL (a chatgpt.com backend-api
+// content stream) using the generating account's token — a plain GET 403s.
+// Mirrors downloadBytes but returns a live stream instead of buffering.
 func (c *Client) OpenAsset(ctx context.Context, accessToken, rawURL string) (io.ReadCloser, string, error) {
-	session, err := c.newDirectSession(accessToken)
+	session, err := c.newProxySession(accessToken)
 	if err != nil {
 		return nil, "", err
 	}
@@ -502,17 +511,17 @@ func ExtractAccountInfo(token string) map[string]any {
 }
 
 func (c *Client) FetchImageQuota(ctx context.Context, accessToken string) (map[string]any, error) {
-	session, err := c.newSession(accessToken)
+	session, err := c.newProxySession(accessToken)
 	if err != nil {
 		return nil, err
 	}
 	return c.fetchImageQuota(ctx, session, accessToken)
 }
 
-// FetchImageQuotaDirect preserves the historical API name. Its egress follows
-// the same global proxy setting as every other ChatGPT request.
+// FetchImageQuotaDirect preserves the historical API name; quota is an account
+// maintenance call and therefore follows the configured proxy.
 func (c *Client) FetchImageQuotaDirect(ctx context.Context, accessToken string) (map[string]any, error) {
-	session, err := c.newSession(accessToken)
+	session, err := c.newProxySession(accessToken)
 	if err != nil {
 		return nil, err
 	}
@@ -576,11 +585,15 @@ type chatRequirements struct {
 	TurnstileToken string
 }
 
-func (c *Client) newSession(accessToken string) (tlsclient.HttpClient, error) {
+func (c *Client) newSubmitSession(accessToken string) (tlsclient.HttpClient, error) {
+	return c.newProxySession(accessToken)
+}
+
+func (c *Client) newProxySession(accessToken string) (tlsclient.HttpClient, error) {
 	return c.newSessionP(accessToken, true)
 }
 
-// newDirectSession is reserved for presigned uploads and generated artifacts.
+// newDirectSession is used by the raw blob upload host only.
 func (c *Client) newDirectSession(accessToken string) (tlsclient.HttpClient, error) {
 	return c.newSessionP(accessToken, false)
 }

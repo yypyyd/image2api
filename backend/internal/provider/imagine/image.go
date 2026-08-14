@@ -58,7 +58,7 @@ func (c *Client) GenerateImage(ctx context.Context, cred string, styleID int, re
 	}
 	_ = w.Close()
 
-	body, status, err := c.apiPost(ctx, cr.Token, apiBase+"/v1/image/generations/upload", w.FormDataContentType(), buf.Bytes())
+	body, status, err := c.submitGeneration(ctx, cr.Token, apiBase+"/v1/image/generations/upload", w.FormDataContentType(), buf.Bytes())
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: submit: %s", ErrTemporaryUpstream, err.Error())
 	}
@@ -110,7 +110,7 @@ func (c *Client) pollImage(ctx context.Context, token, userID, batchID string) (
 
 	url := teamsBase + "/v1/org/" + userID + "/objects?batch=true&limit=50&service=image,chat-image"
 	for {
-		body, status, err := c.apiGetP(ctx, token, url, true)
+		body, status, err := c.apiGetP(ctx, token, url, false)
 		if err == nil && status == 200 {
 			var resp struct {
 				Data []struct {
@@ -219,9 +219,9 @@ func (c *Client) download(ctx context.Context, url string) ([]byte, error) {
 	return b, nil
 }
 
-// apiPost issues a POST with a raw body + content-type, carrying the bearer token.
-func (c *Client) apiPost(ctx context.Context, token, url, contentType string, body []byte) ([]byte, int, error) {
-	client, err := c.newTLSClient()
+// submitGeneration issues the one POST that creates a generation job.
+func (c *Client) submitGeneration(ctx context.Context, token, url, contentType string, body []byte) ([]byte, int, error) {
+	client, err := c.newSubmitTLSClient()
 	if err != nil {
 		return nil, 0, err
 	}

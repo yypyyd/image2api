@@ -69,9 +69,9 @@ func (c *Client) GenerateVideo(ctx context.Context, token, teamID, prompt, aspec
 		return nil, nil, errors.New("runway: failed to decode first-frame image")
 	}
 
-	// Control APIs use the global proxy; presigned media PUTs and artifact reads
-	// use direct local egress.
-	submitClient, err := c.newTLSClient()
+	// Account quota and /v1/tasks generation submit use the proxy; project setup,
+	// reference uploads, polling, and downloads remain direct.
+	submitClient, err := c.newSubmitTLSClient()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -81,34 +81,34 @@ func (c *Client) GenerateVideo(ctx context.Context, token, teamID, prompt, aspec
 	}
 
 	filename := "frame_" + time.Now().UTC().Format("20060102_150405") + ".png"
-	previewUploadID, _, err := c.uploadFile(ctx, submitClient, directClient, token, teamID, filename, "DATASET_PREVIEW", frame)
+	previewUploadID, _, err := c.uploadFile(ctx, directClient, directClient, token, teamID, filename, "DATASET_PREVIEW", frame)
 	if err != nil {
 		return nil, nil, err
 	}
-	datasetUploadID, _, err := c.uploadFile(ctx, submitClient, directClient, token, teamID, filename, "DATASET", frame)
+	datasetUploadID, _, err := c.uploadFile(ctx, directClient, directClient, token, teamID, filename, "DATASET", frame)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	assetID, imageURL, err := c.createDataset(ctx, submitClient, token, teamID, filename, datasetUploadID, previewUploadID, cfg.Width, cfg.Height)
+	assetID, imageURL, err := c.createDataset(ctx, directClient, token, teamID, filename, datasetUploadID, previewUploadID, cfg.Width, cfg.Height)
 	if err != nil {
 		return nil, nil, err
 	}
 	// Browser order: real session first, attach the first-frame asset + its own
 	// asset group, THEN submit the task into it (see createSession).
-	sessionID, err := c.createSession(ctx, submitClient, token, teamID)
+	sessionID, err := c.createSession(ctx, directClient, token, teamID)
 	if err != nil {
 		return nil, nil, err
 	}
-	c.attachReference(ctx, submitClient, token, teamID, sessionID, assetID)
-	assetGroupID, _ := c.sessionAssetGroup(ctx, submitClient, token, teamID, sessionID) // best-effort
+	c.attachReference(ctx, directClient, token, teamID, sessionID, assetID)
+	assetGroupID, _ := c.sessionAssetGroup(ctx, directClient, token, teamID, sessionID) // best-effort
 
-	taskID, err := c.createTask(ctx, submitClient, token, teamID, prompt, imageURL, assetID, assetGroupID, sessionID, aspectRatio, seconds)
+	taskID, err := c.createTask(ctx, submitClient, directClient, token, teamID, prompt, imageURL, assetID, assetGroupID, sessionID, aspectRatio, seconds)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	artifactURL, err := c.pollTask(ctx, submitClient, token, teamID, taskID)
+	artifactURL, err := c.pollTask(ctx, directClient, token, teamID, taskID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -200,7 +200,7 @@ func (c *Client) assetGroupID(ctx context.Context, client tlsclient.HttpClient, 
 	return strings.TrimSpace(stringValue(ag["id"])), nil
 }
 
-func (c *Client) createTask(ctx context.Context, client tlsclient.HttpClient, token, teamID, prompt, imageURL, assetID, assetGroupID, sessionID, aspectRatio string, seconds int) (string, error) {
+func (c *Client) createTask(ctx context.Context, submitClient, controlClient tlsclient.HttpClient, token, teamID, prompt, imageURL, assetID, assetGroupID, sessionID, aspectRatio string, seconds int) (string, error) {
 	w, h := ratioDimensions(aspectRatio)
 	opts := map[string]any{
 		"route":          "i2v",
@@ -219,7 +219,7 @@ func (c *Client) createTask(ctx context.Context, client tlsclient.HttpClient, to
 	if assetGroupID != "" {
 		opts["assetGroupId"] = assetGroupID
 	}
-	res, err := c.submitTask(ctx, client, token, teamID, map[string]any{
+	res, err := c.submitTask(ctx, submitClient, token, teamID, map[string]any{
 		"taskType":  "gen4_turbo",
 		"options":   opts,
 		"asTeamId":  jsonNumberOrString(teamID),
@@ -234,7 +234,7 @@ func (c *Client) createTask(ctx context.Context, client tlsclient.HttpClient, to
 		return "", fmt.Errorf("%w: task missing id", ErrTemporaryUpstream)
 	}
 	// Post-submit: generation record + session play (session already exists).
-	c.recordGeneration(ctx, client, token, teamID, id, sessionID, prompt, opts)
+	c.recordGeneration(ctx, controlClient, token, teamID, id, sessionID, prompt, opts)
 	return id, nil
 }
 

@@ -106,7 +106,7 @@
 - 把任意 **OpenAI 兼容的 v1 端点**当成一个账号接入(填 `base_url` + `key`),无需写代码
 - **按 model id 自动路由**:上游声明支持哪些 id,生成该 id 时即走对应上游(可覆盖内置 provider);id 留空 = 全部
 - 模型管理里自由新建自定义模型(id / 文本·图像·视频类型 / 每请求价 / 分辨率·价 / 时长·价 / 多媒体参考能力),按本地价计费
-- 与内置账号一样遵循后台全局代理：配置 `proxy.url` 时所有 provider 的登录、刷新、配额、提交、轮询等控制请求走该代理，留空时从本机直连；大媒体参考上传和生成结果下载默认从本机直连以节省代理流量；如果 provider 把参考媒体和控制字段合并在同一个 multipart 请求中，则该请求整体直连；上游可配权重与并发,与内置池统一调度
+- 与内置账号一样遵循后台全局代理：配置 `proxy.url` 时，登录/账号校验、Cookie/Token 交换与刷新、Profile/配额/订阅查询、必要的上游 bootstrap/challenge 以及真正创建生成任务的 submit 请求走代理；项目/Session 准备、参考素材上传、状态轮询、结果下载、生成后的记录和 `/content` 均从服务器本机直连。Custom 带参考素材的 multipart 请求本身就是生成 submit，因此该请求整体走代理；上游可配权重与并发,与内置池统一调度
 
 #### 🔐 Token 自动保活
 - 一次性轮换 token(Krea / Imagine)**到期前 10 分钟主动续期**,新 token 自动落库
@@ -193,7 +193,7 @@ curl https://你的域名/v1/images/edits \
 
 > 域名 + HTTPS 由你自己的反向代理处理(本项目不内置证书签发)。
 
-**Docker(推荐)**:`docker compose up -d --build` 一条命令拉起 PostgreSQL + Redis + RustFS + 后端 + 前端(nginx **HTTP 监听容器 2000 端口**),把你的反向代理指到 `http://<本机>:2000`(端口用 `WEB_PORT` 改;要改密码 / 密钥 / `CORS_ORIGINS`(反代走 HTTPS 时把 `COOKIE_SECURE` 设为 `true`),直接改 `docker-compose.yml` 里对应值即可)。出站代理只由后台“全局代理”(`proxy.url`)控制：填写 `http://user:password@proxy:port`、HTTPS 或 SOCKS5 地址后，所有 provider 的导入、刷新、配额、生成提交与轮询等控制请求走它；大图片/视频/音频参考上传和生成结果下载默认从本机直连，以避免消耗代理流量；若参考媒体与控制字段在同一个 multipart 请求中，则整包直连。清空后控制请求也从本机直连。该值可能含凭据，请仅授予管理员、不要写入日志，并将代理出口限制为应用服务器。
+**Docker(推荐)**:`docker compose up -d --build` 一条命令拉起 PostgreSQL + Redis + RustFS + 后端 + 前端(nginx **HTTP 监听容器 2000 端口**),把你的反向代理指到 `http://<本机>:2000`(端口用 `WEB_PORT` 改;要改密码 / 密钥 / `CORS_ORIGINS`(反代走 HTTPS 时把 `COOKIE_SECURE` 设为 `true`),直接改 `docker-compose.yml` 里对应值即可)。出站代理只由后台“全局代理”(`proxy.url`)控制：填写 `http://user:password@proxy:port`、HTTPS 或 SOCKS5 地址后，登录/账号校验、Cookie/Token 交换与刷新、Profile/配额/订阅查询、必要的上游 bootstrap/challenge 以及生成 submit 请求走代理；项目/Session 准备、参考素材上传、状态轮询、结果下载、生成后的记录和 `/content` 均从服务器本机直连。Custom 带参考素材的 multipart 请求本身就是生成 submit，因此完整 HTTPS 请求走代理。清空后这些请求也从本机直连。该值可能含凭据，请仅授予管理员、不要写入日志，并将代理出口限制为应用服务器。
 
 也可**从源码手动构建**,自备 **PostgreSQL · Redis · RustFS(或任意 S3)· 反向代理**:
 
@@ -275,7 +275,7 @@ backend/                       后端源码(Go)
 │   │   ├── leonardo/          Leonardo
 │   │   ├── krea/              Krea
 │   │   ├── imagine/           Imagine.art
-│   │   ├── custom/            自定义上游(OpenAI 兼容 v1,按 id 路由,遵循全局代理)
+│   │   ├── custom/            自定义上游(OpenAI 兼容 v1,按 id 路由,生成 submit 走全局代理)
 │   │   └── epay/              易支付(mapi 下单 + 回调 MD5 验签,积分充值)
 │   ├── repo/                  数据访问层(用户 / 模型 / 账号 / 日志 / CDK / 订单 / 并发组…)
 │   ├── service/              业务逻辑(生成调度、计费、账号池、保活、维护)

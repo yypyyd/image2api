@@ -28,7 +28,10 @@ import (
 const (
 	appBase       = "https://app.leonardo.ai"
 	graphqlURL    = "https://api.leonardo.ai/v1/graphql"
-	schemaVersion = "1.187.0"
+	// schemaVersion must track the web app's x-leo-schema-version header: the
+	// GraphQL gateway rejects a stale version with a generic
+	// INTERNAL_SERVER_ERROR / "An error occurred." on the Generate mutation.
+	schemaVersion = "1.258.8"
 	userAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 )
 
@@ -100,7 +103,29 @@ func (c *Client) GetSession(ctx context.Context, cookie string) (*Session, error
 	}
 	c.mu.Unlock()
 
-	client, err := c.newTLSClient()
+	// app.leonardo.ai sits behind Vercel's challenge edge, which answers the
+	// residential proxy ranges with an HTML 429 checkpoint page while the plain
+	// egress passes. Try direct first, fall back to the proxy.
+	sess, err := c.fetchSession(ctx, cookie, false)
+	if err != nil && !errors.Is(err, ErrAuth) && c.proxyValue() != "" {
+		if viaProxy, perr := c.fetchSession(ctx, cookie, true); perr == nil {
+			sess, err = viaProxy, nil
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	if sess.ExpiresAt > time.Now().Unix() {
+		c.mu.Lock()
+		c.sessions[cookie] = sess
+		c.mu.Unlock()
+	}
+	return sess, nil
+}
+
+// fetchSession performs the get-session exchange over one egress path.
+func (c *Client) fetchSession(ctx context.Context, cookie string, useProxy bool) (*Session, error) {
+	client, err := c.newTLSClientP(useProxy)
 	if err != nil {
 		return nil, err
 	}
@@ -164,20 +189,14 @@ func (c *Client) GetSession(ctx context.Context, cookie string) (*Session, error
 	if uid == "" {
 		uid = raw.User.ID
 	}
-	sess := &Session{
+	return &Session{
 		AccessToken: raw.Session.AccessToken,
 		CognitoSub:  raw.Session.CognitoSub,
 		UserID:      uid,
 		Email:       strings.TrimSpace(raw.User.Email),
 		Name:        strings.TrimSpace(raw.User.Name),
 		ExpiresAt:   raw.Session.TokenExpiry,
-	}
-	if sess.ExpiresAt > time.Now().Unix() {
-		c.mu.Lock()
-		c.sessions[cookie] = sess
-		c.mu.Unlock()
-	}
-	return sess, nil
+	}, nil
 }
 
 const qGetTokens = `query GetUserTokensFromSub($sub: String) {
@@ -284,9 +303,9 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, cookie string) (map[st
 	}, nil
 }
 
-// graphql runs a control-plane GraphQL call through the proxy. graphqlP lets
-// callers pick the route for presigned media-related operations.
-func (c *Client) graphql(ctx context.Context, accessToken string, payload []byte) ([]byte, int, error) {
+// submitGraphQL is reserved for a generation-submit mutation. graphqlP lets
+// callers explicitly choose proxy or direct egress for each route.
+func (c *Client) submitGraphQL(ctx context.Context, accessToken string, payload []byte) ([]byte, int, error) {
 	return c.graphqlP(ctx, accessToken, payload, true)
 }
 
@@ -340,9 +359,12 @@ func unknownBalance(reason string) map[string]any {
 	}
 }
 
-func (c *Client) newTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
+// newProxyTLSClient is used for authentication/account maintenance and submit.
+func (c *Client) newProxyTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
 
-// newDirectTLSClient is reserved for generated artifact downloads.
+func (c *Client) newSubmitTLSClient() (tlsclient.HttpClient, error) { return c.newProxyTLSClient() }
+
+// newDirectTLSClient is used for project/media setup, polling, and downloads.
 func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(false) }
 
 func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {

@@ -78,9 +78,9 @@ func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileR
 	}
 }
 
-// applyProxy snapshots the single site-wide egress route onto every provider
-// client immediately before account import, refresh, quota and maintenance
-// calls. Empty proxy.url explicitly clears prior proxy state and means direct.
+// applyProxy keeps each provider's proxy-eligible route synchronized with
+// proxy.url. Clients choose the proxy for authentication, maintenance, edge
+// bootstrap, and submits, while bulk media and polling stay direct.
 func (s *TokenService) applyProxy(ctx context.Context) {
 	proxy := ""
 	if s.settings != nil {

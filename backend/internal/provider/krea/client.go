@@ -140,7 +140,7 @@ func (c *Client) RefreshIfNeeded(ctx context.Context, cookie string) (string, bo
 }
 
 func (c *Client) refreshPost(ctx context.Context, refreshToken string) ([]byte, int, error) {
-	client, err := c.newTLSClient()
+	client, err := c.newProxyTLSClient()
 	if err != nil {
 		return nil, 0, err
 	}
@@ -403,10 +403,11 @@ func accountKey(cookie string) string {
 
 // apiGet issues a GET to a krea.ai API path carrying the account cookie.
 func (c *Client) apiGet(ctx context.Context, cookie, path string) ([]byte, int, error) {
-	return c.apiGetP(ctx, cookie, path, true)
+	return c.apiGetP(ctx, cookie, path, false)
 }
 
-// apiGetP selects proxy egress for control requests.
+// apiGetP keeps the route explicit: authentication/quota/bootstrap callers use
+// the proxy, while project setup and polling can remain direct.
 func (c *Client) apiGetP(ctx context.Context, cookie, path string, useProxy bool) ([]byte, int, error) {
 	client, err := c.newTLSClientP(useProxy)
 	if err != nil {
@@ -440,9 +441,12 @@ func (c *Client) apiGetP(ctx context.Context, cookie, path string, useProxy bool
 	return b, resp.StatusCode, err
 }
 
-func (c *Client) newTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
+// newProxyTLSClient is used for authentication/account maintenance and submit.
+func (c *Client) newProxyTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
 
-// newDirectTLSClient is reserved for generated artifact downloads.
+func (c *Client) newSubmitTLSClient() (tlsclient.HttpClient, error) { return c.newProxyTLSClient() }
+
+// newDirectTLSClient is used for project setup, media, polling, and downloads.
 func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(false) }
 
 func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {

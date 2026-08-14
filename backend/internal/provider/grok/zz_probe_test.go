@@ -24,10 +24,10 @@ func hnew(ctx context.Context, url, token string) (*http.Request, error) {
 	}
 	req = req.WithContext(ctx)
 	req.Header = http.Header{
-		"accept":          {"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
-		"accept-language": {"en-US,en;q=0.9"},
-		"user-agent":      {userAgent},
-		"cookie":          {"sso=" + token + "; sso-rw=" + token},
+		"accept":            {"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+		"accept-language":   {"en-US,en;q=0.9"},
+		"user-agent":        {userAgent},
+		"cookie":            {"sso=" + token + "; sso-rw=" + token},
 		http.HeaderOrderKey: {"accept", "accept-language", "user-agent", "cookie"},
 	}
 	return req, nil
@@ -53,7 +53,7 @@ func TestGrokCacheChunks(t *testing.T) {
 	c := NewClient(os.Getenv("DIAG_PROXY"))
 	ctx, cancel := context.WithTimeout(context.Background(), 3000*time.Second)
 	defer cancel()
-	client, err := c.newTLSClient()
+	client, err := c.newSubmitTLSClient()
 	if err != nil {
 		t.Fatal(err)
 	}

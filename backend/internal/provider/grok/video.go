@@ -60,9 +60,9 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 		seconds = 10
 	}
 
-	// Control requests use the proxy; reference uploads and generated assets use
-	// direct local egress.
-	submitClient, err := c.newTLSClient()
+	// Account bootstrap/challenge and generation submits use the proxy; reference
+	// uploads, polling, and artifact downloads remain direct.
+	submitClient, err := c.newSubmitTLSClient()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -74,7 +74,7 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 	// Self-heal the x-statsig-id anti-bot challenge for THIS session before the
 	// gated submit. Without it the header falls back to the static defaults,
 	// which go stale on a new grok web build and make conversations/new answer
-	// 403 (anti-bot). The challenge uses the configured Grok proxy when present;
+	// 403 (anti-bot). Challenge refresh itself is an upstream bootstrap request;
 	// failure is non-fatal (statsigID then uses defaults).
 	c.ensureChallenge(ctx, submitClient, token)
 
@@ -99,7 +99,7 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 	// dead stream is NOT a failed generation: poll that URL until the clip is
 	// ready instead of failing the job (which would also fail over and burn
 	// another account's credits for a video that already exists).
-	postID, userID, err := c.createPost(ctx, submitClient, token, prompt)
+	postID, userID, err := c.createPost(ctx, directClient, token, prompt)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -401,8 +401,7 @@ func (c *Client) OpenAsset(ctx context.Context, token, url string) (io.ReadClose
 	if token == "" {
 		return nil, "", ErrAuth
 	}
-	// Asset streaming follows the global proxy too, so all account traffic has one
-	// predictable egress route.
+	// Artifact streaming is a non-submit request and therefore stays direct.
 	client, err := c.newDirectTLSClient()
 	if err != nil {
 		return nil, "", err

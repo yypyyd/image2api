@@ -70,12 +70,12 @@ var (
 	statsigRefreshStarted sync.Once
 	statsigLastCapture    time.Time
 	statsigLastCaptureMu  sync.Mutex
-	statsigProxy          string
 	statsigProxyMu        sync.RWMutex
+	statsigProxy          string
 )
 
-// SetStatsigProxy applies the same site-wide egress rule to the headless Grok
-// signer capture as to normal Grok API calls.
+// SetStatsigProxy keeps the headless bootstrap route aligned with the provider
+// clients. Empty values explicitly disable proxying for the capture browser.
 func SetStatsigProxy(proxy string) {
 	statsigProxyMu.Lock()
 	statsigProxy = strings.TrimSpace(proxy)

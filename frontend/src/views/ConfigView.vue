@@ -175,7 +175,7 @@ async function savePay() {
   else payErr.value = r.data?.detail || '保存失败'
 }
 
-// ---- proxy (carried when calling upstream during generation) ----
+// ---- proxy (control-plane and generation-submit requests) ----
 const proxy = reactive({ proxy: '' })
 const proxyBusy = ref(false); const proxySaved = ref(false)
 async function loadProxy() {
@@ -438,10 +438,10 @@ onMounted(() => { loadSite(); loadReg(); loadSmtp(); loadCredits(); loadAnnounce
     <!-- proxy -->
     <div class="card p-5">
       <div class="flex items-center justify-between mb-4">
-        <h2 class="text-sm font-semibold">代理 (生图请求)</h2>
+        <h2 class="text-sm font-semibold">生成提交代理</h2>
         <span v-if="proxySaved" class="text-xs text-emerald-300">已保存 ✓</span>
       </div>
-      <p class="text-xs text-slate-400 mb-4">调用上游生成图片/视频时统一使用的 HTTP 代理,留空 = 直连。格式如 <code class="px-1 bg-slate-100 rounded">http://127.0.0.1:7890</code>。修改即时生效,无需重启。</p>
+      <p class="text-xs text-slate-400 mb-4">登录/账号校验、Cookie/Token 交换与刷新、Profile/配额/订阅查询、必要的上游 bootstrap/challenge 和生成提交请求使用该代理；项目/Session 准备、参考素材上传、状态轮询、结果下载、生成后的记录及 /content 均从服务器直连。留空 = 这些请求全部直连。格式如 <code class="px-1 bg-slate-100 rounded">http://127.0.0.1:7890</code>。修改即时生效,无需重启。</p>
       <input v-model="proxy.proxy" placeholder="留空 = 直连,如 http://127.0.0.1:7890" class="field" />
       <div class="mt-4 flex items-center gap-2">
         <button @click="saveProxy" :disabled="proxyBusy" class="btn-primary">{{ proxyBusy ? '保存中…' : '保存设置' }}</button>

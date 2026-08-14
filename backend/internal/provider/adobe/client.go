@@ -169,7 +169,7 @@ func (c *Client) proxyValue() string {
 }
 
 func (c *Client) ExchangeCookie(ctx context.Context, cookie string) (*CookieExchangeResult, error) {
-	sess, err := c.newTLSClient()
+	sess, err := c.newProxyTLSClient()
 	if err != nil {
 		return nil, err
 	}
@@ -311,11 +311,11 @@ func defaultMediaContentType(kind string) string {
 const generatedImageSafetyMaxAttempts = 3
 
 func (c *Client) GenerateImage(ctx context.Context, token, modelID, prompt, aspectRatio, resolution string, blobIDs []string, downloadResult bool) ([]byte, map[string]any, error) {
-	submitSess, err := c.newTLSClient()
+	submitSess, err := c.newSubmitTLSClient()
 	if err != nil {
 		return nil, nil, err
 	}
-	pollSess, err := c.newTLSClient()
+	pollSess, err := c.newDirectTLSClient()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -381,11 +381,11 @@ generationAttempts:
 // in meta["video_url"] — used by the async /v1/videos job, which proxies that URL
 // on /content instead of persisting the file.
 func (c *Client) GenerateVideo(ctx context.Context, token, engine, prompt, aspectRatio string, durationSeconds int, resolution, referenceMode, upstreamModel string, inputs VideoInputs, downloadResult bool) ([]byte, map[string]any, error) {
-	submitSess, err := c.newTLSClient()
+	submitSess, err := c.newSubmitTLSClient()
 	if err != nil {
 		return nil, nil, err
 	}
-	pollSess, err := c.newTLSClient()
+	pollSess, err := c.newDirectTLSClient()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -416,7 +416,7 @@ func (c *Client) FetchAccountProfile(ctx context.Context, token string) (map[str
 	if token == "" {
 		return map[string]any{}, nil
 	}
-	sess, err := c.newTLSClient()
+	sess, err := c.newProxyTLSClient()
 	if err != nil {
 		return nil, err
 	}
@@ -501,7 +501,7 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, token string) (map[str
 		}, nil
 	}
 
-	sess, err := c.newTLSClient()
+	sess, err := c.newProxyTLSClient()
 	if err != nil {
 		return nil, err
 	}
@@ -1068,12 +1068,13 @@ type tlsSession struct {
 	fp     fingerprint
 }
 
-// Control-plane requests use the configured administrator proxy. Large media
-// uploads and artifact downloads deliberately use the direct helper below so a
-// small proxy allowance is not consumed by image/video bytes.
-func (c *Client) newTLSClient() (*tlsSession, error) {
+// newProxyTLSClient is used for authentication, account maintenance, and
+// generation-submit requests. Large media and artifact transfers use direct.
+func (c *Client) newProxyTLSClient() (*tlsSession, error) {
 	return c.newTLSSession(randomFingerprint(), true)
 }
+
+func (c *Client) newSubmitTLSClient() (*tlsSession, error) { return c.newProxyTLSClient() }
 
 func (c *Client) newDirectTLSClient() (*tlsSession, error) {
 	return c.newTLSSession(randomFingerprint(), false)

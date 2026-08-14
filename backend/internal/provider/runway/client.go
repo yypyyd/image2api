@@ -234,7 +234,7 @@ func (c *Client) FetchCreditsBalance(ctx context.Context, token string) (map[str
 		return unknownBalance("no team id"), nil
 	}
 
-	client, err := c.newTLSClient()
+	client, err := c.newProxyTLSClient()
 	if err != nil {
 		return nil, err
 	}
@@ -297,9 +297,12 @@ func unknownBalance(reason string) map[string]any {
 	}
 }
 
-func (c *Client) newTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
+// newProxyTLSClient is used for authentication/account maintenance and submit.
+func (c *Client) newProxyTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(true) }
 
-// newDirectTLSClient is used for presigned media uploads and artifact downloads.
+func (c *Client) newSubmitTLSClient() (tlsclient.HttpClient, error) { return c.newProxyTLSClient() }
+
+// newDirectTLSClient is used for project setup, media, polling, and downloads.
 func (c *Client) newDirectTLSClient() (tlsclient.HttpClient, error) { return c.newTLSClientP(false) }
 
 func (c *Client) newTLSClientP(useProxy bool) (tlsclient.HttpClient, error) {

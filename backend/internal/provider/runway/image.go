@@ -35,9 +35,9 @@ func (c *Client) GenerateImage(ctx context.Context, token, teamID, modelID, prom
 		imageSize = "1K"
 	}
 
-	// Control APIs use the global proxy; presigned media PUTs and artifact reads
-	// use direct local egress.
-	submitClient, err := c.newTLSClient()
+	// Account quota and /v1/tasks generation submit use the proxy; project setup,
+	// reference uploads, polling, and downloads remain direct.
+	submitClient, err := c.newSubmitTLSClient()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -53,7 +53,7 @@ func (c *Client) GenerateImage(ctx context.Context, token, teamID, modelID, prom
 			continue
 		}
 		filename := fmt.Sprintf("ref_%s_%d.png", time.Now().UTC().Format("20060102_150405"), i+1)
-		assetID, url, upErr := c.uploadReference(ctx, submitClient, directClient, token, teamID, filename, raw)
+		assetID, url, upErr := c.uploadReference(ctx, directClient, directClient, token, teamID, filename, raw)
 		if upErr != nil {
 			return nil, nil, upErr
 		}
@@ -69,20 +69,20 @@ func (c *Client) GenerateImage(ctx context.Context, token, teamID, modelID, prom
 	// own asset group, THEN submit the task into it (see createSession). The task
 	// carries this session's assetGroupId, NOT the account-wide "Generations"
 	// group.
-	sessionID, err := c.createSession(ctx, submitClient, token, teamID)
+	sessionID, err := c.createSession(ctx, directClient, token, teamID)
 	if err != nil {
 		return nil, nil, err
 	}
 	for _, aid := range refAssetIDs {
-		c.attachReference(ctx, submitClient, token, teamID, sessionID, aid)
+		c.attachReference(ctx, directClient, token, teamID, sessionID, aid)
 	}
-	assetGroupID, _ := c.sessionAssetGroup(ctx, submitClient, token, teamID, sessionID) // best-effort
+	assetGroupID, _ := c.sessionAssetGroup(ctx, directClient, token, teamID, sessionID) // best-effort
 
-	taskID, err := c.createImageTask(ctx, submitClient, token, teamID, modelID, prompt, aspectRatio, imageSize, sessionID, assetGroupID, refImages)
+	taskID, err := c.createImageTask(ctx, submitClient, directClient, token, teamID, modelID, prompt, aspectRatio, imageSize, sessionID, assetGroupID, refImages)
 	if err != nil {
 		return nil, nil, err
 	}
-	artifactURL, err := c.pollTask(ctx, submitClient, token, teamID, taskID)
+	artifactURL, err := c.pollTask(ctx, directClient, token, teamID, taskID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -132,7 +132,7 @@ func (c *Client) uploadReference(ctx context.Context, controlClient, dataClient 
 // gemini_3_1_flash_image for Nano Banana 2) INTO the pre-created session and
 // returns its id. sessionID must be a real server-side session (see
 // createSession) and assetGroupID must be that session's own group.
-func (c *Client) createImageTask(ctx context.Context, client tlsclient.HttpClient, token, teamID, modelID, prompt, aspectRatio, imageSize, sessionID, assetGroupID string, refImages []map[string]any) (string, error) {
+func (c *Client) createImageTask(ctx context.Context, submitClient, controlClient tlsclient.HttpClient, token, teamID, modelID, prompt, aspectRatio, imageSize, sessionID, assetGroupID string, refImages []map[string]any) (string, error) {
 	if strings.TrimSpace(aspectRatio) == "" {
 		aspectRatio = "16:9"
 	}
@@ -159,9 +159,9 @@ func (c *Client) createImageTask(ctx context.Context, client tlsclient.HttpClien
 		opts["reference_images"] = refImages
 	}
 	// Pre-flight cost estimate, exactly as the web app does before every spend.
-	c.estimateCost(ctx, client, token, teamID, "gemini_image", opts)
+	c.estimateCost(ctx, controlClient, token, teamID, "gemini_image", opts)
 
-	res, err := c.submitTask(ctx, client, token, teamID, map[string]any{
+	res, err := c.submitTask(ctx, submitClient, token, teamID, map[string]any{
 		"taskType":  taskType,
 		"options":   opts,
 		"asTeamId":  jsonNumberOrString(teamID),
@@ -176,6 +176,6 @@ func (c *Client) createImageTask(ctx context.Context, client tlsclient.HttpClien
 		return "", fmt.Errorf("%w: image task missing id", ErrTemporaryUpstream)
 	}
 	// Post-submit: generation record + session play (session already exists).
-	c.recordGeneration(ctx, client, token, teamID, id, sessionID, prompt, opts)
+	c.recordGeneration(ctx, controlClient, token, teamID, id, sessionID, prompt, opts)
 	return id, nil
 }

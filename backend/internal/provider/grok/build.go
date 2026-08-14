@@ -76,7 +76,7 @@ func (c *Client) ConvertSSOToBuild(ctx context.Context, sso string) (BuildCreden
 	if sso == "" {
 		return BuildCredential{}, ErrAuth
 	}
-	client, err := c.newBuildHTTPClient(100 * time.Second)
+	client, err := c.newBuildHTTPClient(100*time.Second, true)
 	if err != nil {
 		return BuildCredential{}, fmt.Errorf("%w: create oauth client: %v", ErrTemporaryUpstream, err)
 	}
@@ -101,7 +101,7 @@ func (c *Client) RefreshBuildCredential(ctx context.Context, refreshToken string
 	if refreshToken == "" {
 		return BuildCredential{}, ErrAuth
 	}
-	client, err := c.newBuildHTTPClient(45 * time.Second)
+	client, err := c.newBuildHTTPClient(45*time.Second, true)
 	if err != nil {
 		return BuildCredential{}, fmt.Errorf("%w: create oauth client: %v", ErrTemporaryUpstream, err)
 	}
@@ -124,7 +124,7 @@ func (c *Client) RefreshBuildCredential(ctx context.Context, refreshToken string
 // final assistant text. The service wraps it as Chat Completions JSON/SSE for
 // downstream compatibility.
 func (c *Client) GenerateBuildText(ctx context.Context, accessToken, prompt, model string) (string, error) {
-	client, err := c.newBuildHTTPClient(10 * time.Minute)
+	client, err := c.newBuildHTTPClient(10*time.Minute, true)
 	if err != nil {
 		return "", fmt.Errorf("%w: create build client: %v", ErrTemporaryUpstream, err)
 	}
@@ -416,12 +416,12 @@ func exchangeBuildToken(ctx context.Context, client *http.Client, endpoint strin
 	}, "", nil
 }
 
-func (c *Client) newBuildHTTPClient(timeout time.Duration) (*http.Client, error) {
+func (c *Client) newBuildHTTPClient(timeout time.Duration, useProxy bool) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	// Empty global proxy means direct local egress, regardless of process-level
 	// HTTP_PROXY/HTTPS_PROXY environment variables.
 	transport.Proxy = nil
-	if proxyRaw := c.proxyValue(); proxyRaw != "" {
+	if proxyRaw := c.proxyValue(); useProxy && proxyRaw != "" {
 		proxyURL, err := url.Parse(proxyRaw)
 		if err != nil || proxyURL.Host == "" {
 			return nil, errors.New("invalid global proxy configuration")

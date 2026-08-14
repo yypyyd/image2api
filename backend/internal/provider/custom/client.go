@@ -1,8 +1,9 @@
 // Package custom implements a generic OpenAI-compatible upstream client. A
 // "custom" model forwards generation to any OpenAI-compatible API: the upstream
 // base_url + api_key live on a custom account (pool="custom"), the upstream model
-// name on the model config (UpstreamModel). Calls use the site-wide proxy when
-// configured and connect directly when it is empty.
+// name on the model config (UpstreamModel). Generation submits use the site-wide
+// proxy; polling and artifact fetches use direct local egress. Custom has no
+// separate login or quota endpoint to route.
 package custom
 
 import (
@@ -67,7 +68,7 @@ func sanitizeErr(err error) string {
 	return "upstream request failed"
 }
 
-func (c *Client) httpClient() (*http.Client, error) {
+func (c *Client) submitHTTPClient() (*http.Client, error) {
 	return c.httpClientP(true)
 }
 
@@ -95,7 +96,7 @@ func (c *Client) httpClientP(useProxy bool) (*http.Client, error) {
 	return &http.Client{Transport: transport, Timeout: 10 * time.Minute}, nil
 }
 
-func (c *Client) do(req *http.Request) (*http.Response, error) {
+func (c *Client) doSubmit(req *http.Request) (*http.Response, error) {
 	return c.doP(req, true)
 }
 
@@ -146,7 +147,7 @@ func (c *Client) ChatCompletions(ctx context.Context, baseURL, apiKey, upstreamM
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
 	}
-	resp, err := c.do(req)
+	resp, err := c.doSubmit(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
 	}
@@ -289,7 +290,7 @@ func (c *Client) GenerateImage(ctx context.Context, baseURL, apiKey, model, prom
 	req = req.WithContext(ctx)
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
-	resp, err := c.doP(req, len(refs) == 0)
+	resp, err := c.doSubmit(req)
 	if err != nil {
 		return nil, "", fmt.Errorf("%w: %s", ErrTemporaryUpstream, sanitizeErr(err))
 	}
@@ -332,7 +333,7 @@ func (c *Client) GenerateVideo(ctx context.Context, baseURL, apiKey, model, prom
 			_, _ = fw.Write(f)
 		}
 		_ = w.Close()
-		created, err = c.doMultipartP(ctx, baseURL+"/v1/videos", apiKey, body, w.FormDataContentType(), false)
+		created, err = c.submitMultipart(ctx, baseURL+"/v1/videos", apiKey, body, w.FormDataContentType())
 	} else {
 		payload := map[string]any{"model": model, "prompt": prompt}
 		if size != "" {
@@ -342,7 +343,7 @@ func (c *Client) GenerateVideo(ctx context.Context, baseURL, apiKey, model, prom
 			payload["seconds"] = fmt.Sprintf("%d", seconds)
 		}
 		raw, _ := json.Marshal(payload)
-		created, err = c.doJSON(ctx, http.MethodPost, baseURL+"/v1/videos", apiKey, raw)
+		created, err = c.submitJSON(ctx, http.MethodPost, baseURL+"/v1/videos", apiKey, raw)
 	}
 	if err != nil {
 		return nil, "", err
@@ -356,7 +357,7 @@ func (c *Client) GenerateVideo(ctx context.Context, baseURL, apiKey, model, prom
 		if err := ctx.Err(); err != nil {
 			return nil, "", err
 		}
-		job, err := c.doJSON(ctx, http.MethodGet, baseURL+"/v1/videos/"+jobID, apiKey, nil)
+		job, err := c.doJSONP(ctx, http.MethodGet, baseURL+"/v1/videos/"+jobID, apiKey, nil, false)
 		if err != nil {
 			if errors.Is(err, ErrTemporaryUpstream) {
 				if sleepCtx(ctx, 5*time.Second) != nil {
@@ -390,7 +391,7 @@ func (c *Client) GenerateVideo(ctx context.Context, baseURL, apiKey, model, prom
 	}
 }
 
-func (c *Client) doJSON(ctx context.Context, method, url, apiKey string, body []byte) (map[string]any, error) {
+func (c *Client) submitJSON(ctx context.Context, method, url, apiKey string, body []byte) (map[string]any, error) {
 	return c.doJSONP(ctx, method, url, apiKey, body, true)
 }
 
@@ -427,7 +428,7 @@ func (c *Client) doJSONP(ctx context.Context, method, url, apiKey string, body [
 	return out, nil
 }
 
-func (c *Client) doMultipart(ctx context.Context, url, apiKey string, body io.Reader, contentType string) (map[string]any, error) {
+func (c *Client) submitMultipart(ctx context.Context, url, apiKey string, body io.Reader, contentType string) (map[string]any, error) {
 	return c.doMultipartP(ctx, url, apiKey, body, contentType, true)
 }
 
