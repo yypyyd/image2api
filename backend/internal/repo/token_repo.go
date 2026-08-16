@@ -274,9 +274,11 @@ func (r *TokenRepository) RecoverQuota(ctx context.Context) ([]model.TokenAccoun
 	for i := range items {
 		t := &items[i]
 		// Runway's reset marker is the JWT expiry, not a quota-refresh time, and
-		// there's no way to refresh a bare JWT — so a runway account is never
-		// "recovered"; it's expired-to-dead by ExpireByReset instead.
-		if t.Pool == "runway" {
+		// there's no way to refresh a bare JWT. Oreate's marker is the expiry of
+		// its current positive point bucket, not proof that a new grant arrived.
+		// Both therefore require their provider-specific lifecycle instead of an
+		// optimistic status flip here.
+		if t.Pool == "runway" || t.Pool == "oreate" {
 			continue
 		}
 		reset := parseResetMarker(t.CachedQuotaResetAfter)

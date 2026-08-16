@@ -42,6 +42,16 @@ type Client struct {
 	proxy     string
 	deviceID  string
 	sessionID string
+	// Reusable tls-client sessions. Every call previously built a fresh client,
+	// so each proxied request paid a full CONNECT + TLS handshake (and a fresh
+	// cookie jar). Caching per egress lets the underlying transport keep-alive,
+	// cutting metered-proxy connect overhead. sessionMu guards the cache and the
+	// proxy value it was built for; the returned clients are themselves safe for
+	// concurrent use, so requests do not hold the lock.
+	sessionMu           sync.Mutex
+	cachedProxySession  tlsclient.HttpClient
+	cachedDirectSession tlsclient.HttpClient
+	cachedProxy         string
 }
 
 type fileEntry struct {
@@ -599,6 +609,24 @@ func (c *Client) newDirectSession(accessToken string) (tlsclient.HttpClient, err
 }
 
 func (c *Client) newSessionP(accessToken string, useProxy bool) (tlsclient.HttpClient, error) {
+	proxy := c.proxyValue()
+	c.sessionMu.Lock()
+	if useProxy {
+		if c.cachedProxySession != nil && c.cachedProxy == proxy {
+			client := c.cachedProxySession
+			c.sessionMu.Unlock()
+			// Keep the original invariant: every session starts with an empty jar.
+			client.SetCookies(&url.URL{Scheme: "https", Host: "chatgpt.com"}, nil)
+			return client, nil
+		}
+	} else if c.cachedDirectSession != nil {
+		client := c.cachedDirectSession
+		c.sessionMu.Unlock()
+		client.SetCookies(&url.URL{Scheme: "https", Host: "chatgpt.com"}, nil)
+		return client, nil
+	}
+	c.sessionMu.Unlock()
+
 	options := []tlsclient.HttpClientOption{
 		tlsclient.WithTimeoutSeconds(600),
 		// Match the Python reference (curl_cffi impersonate="chrome110"): the
@@ -607,7 +635,7 @@ func (c *Client) newSessionP(accessToken string, useProxy bool) (tlsclient.HttpC
 		tlsclient.WithRandomTLSExtensionOrder(),
 	}
 	if useProxy {
-		if proxy := c.proxyValue(); proxy != "" {
+		if proxy != "" {
 			options = append(options, tlsclient.WithProxyUrl(proxy))
 		}
 	}
@@ -616,6 +644,15 @@ func (c *Client) newSessionP(accessToken string, useProxy bool) (tlsclient.HttpC
 		return nil, err
 	}
 	client.SetCookies(&url.URL{Scheme: "https", Host: "chatgpt.com"}, nil)
+
+	c.sessionMu.Lock()
+	if useProxy {
+		c.cachedProxySession = client
+		c.cachedProxy = proxy
+	} else {
+		c.cachedDirectSession = client
+	}
+	c.sessionMu.Unlock()
 	return client, nil
 }
 

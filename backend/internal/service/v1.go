@@ -1958,6 +1958,15 @@ func (s *V1Service) OpenImageContent(ctx context.Context, principal *APIPrincipa
 		return resp.Body, contentType, nil
 	}
 	if ev.Provider == "chatgpt" && s.chatgpt != nil {
+		// Lazy cache: the first /content hit downloads through the residential
+		// proxy and stores a copy under a deterministic key; later hits serve the
+		// copy and stop re-spending metered proxy traffic on the same image. This
+		// also fixes ChatGPT's estuary download URL going stale (signed/expiring)
+		// and permanently 404ing after the signature lapses.
+		cacheKey := imageCacheKey(ev.ID)
+		if cached, ct, ok := s.openCachedImage(ctx, cacheKey); ok {
+			return cached, ct, nil
+		}
 		if s.settings != nil {
 			if proxy, perr := s.settings.GetValue(ctx, "proxy.url"); perr == nil {
 				s.chatgpt.SetProxy(proxy)
@@ -1967,7 +1976,11 @@ func (s *V1Service) OpenImageContent(ctx context.Context, principal *APIPrincipa
 		if acct == nil || strings.TrimSpace(acct.Value) == "" {
 			return nil, "", fmt.Errorf("%w: chatgpt account no longer available for this image", ErrProviderTemporary)
 		}
-		return s.chatgpt.OpenAsset(ctx, acct.Value, ev.File)
+		body, ct, err := s.chatgpt.OpenAsset(ctx, acct.Value, ev.File)
+		if err != nil {
+			return nil, "", err
+		}
+		return s.cacheImageStream(ctx, cacheKey, body, ct)
 	}
 	// grok asset URLs (assets.grok.com) are auth-gated too — stream them with the
 	// token of the account that generated the image.
@@ -2004,6 +2017,54 @@ func (s *V1Service) OpenImageContent(ctx context.Context, principal *APIPrincipa
 		ct = "image/png"
 	}
 	return resp.Body, ct, nil
+}
+
+// imageCacheKey maps an event ID to the RustFS object key holding a cached copy
+// of its no-store generated image. Caching is lazy: the first /content hit
+// downloads through the residential proxy and stores a copy, subsequent hits
+// serve the copy and stop consuming metered proxy traffic.
+func imageCacheKey(eventID string) string {
+	return "cache/img/" + strings.TrimSpace(eventID)
+}
+
+// openCachedImage returns a cached image stream when one exists. A store read
+// error or a miss must never fail the request, so it reports ok=false on both.
+func (s *V1Service) openCachedImage(ctx context.Context, key string) (io.ReadCloser, string, bool) {
+	if s.store == nil || !s.store.Configured() {
+		return nil, "", false
+	}
+	resp, err := s.store.Get(ctx, key, "")
+	if err != nil || resp == nil {
+		return nil, "", false
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, "", false
+	}
+	ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if ct == "" {
+		ct = "image/png"
+	}
+	return resp.Body, ct, true
+}
+
+// cacheImageStream reads a freshly downloaded image fully, stores a best-effort
+// copy under key, and returns the same bytes as a stream so the caller's
+// streaming contract is unchanged. A cache write failure never fails the fetch.
+func (s *V1Service) cacheImageStream(ctx context.Context, key string, body io.ReadCloser, ct string) (io.ReadCloser, string, error) {
+	data, err := io.ReadAll(body)
+	_ = body.Close()
+	if err != nil {
+		return nil, "", err
+	}
+	if s.store != nil && s.store.Configured() && len(data) > 0 {
+		cct := strings.TrimSpace(ct)
+		if cct == "" {
+			cct = "image/png"
+		}
+		_ = s.store.Put(ctx, key, data, cct)
+	}
+	return io.NopCloser(bytes.NewReader(data)), ct, nil
 }
 
 func publicImageContentURL(baseURL, eventID string) string {
@@ -3260,7 +3321,7 @@ func (s *V1Service) generateOreateVideo(ctx context.Context, eventID string, mod
 		if item.Status != "active" || item.Dead || item.VideoLimited || strings.TrimSpace(item.Value) == "" {
 			continue
 		}
-		if remaining, ok := jsonMapInt(item.Meta, "cached_quota_remaining"); ok && remaining < oreateDeleteBelowCredits {
+		if remaining, ok := jsonMapInt(item.Meta, "cached_quota_remaining"); ok && remaining < oreateMinUsableCredits {
 			continue
 		}
 		active = append(active, item)
@@ -3297,7 +3358,7 @@ func (s *V1Service) generateOreateVideo(ctx context.Context, eventID string, mod
 				_ = s.tokens.RefundQuota(ctx, "oreate", token.ID, requiredCredits)
 			}
 			if errors.Is(genErr, oreate.ErrQuotaExhausted) {
-				if remaining, known := s.reconcileOreateCredits(ctx, token); known && remaining >= oreateDeleteBelowCredits {
+				if remaining, known := s.reconcileOreateCredits(ctx, token); known && remaining >= oreateMinUsableCredits {
 					genErr = fmt.Errorf("%w: %w", genErr, errAccountTaskQuota)
 				}
 			}
@@ -3313,14 +3374,15 @@ func (s *V1Service) generateOreateVideo(ctx context.Context, eventID string, mod
 }
 
 // filterOreateAccountsByCredits keeps unknown balances eligible for backwards
-// compatibility, but never schedules an account whose confirmed cached balance
-// cannot cover this request. The latter is task-specific and does not change
-// account status: the same account may still serve a cheaper Seedance request.
+// compatibility, but never schedules an account below either the operating
+// floor or this request's exact cost. Insufficiency above the floor remains
+// task-specific: the same account may still serve a cheaper Seedance request.
 func filterOreateAccountsByCredits(items []model.TokenAccount, required int) ([]model.TokenAccount, bool) {
 	eligible := make([]model.TokenAccount, 0, len(items))
 	knownInsufficient := false
+	minimum := max(required, oreateMinUsableCredits)
 	for _, item := range items {
-		if remaining, ok := jsonMapInt(item.Meta, "cached_quota_remaining"); ok && remaining < required {
+		if remaining, ok := jsonMapInt(item.Meta, "cached_quota_remaining"); ok && remaining < minimum {
 			knownInsufficient = true
 			continue
 		}
@@ -3359,31 +3421,9 @@ func (s *V1Service) reconcileOreateCredits(ctx context.Context, token model.Toke
 		return 0, false
 	}
 	remaining, hasRemaining := data["remaining"].(int)
-	deleteRequired, deleteErr := deleteOreateAccountBelowCreditFloor(ctx, s.tokens, token.ID, data)
-	if deleteRequired {
-		if deleteErr != nil {
-			log.Printf("oreate reconciliation: could not delete low-credit account %s: %v", token.ID, deleteErr)
-			_, _ = s.tokens.Update(ctx, "oreate", token.ID, map[string]any{"status": "disabled"})
-		}
-		return remaining, hasRemaining
+	if _, updateErr := persistOreateQuotaSnapshot(ctx, s.tokens, token.ID, data, time.Now()); updateErr != nil {
+		log.Printf("oreate reconciliation: could not persist refreshed quota for %s: %v", token.ID, updateErr)
 	}
-	item, err := s.tokens.Get(ctx, "oreate", token.ID)
-	if err != nil {
-		return remaining, hasRemaining
-	}
-	meta := cloneJSONMap(item.Meta)
-	meta["cached_quota_at"] = int(time.Now().Unix())
-	if hasRemaining {
-		meta["cached_quota_remaining"] = remaining
-	}
-	if total, ok := data["total"].(int); ok {
-		meta["cached_quota_total"] = total
-	}
-	patch := map[string]any{"meta": meta}
-	if reset := strings.TrimSpace(stringValue(data["reset_after"])); reset != "" {
-		patch["cached_quota_reset_after"] = reset
-	}
-	_, _ = s.tokens.Update(ctx, "oreate", token.ID, patch)
 	return remaining, hasRemaining
 }
 

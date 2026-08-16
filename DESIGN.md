@@ -1,5 +1,31 @@
 # Design Notes
 
+### 2026-08-17 - Retain and refresh low-credit OreateAI accounts
+
+**Change**: OreateAI accounts with a confirmed balance below 60 now remain in
+the database in `quota` state instead of being permanently deleted. Import,
+administrator quota reads, successful generations, quota-error reconciliation,
+and the maintenance loop all share the same state transition: below 60 parks
+the account, while a later successful reading of 60 or more reactivates it. The
+account table exposes a per-row quota refresh action and also rechecks visible
+Oreate quota rows during a normal page refresh. Maintenance probes at most four
+due low-credit accounts concurrently and throttles each account to one attempt
+per 30 minutes.
+
+**Reason**: Oreate can grant points again on a later day. Deleting a low-credit
+cookie discarded a still-valid account before that grant could be observed.
+
+**Impact**: Low-credit accounts remain unschedulable but recover automatically
+after a confirmed replenishment, or immediately when an administrator refreshes
+their quota. Authentication failures may still mark the cookie dead, and manual
+or bulk deletion remains available. Oreate is excluded from the generic reset
+marker recovery because its marker is a current point-bucket expiry, not proof
+that replacement points were granted.
+
+**Decision**: Provider state is recoverable data. Balance snapshots may park or
+reactivate an account but never destroy it; deletion is an explicit
+administrator operation.
+
 ### 2026-08-16 - Preserve accepted submits and close provider recovery loops
 
 **Change**: ChatGPT image-start finalization now recovers a fragmented

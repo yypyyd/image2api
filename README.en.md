@@ -106,7 +106,7 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 #### 🔐 Automatic Token Keep-alive
 - Single-use rotating tokens (Krea / Imagine) are **renewed proactively 10 minutes before expiry**; new tokens persisted automatically
 - Adobe cookies exchanged for fresh tokens on a schedule; bare JWTs killed on expiry
-- Daily quota recovered at each provider's reset time, then re-probed for the real balance
+- Daily quota recovered at each provider's reset time, then re-probed for the real balance; OreateAI accounts below 60 points are retained in quota state, periodically refreshed, and automatically re-enabled after replenishment
 
 #### 💳 Billing & Operations
 - Credit-based (**pre-deduct + refund on failure**), priced per model / resolution / duration; de-AI fingerprint adds a per-tier surcharge
@@ -125,7 +125,7 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 
 #### 🛠️ Admin Console
 - Overview dashboard (trends / DAU / top failures / top spenders)
-- Model management (normal + agent price + aliases) · account management (bulk import / dedup / quota, including CPA JSON/ZIP and Sub2API bundle JSON) · **concurrency groups** · **order management** (filter / search / paginate) · site-wide logs · user management (set as agent / assign concurrency group / view cumulative top-up / banned-word hits) · CDK · image management (multi-select bulk delete / zip download) · showcase · **announcements** · site config (incl. epay, de-AI fingerprint toggle & surcharge pricing)
+- Model management (normal + agent price + aliases) · account management (bulk import / dedup / per-account quota refresh, including CPA JSON/ZIP and Sub2API bundle JSON) · **concurrency groups** · **order management** (filter / search / paginate) · site-wide logs · user management (set as agent / assign concurrency group / view cumulative top-up / banned-word hits) · CDK · image management (multi-select bulk delete / zip download) · showcase · **announcements** · site config (incl. epay, de-AI fingerprint toggle & surcharge pricing)
 - **Banned words**: add / remove words in the console (paginated + multi-select bulk delete); prompts containing a banned word are rejected outright (playground + API, case-insensitive), with per-word / per-user hit counters
 
 **🧰 Engineering highlights**: tls-client (Chrome JA3/JA4 fingerprint) reliably passes Cloudflare · media stored in S3/RustFS, served through an authenticated proxy with retention cleanup · self-healing maintenance loop (quota recovery / credential refresh / orphan-job cleanup with refunds) · one-command Docker deploy (TLS via your own reverse proxy).

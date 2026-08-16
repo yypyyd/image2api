@@ -1,8 +1,6 @@
 package service
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -12,21 +10,6 @@ import (
 	"backend/internal/provider/oreate"
 	"gorm.io/datatypes"
 )
-
-type recordingOreateDeleter struct {
-	calls int
-	pool  string
-	id    string
-	rows  int64
-	err   error
-}
-
-func (d *recordingOreateDeleter) Delete(_ context.Context, pool, id string) (int64, error) {
-	d.calls++
-	d.pool = pool
-	d.id = id
-	return d.rows, d.err
-}
 
 func TestOreateAccountFromToken(t *testing.T) {
 	item := model.TokenAccount{
@@ -58,64 +41,54 @@ func TestOreatePoolRegistration(t *testing.T) {
 	}
 }
 
-func TestShouldDeleteOreateAccount(t *testing.T) {
+func TestOreateStatusForBalance(t *testing.T) {
 	tests := []struct {
-		name string
-		data map[string]any
-		want bool
+		name       string
+		item       model.TokenAccount
+		remaining  int
+		known      bool
+		wantStatus string
+		wantChange bool
 	}{
-		{name: "zero", data: map[string]any{"remaining": 0}, want: true},
-		{name: "below floor", data: map[string]any{"remaining": 59}, want: true},
-		{name: "at floor", data: map[string]any{"remaining": 60}, want: false},
-		{name: "above floor", data: map[string]any{"remaining": 61}, want: false},
-		{name: "missing", data: map[string]any{}, want: false},
-		{name: "untyped", data: map[string]any{"remaining": "59"}, want: false},
+		{name: "low active is parked", item: model.TokenAccount{Status: "active"}, remaining: 59, known: true, wantStatus: "quota", wantChange: true},
+		{name: "zero quota stays parked", item: model.TokenAccount{Status: "quota"}, remaining: 0, known: true, wantStatus: "quota"},
+		{name: "floor reactivates quota", item: model.TokenAccount{Status: "quota"}, remaining: 60, known: true, wantStatus: "active", wantChange: true},
+		{name: "healthy active is unchanged", item: model.TokenAccount{Status: "active"}, remaining: 61, known: true},
+		{name: "unknown is unchanged", item: model.TokenAccount{Status: "quota"}, remaining: 0, known: false},
+		{name: "disabled is respected", item: model.TokenAccount{Status: "disabled"}, remaining: 80, known: true},
+		{name: "dead is respected", item: model.TokenAccount{Status: "quota", Dead: true}, remaining: 80, known: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := shouldDeleteOreateAccount(tt.data); got != tt.want {
-				t.Fatalf("shouldDeleteOreateAccount(%v) = %v, want %v", tt.data, got, tt.want)
+			status, changed := oreateStatusForBalance(tt.item, tt.remaining, tt.known)
+			if status != tt.wantStatus || changed != tt.wantChange {
+				t.Fatalf("oreateStatusForBalance() = (%q, %v), want (%q, %v)", status, changed, tt.wantStatus, tt.wantChange)
 			}
 		})
 	}
 }
 
-func TestDeleteOreateAccountBelowCreditFloor(t *testing.T) {
-	t.Run("deletes confirmed low balance", func(t *testing.T) {
-		deleter := &recordingOreateDeleter{rows: 1}
-		handled, err := deleteOreateAccountBelowCreditFloor(context.Background(), deleter, "ORLOW", map[string]any{"remaining": 59})
-		if err != nil || !handled {
-			t.Fatalf("deleteOreateAccountBelowCreditFloor() = (%v, %v), want (true, nil)", handled, err)
-		}
-		if deleter.calls != 1 || deleter.pool != "oreate" || deleter.id != "ORLOW" {
-			t.Fatalf("Delete calls = %d, pool = %q, id = %q", deleter.calls, deleter.pool, deleter.id)
-		}
-	})
+func TestOreateQuotaPatches(t *testing.T) {
+	now := time.Unix(2_000_000_000, 0)
+	meta, patch := oreateQuotaPatches(model.TokenAccount{Status: "active"}, map[string]any{
+		"remaining":   59,
+		"total":       80,
+		"reset_after": "2033-05-18T03:33:20Z",
+	}, now)
+	if meta["cached_quota_remaining"] != 59 || meta["cached_quota_total"] != 80 || meta["cached_quota_at"] != int(now.Unix()) {
+		t.Fatalf("quota metadata = %#v", meta)
+	}
+	if patch["status"] != "quota" || patch["cached_quota_reset_after"] != "2033-05-18T03:33:20Z" {
+		t.Fatalf("low-credit patch = %#v", patch)
+	}
 
-	t.Run("keeps boundary balance", func(t *testing.T) {
-		deleter := &recordingOreateDeleter{rows: 1}
-		handled, err := deleteOreateAccountBelowCreditFloor(context.Background(), deleter, "ORKEEP", map[string]any{"remaining": 60})
-		if err != nil || handled || deleter.calls != 0 {
-			t.Fatalf("deleteOreateAccountBelowCreditFloor() = (%v, %v), calls = %d", handled, err, deleter.calls)
-		}
-	})
-
-	t.Run("treats concurrent delete as handled", func(t *testing.T) {
-		deleter := &recordingOreateDeleter{rows: 0}
-		handled, err := deleteOreateAccountBelowCreditFloor(context.Background(), deleter, "ORGONE", map[string]any{"remaining": 1})
-		if err != nil || !handled || deleter.calls != 1 {
-			t.Fatalf("deleteOreateAccountBelowCreditFloor() = (%v, %v), calls = %d", handled, err, deleter.calls)
-		}
-	})
-
-	t.Run("surfaces repository failure", func(t *testing.T) {
-		wantErr := errors.New("delete failed")
-		deleter := &recordingOreateDeleter{err: wantErr}
-		handled, err := deleteOreateAccountBelowCreditFloor(context.Background(), deleter, "ORERROR", map[string]any{"remaining": 10})
-		if !handled || !errors.Is(err, wantErr) {
-			t.Fatalf("deleteOreateAccountBelowCreditFloor() = (%v, %v), want (true, %v)", handled, err, wantErr)
-		}
-	})
+	_, patch = oreateQuotaPatches(model.TokenAccount{Status: "quota"}, map[string]any{"remaining": 60}, now)
+	if patch["status"] != "active" || patch["fails"] != 0 {
+		t.Fatalf("recovery patch = %#v", patch)
+	}
+	if _, ok := patch["quota_recover_at"]; !ok {
+		t.Fatalf("recovery patch did not clear quota_recover_at: %#v", patch)
+	}
 }
 
 func TestFilterOreateAccountsByCredits(t *testing.T) {
@@ -135,6 +108,7 @@ func TestFilterOreateAccountsByCredits(t *testing.T) {
 		wantInsufficient bool
 	}{
 		{name: "80 cannot run 100 point task", items: []model.TokenAccount{account("80", 80)}, required: 100, wantInsufficient: true},
+		{name: "below operating floor cannot run cheap task", items: []model.TokenAccount{account("59", 59)}, required: 38, wantInsufficient: true},
 		{name: "exact balance is eligible", items: []model.TokenAccount{account("100", 100)}, required: 100, wantIDs: []string{"100"}},
 		{name: "80 can run cheap task", items: []model.TokenAccount{account("80", 80)}, required: 38, wantIDs: []string{"80"}},
 		{name: "unknown balance remains eligible", items: []model.TokenAccount{account("unknown", nil)}, required: 100, wantIDs: []string{"unknown"}},
@@ -162,14 +136,25 @@ func TestFilterOreateAccountsByCredits(t *testing.T) {
 }
 
 func TestPinnedOreateAccountCannotBypassCreditCheck(t *testing.T) {
-	items := []model.TokenAccount{{
-		ID: "pinned", Pool: "oreate", Status: "disabled", Value: "cookie",
-		Meta: datatypes.JSONMap{"cached_quota_remaining": 80},
-	}}
-	pinned := pinTestAccount(items, nil, "pinned")
-	eligible, insufficient := filterOreateAccountsByCredits(pinned, 100)
-	if len(eligible) != 0 || !insufficient {
-		t.Fatalf("pinned credit filter = (%v, %v), want (empty, true)", eligible, insufficient)
+	for _, tc := range []struct {
+		name      string
+		remaining int
+		required  int
+	}{
+		{name: "task cost", remaining: 80, required: 100},
+		{name: "operating floor", remaining: 59, required: 38},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			items := []model.TokenAccount{{
+				ID: "pinned", Pool: "oreate", Status: "disabled", Value: "cookie",
+				Meta: datatypes.JSONMap{"cached_quota_remaining": tc.remaining},
+			}}
+			pinned := pinTestAccount(items, nil, "pinned")
+			eligible, insufficient := filterOreateAccountsByCredits(pinned, tc.required)
+			if len(eligible) != 0 || !insufficient {
+				t.Fatalf("pinned credit filter = (%v, %v), want (empty, true)", eligible, insufficient)
+			}
+		})
 	}
 }
 
@@ -231,37 +216,38 @@ func TestPrioritizeOreate80CreditAccounts(t *testing.T) {
 	})
 }
 
-func TestSelectOreateRetirementCandidates(t *testing.T) {
+func TestSelectOreateQuotaRefreshCandidates(t *testing.T) {
 	now := time.Unix(2_000_000_000, 0)
-	account := func(id string, remaining any, checkedAt int64) model.TokenAccount {
+	account := func(id, status string, remaining any, checkedAt int64) model.TokenAccount {
 		meta := datatypes.JSONMap{}
 		if remaining != nil {
 			meta["cached_quota_remaining"] = remaining
 		}
 		if checkedAt > 0 {
-			meta[oreateRetirementCheckedAtMetaKey] = checkedAt
+			meta[oreateQuotaCheckedAtMetaKey] = checkedAt
 		}
-		return model.TokenAccount{ID: id, Pool: "oreate", Value: "cookie", Meta: meta}
+		return model.TokenAccount{ID: id, Pool: "oreate", Status: status, Value: "cookie", Meta: meta}
 	}
 
 	items := []model.TokenAccount{
-		account("old-b", 20, now.Add(-time.Hour).Unix()),
-		account("at-floor", 60, 0),
-		account("unknown", nil, 0),
-		account("recent", 10, now.Add(-time.Minute).Unix()),
-		account("old-a", 59, now.Add(-time.Hour).Unix()),
-		account("never-c", 0, 0),
-		account("never-b", 1, 0),
-		account("never-a", 2, 0),
+		account("old-b", "active", 20, now.Add(-time.Hour).Unix()),
+		account("at-floor", "active", 60, 0),
+		account("quota-unknown", "quota", nil, 0),
+		account("recent", "quota", 10, now.Add(-time.Minute).Unix()),
+		account("old-a", "active", 59, now.Add(-time.Hour).Unix()),
+		account("quota-c", "quota", 0, 0),
+		account("quota-b", "quota", 1, 0),
+		account("quota-a", "quota", 2, 0),
+		account("disabled", "disabled", 0, 0),
 	}
-	items = append(items, model.TokenAccount{ID: "missing-cookie", Meta: datatypes.JSONMap{"cached_quota_remaining": 0}})
+	items = append(items, model.TokenAccount{ID: "missing-cookie", Status: "quota", Meta: datatypes.JSONMap{"cached_quota_remaining": 0}})
 
-	got := selectOreateRetirementCandidates(items, now)
+	got := selectOreateQuotaRefreshCandidates(items, now)
 	ids := make([]string, 0, len(got))
 	for _, item := range got {
 		ids = append(ids, item.ID)
 	}
-	if want := "never-a,never-b,never-c,old-a"; strings.Join(ids, ",") != want {
-		t.Fatalf("retirement candidates = %v, want %s", ids, want)
+	if want := "quota-a,quota-b,quota-c,quota-unknown"; strings.Join(ids, ",") != want {
+		t.Fatalf("quota refresh candidates = %v, want %s", ids, want)
 	}
 }

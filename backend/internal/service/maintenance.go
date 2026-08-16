@@ -161,9 +161,9 @@ func (m *MaintenanceService) tick(ctx context.Context) {
 		//     It also provides liveness; subscription tier is not a video
 		//     entitlement signal and is intentionally not probed here.
 		m.tokenSvc.RefreshGrokLiveness(ctx)
-		// 1f. Revalidate Oreate rows whose cached balance is below the deletion
-		//     floor. Only a fresh successful balance response can delete the row.
-		m.tokenSvc.RetireLowCreditOreateAccounts(ctx)
+		// 1f. Refresh Oreate quota rows and legacy active rows cached below the
+		//     operating floor. Replenished accounts return to active automatically.
+		m.tokenSvc.RefreshLowCreditOreateAccounts(ctx)
 		// 1g. Re-probe ChatGPT accounts stuck in pending past stalePending — an
 		//     import probe interrupted by a restart (or that never finished) would
 		//     otherwise strand a good freshly-registered account forever, since

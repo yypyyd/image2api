@@ -90,7 +90,7 @@ the cached balance. This prevents queued or explicitly concurrent requests from
 both spending the same cached points. A failed generation refunds the hold; a
 successful generation replaces it with the authoritative upstream balance. If
 upstream reports insufficient points but reconciliation still shows at least
-the 60-point retention floor, the failure remains task-specific and does not
+the 60-point operating floor, the failure remains task-specific and does not
 move the account into the pool-wide quota state.
 
 After normal health, weight, and round-robin ordering, requests priced at 80
@@ -100,26 +100,28 @@ accounts or allowing a cooling account to jump ahead of healthy accounts.
 
 ## Account Lifecycle
 
-Oreate accounts are disposable once their confirmed remaining balance can no
-longer cover the operational reserve. The service permanently deletes the
-account row when, and only when, a successful balance response contains an
-integer `remaining < 60`. Exactly 60 remains eligible. Network errors,
-authentication errors, missing fields, malformed types, and otherwise unknown
-balances do not enter the destructive path.
+Oreate accounts are recoverable when their confirmed remaining balance cannot
+cover the operational reserve. A successful integer `remaining < 60` moves the
+row to the unschedulable `quota` state; a later successful `remaining >= 60`
+returns a quota row to `active`. Network errors, missing fields, malformed
+types, and otherwise unknown balances leave the previous status and cached
+balance intact. Authentication failures remain a separate dead-cookie signal.
 
-One shared service-layer predicate owns the threshold and is used by import
+One shared service-layer transition owns the threshold and is used by import
 hydration, administrator quota refresh, and generation-time reconciliation.
-Deletion occurs before quota metadata or status is written back. A concurrent
-zero-row delete is treated as success, while a repository failure is surfaced
-to an administrator and prevents the account from being rescheduled after a
-generation.
+Quota keys are merged without replacing unrelated account metadata. An
+administrator-disabled or dead row is never reactivated merely because a
+balance refresh succeeds.
 
-The maintenance loop closes the gap for legacy rows already excluded by the
-scheduler. It selects at most four cached-below-floor accounts, records a probe
-timestamp, and fetches their current balance concurrently. Only that fresh
-typed response may delete the row; a failed or inconclusive probe retains it and
-is not attempted again for 30 minutes. The cached value alone is deliberately
-non-destructive because an in-flight quota reservation can temporarily lower it.
+The maintenance loop closes the recovery gap for scheduler-excluded rows. It
+selects both quota-state accounts and legacy active accounts cached below the
+floor, records a probe timestamp, and fetches at most four balances
+concurrently. Successful readings update the cache and lifecycle state; failed
+or inconclusive probes keep the previous state and are not attempted again for
+30 minutes. The generic reset-marker recovery explicitly skips Oreate because
+`reset_after` is the expiry of a current positive point bucket, not evidence of
+a new grant. The account page uses the same authoritative refresh path for its
+per-row action and when reconciling visible Oreate quota rows.
 
 ## Proxy And Browser Isolation
 
@@ -219,6 +221,14 @@ risk-control hosts.
   hostname allowlist.
 
 ## Change History
+
+### 2026-08-17 - Recoverable low-credit quota state
+
+- Replaced permanent below-60 deletion with a retained `quota` state.
+- Added bounded 30-minute balance rechecks and automatic reactivation after a
+  confirmed balance reaches 60 or more.
+- Added administrator per-row refresh and visible quota-row reconciliation.
+- Excluded Oreate from optimistic generic reset-marker recovery.
 
 ### 2026-08-16 - Authoritative retirement sweep and tunnel shutdown
 

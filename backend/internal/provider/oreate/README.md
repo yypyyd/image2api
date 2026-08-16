@@ -43,15 +43,20 @@ descendants. See [DESIGN.md](DESIGN.md) for the security boundary.
 
 ## Account Lifecycle
 
-The service layer permanently removes an Oreate account when a successful
-balance response contains an integer `remaining` value below 60. A balance of
-exactly 60 is retained. Missing values, malformed responses, timeouts, proxy
-failures, and other inconclusive probes never trigger deletion. This policy is
-applied after import validation, an administrator quota refresh, and successful
-or quota-exhausted generation reconciliation. The maintenance loop also finds
-legacy or interrupted rows whose cached balance is already below 60, rechecks
-their live balance in bounded batches, and applies the same authoritative
-predicate. Failed confirmations are throttled for 30 minutes.
+The service layer retains an Oreate account when a successful balance response
+contains an integer `remaining` value below 60, but moves it to the
+unschedulable `quota` state. A later successful response at or above 60 returns
+that account to `active`. Missing values, malformed responses, timeouts, proxy
+failures, and other inconclusive probes do not change its lifecycle state. This
+policy is applied after import validation, an administrator quota refresh, and
+successful or quota-exhausted generation reconciliation.
+
+The maintenance loop rechecks both quota-state rows and legacy active rows
+whose cached balance is below 60. It probes at most four due accounts
+concurrently and throttles failed or still-low accounts to once per 30 minutes,
+so a next-day point grant is discovered without operator intervention. The
+account page also exposes an explicit per-row quota refresh action. Low balance
+never deletes the row; deletion remains an administrator-only operation.
 
 Before dispatch, the service resolves the request's official point cost from
 its `aiType` and excludes every account with a known cached balance below that

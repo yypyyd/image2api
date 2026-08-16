@@ -62,8 +62,8 @@ type TokenService struct {
 	// kreaActivating guards the once-per-day krea /app activation sweep so the 60s
 	// maintenance tick can't pile up overlapping sweeps.
 	kreaActivating atomic.Bool
-	// oreateRetiring guards the authoritative low-credit cleanup sweep.
-	oreateRetiring atomic.Bool
+	// oreateRefreshing guards the bounded low-credit balance refresh sweep.
+	oreateRefreshing atomic.Bool
 }
 
 func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileRepository, events *repo.EventRepository, settings *repo.SiteSettingRepository, adobeClient *adobe.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, leonardoClient *leonardo.Client, kreaClient *krea.Client, imagineClient *imagine.Client, grokClient *grok.Client, oreateClient *oreate.Client, customClient *custom.Client) *TokenService {
@@ -1287,16 +1287,6 @@ func (s *TokenService) checkPendingOreate(tokenID string, account oreate.Account
 		s.finishPending(ctx, "oreate", tokenID, "active", false, nil)
 		return
 	}
-	deleteRequired, deleteErr := deleteOreateAccountBelowCreditFloor(ctx, s.tokens, tokenID, data)
-	if deleteRequired {
-		if deleteErr != nil {
-			log.Printf("token import: could not delete low-credit oreate account %s: %v", tokenID, deleteErr)
-			// Keep an account that should have been deleted out of scheduling if the
-			// repository delete itself failed.
-			s.finishPending(ctx, "oreate", tokenID, "disabled", false, nil)
-		}
-		return
-	}
 	quotaMeta := map[string]any{"cached_quota_at": int(time.Now().Unix())}
 	remaining, hasRemaining := data["remaining"].(int)
 	if hasRemaining {
@@ -1308,7 +1298,11 @@ func (s *TokenService) checkPendingOreate(tokenID string, account oreate.Account
 	if reset := strings.TrimSpace(stringValue(data["reset_after"])); reset != "" {
 		_, _ = s.tokens.Update(ctx, "oreate", tokenID, map[string]any{"cached_quota_reset_after": reset})
 	}
-	s.finishPending(ctx, "oreate", tokenID, "active", false, quotaMeta)
+	status := "active"
+	if hasRemaining && remaining < oreateMinUsableCredits {
+		status = "quota"
+	}
+	s.finishPending(ctx, "oreate", tokenID, status, false, quotaMeta)
 }
 
 func oreateAccountFromToken(item model.TokenAccount) oreate.Account {
@@ -1325,52 +1319,85 @@ func oreateAccountFromToken(item model.TokenAccount) oreate.Account {
 }
 
 const (
-	oreateDeleteBelowCredits         = 60
-	oreateRetirementBatchSize        = 4
-	oreateRetirementRetryInterval    = 30 * time.Minute
-	oreateRetirementCheckedAtMetaKey = "oreate_retirement_checked_at"
+	oreateMinUsableCredits             = 60
+	oreateQuotaRefreshBatchSize        = 4
+	oreateQuotaRefreshInterval         = 30 * time.Minute
+	oreateQuotaCheckedAtMetaKey        = "oreate_quota_checked_at"
+	oreateLegacyRetirementCheckedAtKey = "oreate_retirement_checked_at"
 )
 
-type oreateAccountDeleter interface {
-	Delete(ctx context.Context, pool, id string) (int64, error)
-}
-
-func shouldDeleteOreateAccount(data map[string]any) bool {
-	remaining, ok := data["remaining"].(int)
-	return ok && remaining < oreateDeleteBelowCredits
-}
-
-// deleteOreateAccountBelowCreditFloor applies the destructive account lifecycle
-// rule only to a successful, typed balance response. A zero-row delete is still
-// handled: another concurrent reconciliation may already have removed the row.
-func deleteOreateAccountBelowCreditFloor(ctx context.Context, tokens oreateAccountDeleter, tokenID string, data map[string]any) (bool, error) {
-	if !shouldDeleteOreateAccount(data) {
-		return false, nil
+func oreateStatusForBalance(item model.TokenAccount, remaining int, known bool) (string, bool) {
+	if !known || item.Dead || (item.Status != "active" && item.Status != "quota") {
+		return "", false
 	}
-	rows, err := tokens.Delete(ctx, "oreate", tokenID)
+	if remaining < oreateMinUsableCredits {
+		return "quota", item.Status != "quota"
+	}
+	if item.Status == "quota" {
+		return "active", true
+	}
+	return "", false
+}
+
+// oreateQuotaPatches converts a successful upstream balance response into one
+// atomic metadata merge plus the lifecycle transition it authorizes. Low-credit
+// rows are retained in quota state; only a later successful balance at or above
+// the operating floor may reactivate them.
+func oreateQuotaPatches(item model.TokenAccount, data map[string]any, now time.Time) (map[string]any, map[string]any) {
+	metaPatch := map[string]any{
+		"cached_quota_at":           int(now.Unix()),
+		oreateQuotaCheckedAtMetaKey: int(now.Unix()),
+	}
+	remaining, hasRemaining := data["remaining"].(int)
+	if hasRemaining {
+		metaPatch["cached_quota_remaining"] = remaining
+	}
+	if total, ok := data["total"].(int); ok {
+		metaPatch["cached_quota_total"] = total
+	}
+	patch := map[string]any{
+		"cached_quota_reset_after": strings.TrimSpace(stringValue(data["reset_after"])),
+	}
+	if status, change := oreateStatusForBalance(item, remaining, hasRemaining); change {
+		patch["status"] = status
+		if status == "active" {
+			patch["fails"] = 0
+			patch["quota_recover_at"] = nil
+		}
+	}
+	return metaPatch, patch
+}
+
+func persistOreateQuotaSnapshot(ctx context.Context, tokens *repo.TokenRepository, tokenID string, data map[string]any, now time.Time) (*model.TokenAccount, error) {
+	item, err := tokens.Get(ctx, "oreate", tokenID)
 	if err != nil {
-		return true, err
+		return nil, err
 	}
-	if rows > 0 {
-		log.Printf("oreate account %s deleted after confirmed balance fell below %d credits", tokenID, oreateDeleteBelowCredits)
+	metaPatch, patch := oreateQuotaPatches(*item, data, now)
+	if err := tokens.UpdateMergingMeta(ctx, "oreate", tokenID, metaPatch, patch); err != nil {
+		return nil, err
 	}
-	return true, nil
+	return tokens.Get(ctx, "oreate", tokenID)
 }
 
-func selectOreateRetirementCandidates(items []model.TokenAccount, now time.Time) []model.TokenAccount {
-	cutoff := now.Add(-oreateRetirementRetryInterval).Unix()
+func selectOreateQuotaRefreshCandidates(items []model.TokenAccount, now time.Time) []model.TokenAccount {
+	cutoff := now.Add(-oreateQuotaRefreshInterval).Unix()
 	type candidate struct {
 		account   model.TokenAccount
 		checkedAt int64
 	}
-	due := make([]candidate, 0, oreateRetirementBatchSize)
+	due := make([]candidate, 0, oreateQuotaRefreshBatchSize)
 	for i := range items {
 		item := items[i]
 		remaining, known := jsonMapInt(item.Meta, "cached_quota_remaining")
-		if !known || remaining >= oreateDeleteBelowCredits || strings.TrimSpace(item.Value) == "" {
+		needsRefresh := item.Status == "quota" || (item.Status == "active" && known && remaining < oreateMinUsableCredits)
+		if item.Dead || !needsRefresh || strings.TrimSpace(item.Value) == "" {
 			continue
 		}
-		checkedAt, _ := jsonMapInt(item.Meta, oreateRetirementCheckedAtMetaKey)
+		checkedAt, ok := jsonMapInt(item.Meta, oreateQuotaCheckedAtMetaKey)
+		if !ok {
+			checkedAt, _ = jsonMapInt(item.Meta, oreateLegacyRetirementCheckedAtKey)
+		}
 		if int64(checkedAt) > cutoff {
 			continue
 		}
@@ -1382,8 +1409,8 @@ func selectOreateRetirementCandidates(items []model.TokenAccount, now time.Time)
 		}
 		return due[i].account.ID < due[j].account.ID
 	})
-	if len(due) > oreateRetirementBatchSize {
-		due = due[:oreateRetirementBatchSize]
+	if len(due) > oreateQuotaRefreshBatchSize {
+		due = due[:oreateQuotaRefreshBatchSize]
 	}
 	out := make([]model.TokenAccount, len(due))
 	for i := range due {
@@ -1392,27 +1419,27 @@ func selectOreateRetirementCandidates(items []model.TokenAccount, now time.Time)
 	return out
 }
 
-// RetireLowCreditOreateAccounts revalidates scheduler-excluded legacy rows and
-// permanently removes them only after a fresh, successful balance response.
-// It runs off the maintenance tick so a cached reservation below the floor can
-// never cause a destructive delete by itself.
-func (s *TokenService) RetireLowCreditOreateAccounts(ctx context.Context) {
-	if s.oreate == nil || !s.oreateRetiring.CompareAndSwap(false, true) {
+// RefreshLowCreditOreateAccounts periodically rechecks quota-state rows and
+// active legacy rows cached below the operating floor. A successful reading
+// keeps low balances parked and reactivates replenished accounts; failed probes
+// leave the last known state untouched and are throttled for 30 minutes.
+func (s *TokenService) RefreshLowCreditOreateAccounts(ctx context.Context) {
+	if s.oreate == nil || !s.oreateRefreshing.CompareAndSwap(false, true) {
 		return
 	}
 	go func() {
-		defer s.oreateRetiring.Store(false)
+		defer s.oreateRefreshing.Store(false)
 		items, err := s.tokens.ListByPool(ctx, "oreate")
 		if err != nil {
 			return
 		}
-		items = selectOreateRetirementCandidates(items, time.Now())
+		items = selectOreateQuotaRefreshCandidates(items, time.Now())
 		if len(items) == 0 {
 			return
 		}
 		s.applyProxy(ctx)
 		var wg sync.WaitGroup
-		var deleted atomic.Int32
+		var refreshed atomic.Int32
 		for i := range items {
 			item := items[i]
 			wg.Add(1)
@@ -1422,7 +1449,7 @@ func (s *TokenService) RetireLowCreditOreateAccounts(ctx context.Context) {
 				defer cancel()
 				nowUnix := int(time.Now().Unix())
 				if markerErr := s.tokens.UpdateMergingMeta(probeCtx, "oreate", item.ID, map[string]any{
-					oreateRetirementCheckedAtMetaKey: nowUnix,
+					oreateQuotaCheckedAtMetaKey: nowUnix,
 				}, nil); markerErr != nil {
 					return
 				}
@@ -1430,37 +1457,16 @@ func (s *TokenService) RetireLowCreditOreateAccounts(ctx context.Context) {
 				if fetchErr != nil {
 					return
 				}
-				removed, deleteErr := deleteOreateAccountBelowCreditFloor(probeCtx, s.tokens, item.ID, data)
-				if deleteErr != nil {
-					log.Printf("oreate maintenance: could not delete low-credit account %s: %v", item.ID, deleteErr)
-					_, _ = s.tokens.Update(probeCtx, "oreate", item.ID, map[string]any{"status": "disabled"})
+				if _, updateErr := persistOreateQuotaSnapshot(probeCtx, s.tokens, item.ID, data, time.Unix(int64(nowUnix), 0)); updateErr != nil {
+					log.Printf("oreate maintenance: could not persist refreshed quota for %s: %v", item.ID, updateErr)
 					return
 				}
-				if removed {
-					deleted.Add(1)
-					return
-				}
-
-				metaPatch := map[string]any{
-					"cached_quota_at":                nowUnix,
-					oreateRetirementCheckedAtMetaKey: nowUnix,
-				}
-				if remaining, ok := data["remaining"].(int); ok {
-					metaPatch["cached_quota_remaining"] = remaining
-				}
-				if total, ok := data["total"].(int); ok {
-					metaPatch["cached_quota_total"] = total
-				}
-				patch := map[string]any{}
-				if reset := strings.TrimSpace(stringValue(data["reset_after"])); reset != "" {
-					patch["cached_quota_reset_after"] = reset
-				}
-				_ = s.tokens.UpdateMergingMeta(probeCtx, "oreate", item.ID, metaPatch, patch)
+				refreshed.Add(1)
 			}()
 		}
 		wg.Wait()
-		if n := deleted.Load(); n > 0 {
-			log.Printf("oreate maintenance: retired %d low-credit account(s)", n)
+		if n := refreshed.Load(); n > 0 {
+			log.Printf("oreate maintenance: refreshed %d low-credit account(s)", n)
 		}
 	}()
 }
@@ -1543,10 +1549,10 @@ func (s *TokenService) finishPending(ctx context.Context, pool, id, status strin
 	patch := map[string]any{"status": status, "meta": meta}
 	if dead {
 		patch["dead"] = true
-	} else if status == "active" {
+	} else if status == "active" || status == "quota" {
 		// Re-importing an email can reuse a previously dead row. An active
-		// terminal probe must clear that stale marker, otherwise the UI and
-		// scheduler continue treating the freshly supplied token as dead.
+		// or quota terminal probe must clear that stale marker, otherwise the UI
+		// continues treating the freshly supplied, authenticated token as dead.
 		patch["dead"] = false
 	}
 	_, _ = s.tokens.Update(ctx, pool, id, patch)
@@ -2026,41 +2032,15 @@ func (s *TokenService) Quota(ctx context.Context, pool, id string) (map[string]a
 			}
 			return nil, err
 		}
-		deleted, deleteErr := deleteOreateAccountBelowCreditFloor(ctx, s.tokens, item.ID, data)
-		if deleteErr != nil {
-			return nil, deleteErr
-		}
-		if deleted {
-			return map[string]any{
-				"supported": true, "remaining": data["remaining"], "used": data["used"], "total": data["total"],
-				"reset_after": emptyToNil(strings.TrimSpace(stringValue(data["reset_after"]))), "quota_cached_at": int(time.Now().Unix()),
-				"unchanged": false, "unknown": false, "deleted": true, "error": data["error"],
-			}, nil
-		}
-		meta := cloneJSONMap(item.Meta)
-		meta["cached_quota_at"] = int(time.Now().Unix())
-		remaining, hasRemaining := data["remaining"].(int)
-		if hasRemaining {
-			meta["cached_quota_remaining"] = remaining
-		}
-		if total, ok := data["total"].(int); ok {
-			meta["cached_quota_total"] = total
-		}
-		patch := map[string]any{"meta": meta}
-		if reset := strings.TrimSpace(stringValue(data["reset_after"])); reset != "" {
-			patch["cached_quota_reset_after"] = reset
-			item.CachedQuotaResetAfter = reset
-		}
-		if hasRemaining && item.Status == "quota" {
-			patch["status"] = "active"
-		}
-		if updated, updateErr := s.tokens.Update(ctx, item.Pool, item.ID, patch); updateErr == nil {
-			item = updated
+		now := time.Now()
+		item, err = persistOreateQuotaSnapshot(ctx, s.tokens, item.ID, data, now)
+		if err != nil {
+			return nil, err
 		}
 		return map[string]any{
 			"supported": true, "remaining": data["remaining"], "used": data["used"], "total": data["total"],
-			"reset_after": emptyToNil(item.CachedQuotaResetAfter), "quota_cached_at": meta["cached_quota_at"],
-			"unchanged": false, "unknown": false, "error": data["error"],
+			"reset_after": emptyToNil(item.CachedQuotaResetAfter), "quota_cached_at": int(now.Unix()),
+			"unchanged": false, "unknown": false, "status": item.Status, "dead": item.Dead, "error": data["error"],
 		}, nil
 	}
 	remaining, hasRemaining := jsonMapInt(item.Meta, "cached_quota_remaining")

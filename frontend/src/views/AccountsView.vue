@@ -11,6 +11,7 @@ import Icon from '../components/Icon.vue'
 const rows = ref([])
 const loading = ref(false)
 const quotaStatus = ref('')
+const refreshingQuota = ref(new Set())
 const showImport = ref(false)
 const showUpstream = ref(false)
 const editingUpstream = ref(null)
@@ -170,8 +171,10 @@ function schedulePendingPoll() {
 }
 
 // Background reconciliation: openai → live quota; adobe → reset_after;
-// adobe without email → fetch email. Only ACTIVE accounts — pending ones are
-// handled by the import worker, dead/disabled ones need no re-check.
+// adobe without email → fetch email. Active accounts are refreshed as before;
+// Oreate quota rows are also refreshed so a next-day grant can reactivate them.
+// Pending rows are handled by the import worker, while dead/disabled rows are
+// left alone unless an administrator explicitly uses the row refresh action.
 //
 // Scope: ONLY the accounts visible on the current page. Probing all 100+ rows on
 // every open floods the backend; the user only ever sees ~20 at a time, so we
@@ -186,7 +189,7 @@ async function reconcile() {
   // probed here — the pending poll just reads the store until the worker writes
   // their quota/email. OLD accounts (active) get a real live /quota probe for
   // up-to-date remaining + refresh time.
-  const quotaRows = visible.filter((r) => !r.pending && r.status === 'active' && (r.type === 'openai' || r.type === 'adobe' || r.type === 'runway' || r.type === 'leonardo' || r.type === 'krea' || r.type === 'imagine' || r.type === 'grok' || r.type === 'oreate'))
+  const quotaRows = visible.filter((r) => !r.pending && (r.status === 'active' || (r.type === 'oreate' && r.status === 'quota')) && (r.type === 'openai' || r.type === 'adobe' || r.type === 'runway' || r.type === 'leonardo' || r.type === 'krea' || r.type === 'imagine' || r.type === 'grok' || r.type === 'oreate'))
   const adobeNeedEmail = visible.filter((r) => !r.pending && r.type === 'adobe' && !r.email)
   const total = quotaRows.length + adobeNeedEmail.length
   if (total === 0) { quotaStatus.value = ''; return }
@@ -258,7 +261,11 @@ async function runWithLimit(thunks, limit) {
 }
 
 async function fetchOneQuota(pool, id) {
-  try { return (await api(`/accounts/${pool}/${id}/quota`)).data || {} }
+  try {
+    const r = await api(`/accounts/${pool}/${id}/quota`)
+    if (!r.ok) return { error: r.data?.detail || `额度刷新失败 (${r.status})` }
+    return r.data || {}
+  }
   catch (e) { return { error: String(e) } }
 }
 async function fetchOneEmail(pool, id) {
@@ -278,6 +285,24 @@ function applyQuota(row, result) {
   if (result.used != null) row.quota_used = result.used
   if (result.total != null) row.quota_total = result.total
   row.reset_after = result.reset_after
+  if (result.status) row.status = result.status
+  if (result.dead != null) row.dead = Boolean(result.dead)
+}
+
+async function refreshAccountQuota(row) {
+  if (refreshingQuota.value.has(row.id)) return
+  const active = new Set(refreshingQuota.value)
+  active.add(row.id)
+  refreshingQuota.value = active
+  try {
+    const result = await fetchOneQuota(row.pool, row.id)
+    applyQuota(row, result)
+    if (!result.error) await fetchAccounts()
+  } finally {
+    const next = new Set(refreshingQuota.value)
+    next.delete(row.id)
+    refreshingQuota.value = next
+  }
 }
 
 async function toggleAccountStatus(pool, id, current) {
@@ -575,6 +600,11 @@ onMounted(() => { loadAccounts(); loadModelList() })
             <!-- actions -->
             <td class="px-3 py-3.5 align-middle whitespace-nowrap">
               <div class="flex items-center justify-end gap-2">
+                <button v-if="a.type === 'oreate' && !a.pending && !a.dead"
+                        @click="refreshAccountQuota(a)" class="act"
+                        :disabled="refreshingQuota.has(a.id)" title="刷新 OreateAI 额度">
+                  <Icon name="refresh" class="w-3.5 h-3.5" :class="refreshingQuota.has(a.id) && 'animate-spin'" />
+                </button>
                 <button @click="testAccount(a)" class="act" title="生图测试">
                   <Icon name="spark" class="w-3.5 h-3.5" />
                 </button>
