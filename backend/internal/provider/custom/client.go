@@ -259,6 +259,9 @@ func (c *Client) GenerateImage(ctx context.Context, baseURL, apiKey, model, prom
 		if size != "" {
 			_ = w.WriteField("size", size)
 		}
+		if quality != "" {
+			_ = w.WriteField("quality", quality)
+		}
 		for i, r := range refs {
 			fw, e := w.CreateFormFile("image[]", fmt.Sprintf("ref_%d.png", i+1))
 			if e != nil {

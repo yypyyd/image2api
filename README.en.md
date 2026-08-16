@@ -91,7 +91,7 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 
 #### 🔌 OpenAI Compatible
 - Text-to-image `/v1/images/generations` · image-to-image `/v1/images/edits` (multipart ref upload) · video `/v1/videos` (Sora-style async: create → poll → `/content`, with model-gated video/audio references and generated audio) · `/v1/models` (extended ratios, resolutions, durations, reference limits, and audio-output capabilities by default; `?extended=false` returns strict four-field OpenAI objects, with ratios normalized as `W:H`)
-- **Strict OpenAI params**: `size` drives **both aspect ratio + resolution tier** (images by long edge → 1K/2K/4K, videos by short edge → 720p/1080p) — just swap `base_url` + `api_key` into an existing OpenAI SDK
+- **Strict OpenAI params**: image `size` sets the aspect ratio and native-provider tier (long edge → 1K/2K/4K); only the GPT Image 2 family (`gpt-image-2` / `firefly-gpt-image-2`) adapts an explicit `quality=low/medium/high` to 1K/2K/4K, while other models ignore its resolution effect; video `size` maps by short edge to 720p/1080p — just swap `base_url` + `api_key` into an existing OpenAI SDK
 - Image results default to **URLs**. Ordinary API requests do not download, base64-encode, or store the upstream asset; explicitly request `response_format=b64_json` for inline bytes. The in-app **/docs** ships a size ↔ tier reference table
 
 #### 🔁 Account Pools + Smart Failover
@@ -100,8 +100,8 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 - **Pre-deducted credits**: atomic debit before generation, auto-refunded on failure, no over-spend under concurrency
 
 #### 🌐 Unified Upstream Egress
-- When the admin **Global Proxy** (`proxy.url`) is configured, account validation/authentication, cookie or token exchange and refresh, profile/quota/subscription checks, required upstream bootstrap/challenge calls, and the request that creates a generation job use it for Adobe, ChatGPT, Runway, Leonardo, Krea, Imagine, Grok Web/Build, and custom OpenAI-compatible accounts. Project/session setup, reference uploads, polling, artifact downloads, post-submit bookkeeping, and `/content` relays use direct local egress to keep metered proxy traffic small. A custom multipart image/video request carrying references is itself the generation submit, so its complete HTTPS request uses the proxy.
-- Leave it empty to make proxy-eligible requests direct as well. Provider-specific proxy environment variables are intentionally not used.
+- The admin **Global Proxy** (`proxy.url`) is injected only into ChatGPT, Grok Web/Build, and OreateAI protected control-plane traffic: account checks, required bootstrap/challenge or browser-signing work, and generation submits. Their provider clients keep confirmed bulk-media and artifact transfers on direct local egress where supported.
+- Adobe, Runway, Leonardo, Krea, Imagine, and custom OpenAI-compatible upstreams use direct server egress and do not consume the residential proxy. Leave `proxy.url` empty to make the protected ChatGPT/Grok/Oreate stages direct as well.
 
 #### 🔐 Automatic Token Keep-alive
 - Single-use rotating tokens (Krea / Imagine) are **renewed proactively 10 minutes before expiry**; new tokens persisted automatically
@@ -148,7 +148,7 @@ It's more than an API proxy: it ships with **credit billing, CDK top-ups, referr
 ## 🔌 OpenAI-Compatible API
 
 ```bash
-# Text-to-image — pure OpenAI params: size drives both aspect ratio + tier (long edge <1800→1K / <3500→2K / ≥3500→4K)
+# Text-to-image — size sets native-provider ratio/resolution; only GPT Image 2 adapts quality
 curl https://your-domain/v1/images/generations \
   -H "Authorization: Bearer sk-xxxx" \
   -H "Content-Type: application/json" \
@@ -172,7 +172,7 @@ Images default to the OpenAI-style `{ "created": ..., "data": [{ "url": "..." }]
 
 **Docker (recommended)**: `docker compose up -d --build` brings up PostgreSQL + Redis + RustFS + backend + frontend (nginx serving **HTTP on container port 2000**); point your reverse proxy at `http://<host>:2000` (port via `WEB_PORT`; edit the values (passwords / keys / `CORS_ORIGINS`, and `COOKIE_SECURE=true` when your proxy serves HTTPS) directly in `docker-compose.yml`).
 
-Configure the admin **Global Proxy** (`proxy.url`), for example `http://user:password@proxy:port`. Authentication, credential exchange/refresh, profile/quota/subscription checks, required upstream bootstrap/challenge calls, and generation submits use it. Project setup, reference uploads, polling, artifact downloads, post-submit bookkeeping, and `/content` relays connect directly from the server. A custom multipart request containing reference media is itself the generation submit and therefore uses the proxy as one complete HTTPS request. Clear the setting to make proxy-eligible requests direct too. The URL can contain credentials: do not expose it in logs or documentation, and restrict the proxy to the application server.
+Configure the admin **Global Proxy** (`proxy.url`), for example `http://user:password@proxy:port`, when ChatGPT, Grok, or OreateAI protected traffic requires residential egress. Only those providers receive the setting; Adobe, Runway, Leonardo, Krea, Imagine, and custom upstreams remain direct. ChatGPT/Grok/Oreate clients also keep confirmed bulk-media and artifact transfers direct where supported. Clear the setting to make their protected stages direct too. The URL can contain credentials: do not expose it in logs or documentation, and restrict the proxy to the application server.
 
 Or **build from source** — bring your own **PostgreSQL · Redis · RustFS (or any S3) · reverse proxy**:
 

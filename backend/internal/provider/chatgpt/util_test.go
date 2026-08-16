@@ -51,9 +51,67 @@ func TestChatGPT403Classification(t *testing.T) {
 	if !errors.Is(edgeErr, ErrTemporaryUpstream) || errors.Is(edgeErr, ErrAuth) {
 		t.Fatalf("bootstrap HTML 403 = %v, want temporary upstream", edgeErr)
 	}
+	edgeJSONErr := ensureOK(403, []byte(`{"detail":"Just a moment..."}`), "chat_requirements_prepare")
+	if !errors.Is(edgeJSONErr, ErrTemporaryUpstream) || errors.Is(edgeJSONErr, ErrAuth) {
+		t.Fatalf("challenge JSON 403 = %v, want temporary upstream", edgeJSONErr)
+	}
+	fileStreamErr := ensureOK(403, []byte(`{"detail":"File stream access denied."}`), "image_download")
+	if !errors.Is(fileStreamErr, ErrTemporaryUpstream) || errors.Is(fileStreamErr, ErrAuth) {
+		t.Fatalf("file stream 403 = %v, want temporary upstream", fileStreamErr)
+	}
+	unauthorizedFileErr := ensureOK(403, []byte(`{"detail":"Unauthorized access to file."}`), "image_download")
+	if !errors.Is(unauthorizedFileErr, ErrTemporaryUpstream) || errors.Is(unauthorizedFileErr, ErrAuth) {
+		t.Fatalf("unauthorized file 403 = %v, want temporary upstream", unauthorizedFileErr)
+	}
+	genericUnauthorizedErr := ensureOK(403, []byte(`{"error":"unauthorized"}`), "conversation_get")
+	if !errors.Is(genericUnauthorizedErr, ErrTemporaryUpstream) || errors.Is(genericUnauthorizedErr, ErrAuth) {
+		t.Fatalf("generic unauthorized 403 = %v, want temporary upstream", genericUnauthorizedErr)
+	}
+	echoedPromptErr := ensureOK(403, []byte(`{"request":{"prompt":"invalid token"},"error":{"message":"access denied"}}`), "image_start")
+	if !errors.Is(echoedPromptErr, ErrTemporaryUpstream) || errors.Is(echoedPromptErr, ErrAuth) {
+		t.Fatalf("echoed prompt 403 = %v, want temporary upstream", echoedPromptErr)
+	}
 	jsonErr := ensureOK(403, []byte(`{"error":{"code":"invalid_access_token"}}`), "chat_requirements_prepare")
 	if !errors.Is(jsonErr, ErrAuth) || errors.Is(jsonErr, ErrTemporaryUpstream) {
 		t.Fatalf("authenticated JSON 403 = %v, want auth error", jsonErr)
+	}
+	expiredErr := ensureOK(403, []byte(`{"detail":"JWT expired"}`), "chat_requirements_prepare")
+	if !errors.Is(expiredErr, ErrAuth) || errors.Is(expiredErr, ErrTemporaryUpstream) {
+		t.Fatalf("expired JWT 403 = %v, want auth error", expiredErr)
+	}
+}
+
+func TestChatGPTTemporaryResponseErrorClassification(t *testing.T) {
+	raw := errors.New("read tcp 172.18.0.2:51110->162.128.69.81:10000: read: connection reset by peer")
+	err := wrapTemporaryResponseError("image_download", raw)
+	if !errors.Is(err, ErrTemporaryUpstream) || errors.Is(err, ErrAuth) {
+		t.Fatalf("connection reset = %v, want temporary upstream", err)
+	}
+	if got := wrapTemporaryResponseError("image_download", ErrAuth); !errors.Is(got, ErrAuth) {
+		t.Fatalf("auth sentinel was not preserved: %v", got)
+	}
+}
+
+func TestImageStartAcknowledgementSurvivesClosedResponseBody(t *testing.T) {
+	streamErr := errors.New("http2: response body closed")
+	if err := imageStartStreamError("conversation-accepted", streamErr); err != nil {
+		t.Fatalf("acknowledged image submit = %v, want polling to continue", err)
+	}
+	if err := imageStartStreamError("", streamErr); !errors.Is(err, ErrTemporaryUpstream) {
+		t.Fatalf("unacknowledged closed stream = %v, want temporary upstream", err)
+	}
+}
+
+func TestImageStartFallbackAcknowledgementPrecedesStreamError(t *testing.T) {
+	chunks := []string{`{"conversation_id"`, `: "conversation-fragmented"}`}
+	for _, chunk := range chunks {
+		if conversationIDRE.MatchString(chunk) {
+			t.Fatalf("test chunk unexpectedly contains a complete acknowledgement: %q", chunk)
+		}
+	}
+	conversationID, err := finalizeImageStartStream("", chunks, errors.New("connection reset by peer"))
+	if err != nil || conversationID != "conversation-fragmented" {
+		t.Fatalf("fallback acknowledgement = (%q, %v), want accepted conversation", conversationID, err)
 	}
 }
 

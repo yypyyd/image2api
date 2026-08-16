@@ -93,6 +93,11 @@ upstream reports insufficient points but reconciliation still shows at least
 the 60-point retention floor, the failure remains task-specific and does not
 move the account into the pool-wide quota state.
 
+After normal health, weight, and round-robin ordering, requests priced at 80
+points or less apply a stable 80-point-balance preference inside each cooling
+group. This drains the low tier without disturbing order among equal-tier
+accounts or allowing a cooling account to jump ahead of healthy accounts.
+
 ## Account Lifecycle
 
 Oreate accounts are disposable once their confirmed remaining balance can no
@@ -109,6 +114,13 @@ zero-row delete is treated as success, while a repository failure is surfaced
 to an administrator and prevents the account from being rescheduled after a
 generation.
 
+The maintenance loop closes the gap for legacy rows already excluded by the
+scheduler. It selects at most four cached-below-floor accounts, records a probe
+timestamp, and fetches their current balance concurrently. Only that fresh
+typed response may delete the row; a failed or inconclusive probe retains it and
+is not attempted again for 30 minutes. The cached value alone is deliberately
+non-destructive because an in-flight quota reservation can temporarily lower it.
+
 ## Proxy And Browser Isolation
 
 Chromium does not support credentials embedded in `--proxy-server`. For an
@@ -118,12 +130,25 @@ ordinary requests and CONNECT tunnels through the configured upstream proxy.
 `Proxy-Authorization` is injected only on the bridge-to-proxy hop and stripped
 from destination headers and copied responses.
 
+CONNECT connections are hijacked from Go's HTTP server, so the shared bridge
+tracks them explicitly. Closing the bridge marks it closed before shutting down
+the listener, rejects late registrations, and closes both ends of every active
+tunnel; relying on `http.Server.Close` alone would leave hijacked connections
+outside the server lifecycle.
+
 On Linux, the backend starts Chromium as the dedicated `chrome` UID with an
 empty environment, a temporary chromedp profile, and a parent-death signal. The
-runtime wrapper exposes only `HOME`, `PATH`, and locale. Docker's default
-seccomp profile prevents Chromium namespaces, so the already-unprivileged child
-uses `--no-sandbox`; the dedicated UID, empty environment, ephemeral profile,
-and restricted egress are mandatory compensating controls.
+runtime wrapper uses `exec`, so Chromium replaces the wrapper instead of
+becoming its child. Each browser is also a process-group leader: context
+cancellation or signer timeout kills the complete browser process group, and
+chromedp waits for the launched process before returning. The backend service
+runs with a container init process to reap any Chromium descendant that exits
+after being orphaned. Chromium is an Oreate-only dependency; no other provider
+starts it. The runtime wrapper exposes only `HOME`, `PATH`, and locale. Docker's
+default seccomp profile prevents Chromium namespaces, so the
+already-unprivileged child uses `--no-sandbox`; the dedicated UID, empty
+environment, ephemeral profile, and restricted egress are mandatory
+compensating controls.
 
 ## TLS Chain Decision
 
@@ -195,12 +220,29 @@ risk-control hosts.
 
 ## Change History
 
+### 2026-08-16 - Authoritative retirement sweep and tunnel shutdown
+
+- Added a bounded maintenance pass for cached-below-60 rows, with a fresh
+  balance confirmation and a 30-minute retry interval after failed probes.
+- Kept cached reservations non-destructive so in-flight work cannot cause an
+  account deletion by itself.
+- Made bridge shutdown close active hijacked CONNECT tunnels explicitly.
+
+### 2026-08-16 - Oreate-only Chromium lifecycle
+
+- Kept Chromium exclusive to Oreate's official Banti signer.
+- Started every signer browser in its own process group and made timeout or
+  cancellation terminate the complete group before chromedp returns.
+- Enabled a container init process to reap orphaned Chromium descendants.
+
 ### 2026-08-15 - Cost-aware account routing
 
 - Recorded the official point cost for every supported Seedance `aiType`.
 - Excluded accounts whose known balance cannot pay for the current request,
   including administrator-pinned tests, without disabling accounts that can
   still serve cheaper combinations.
+- Prioritized confirmed 80-point accounts for requests costing at most 80
+  points while preserving cooling, weight, and round-robin behavior.
 - Preserved exact-balance eligibility and the non-destructive treatment of
   unknown balances.
 

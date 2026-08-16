@@ -647,6 +647,50 @@ func (c *Client) baseHeaders(accessToken string) http.Header {
 	}
 }
 
+// readResponseBody normalizes response-body transport failures. A successful
+// HTTP response can still fail while its body is being streamed (for example,
+// when the proxy resets the TCP connection); those failures are upstream
+// temporary errors and must be eligible for account failover.
+func readResponseBody(resp *http.Response, stage string) ([]byte, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, fmt.Errorf("%w: %s: empty response body", ErrTemporaryUpstream, stage)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s: %v", ErrTemporaryUpstream, stage, err)
+	}
+	return body, nil
+}
+
+// wrapTemporaryResponseError keeps provider sentinel errors intact while
+// treating malformed upstream responses as temporary failures. This prevents a
+// proxy HTML/challenge page or truncated JSON response from poisoning a token.
+func wrapTemporaryResponseError(stage string, err error) error {
+	if err == nil || errors.Is(err, ErrAuth) || errors.Is(err, ErrQuotaExhausted) ||
+		errors.Is(err, ErrTemporaryUpstream) || errors.Is(err, ErrContentPolicy) {
+		return err
+	}
+	return fmt.Errorf("%w: %s: %v", ErrTemporaryUpstream, stage, err)
+}
+
+func imageStartStreamError(conversationID string, err error) error {
+	if err == nil || strings.TrimSpace(conversationID) != "" {
+		return nil
+	}
+	return wrapTemporaryResponseError("image_start", err)
+}
+
+func finalizeImageStartStream(conversationID string, chunks []string, streamErr error) (string, error) {
+	if strings.TrimSpace(conversationID) == "" {
+		joined := strings.Join(chunks, "\n")
+		if match := conversationIDRE.FindStringSubmatch(joined); len(match) >= 2 {
+			conversationID = match[1]
+		}
+	}
+	return conversationID, imageStartStreamError(conversationID, streamErr)
+}
+
 func (c *Client) headers(accessToken, path string, extra map[string]string) http.Header {
 	h := http.Header{
 		"x-openai-target-path":  {path},
@@ -683,8 +727,7 @@ func (c *Client) bootstrap(ctx context.Context, session tlsclient.HttpClient) ([
 	if err != nil {
 		return nil, "", fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	body, err := readResponseBody(resp, "bootstrap")
 	if err != nil {
 		return nil, "", err
 	}
@@ -711,8 +754,7 @@ func (c *Client) getChatRequirements(ctx context.Context, session tlsclient.Http
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
 	}
-	body, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	body, err := readResponseBody(resp, "chat_requirements_prepare")
 	if err != nil {
 		return nil, err
 	}
@@ -721,7 +763,7 @@ func (c *Client) getChatRequirements(ctx context.Context, session tlsclient.Http
 	}
 	var prepare map[string]any
 	if err := json.Unmarshal(body, &prepare); err != nil {
-		return nil, err
+		return nil, wrapTemporaryResponseError("chat_requirements_prepare", err)
 	}
 	if arkose, _ := prepare["arkose"].(map[string]any); arkose["required"] == true {
 		return nil, errors.New("chat-requirements requires arkose token")
@@ -756,8 +798,7 @@ func (c *Client) getChatRequirements(ctx context.Context, session tlsclient.Http
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
 	}
-	body, err = io.ReadAll(resp.Body)
-	resp.Body.Close()
+	body, err = readResponseBody(resp, "chat_requirements_finalize")
 	if err != nil {
 		return nil, err
 	}
@@ -766,7 +807,7 @@ func (c *Client) getChatRequirements(ctx context.Context, session tlsclient.Http
 	}
 	var data map[string]any
 	if err := json.Unmarshal(body, &data); err != nil {
-		return nil, err
+		return nil, wrapTemporaryResponseError("chat_requirements_finalize", err)
 	}
 	token := strings.TrimSpace(stringValue(data["token"]))
 	if token == "" {
@@ -921,8 +962,7 @@ func (c *Client) createFileEntry(ctx context.Context, session tlsclient.HttpClie
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
 	}
-	respBody, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	respBody, err := readResponseBody(resp, "file_create")
 	if err != nil {
 		return nil, err
 	}
@@ -931,7 +971,7 @@ func (c *Client) createFileEntry(ctx context.Context, session tlsclient.HttpClie
 	}
 	var data map[string]any
 	if err := json.Unmarshal(respBody, &data); err != nil {
-		return nil, err
+		return nil, wrapTemporaryResponseError("file_create", err)
 	}
 	entry := &fileEntry{
 		FileID:    strings.TrimSpace(stringValue(data["file_id"])),
@@ -969,8 +1009,7 @@ func (c *Client) uploadRawFile(ctx context.Context, session tlsclient.HttpClient
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
 	}
-	body, readErr := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	body, readErr := readResponseBody(resp, "file_upload")
 	if readErr != nil {
 		return readErr
 	}
@@ -1040,7 +1079,7 @@ func (c *Client) processUploadStream(ctx context.Context, session tlsclient.Http
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return "", err
+		return "", wrapTemporaryResponseError("file_process_upload", err)
 	}
 	return libraryFileID, nil
 }
@@ -1127,8 +1166,7 @@ func (c *Client) prepareImageConversation(ctx context.Context, session tlsclient
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
 	}
-	respBody, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	respBody, err := readResponseBody(resp, "image_prepare")
 	if err != nil {
 		return "", err
 	}
@@ -1137,7 +1175,7 @@ func (c *Client) prepareImageConversation(ctx context.Context, session tlsclient
 	}
 	var data map[string]any
 	if err := json.Unmarshal(respBody, &data); err != nil {
-		return "", err
+		return "", wrapTemporaryResponseError("image_prepare", err)
 	}
 	return strings.TrimSpace(stringValue(data["conduit_token"])), nil
 }
@@ -1269,11 +1307,13 @@ func (c *Client) startImageGeneration(ctx context.Context, session tlsclient.Htt
 			break
 		}
 	}
-	if conversationID == "" {
-		joined := strings.Join(chunks, "\n")
-		if match := conversationIDRE.FindStringSubmatch(joined); len(match) >= 2 {
-			conversationID = match[1]
-		}
+	// The watchdog deliberately closes the SSE body after the conversation is
+	// acknowledged so polling can take over. HTTP/2 reports that close as a read
+	// error; once conversationID exists -- including through the accumulated-chunk
+	// fallback above -- it is not a failed submit.
+	conversationID, err = finalizeImageStartStream(conversationID, chunks, scanner.Err())
+	if err != nil {
+		return "", nil, nil, err
 	}
 	if conversationID == "" {
 		return "", nil, nil, errors.New("chatgpt SSE closed without conversation_id")
@@ -1300,8 +1340,7 @@ func (c *Client) getConversation(ctx context.Context, session tlsclient.HttpClie
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
 	}
-	body, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	body, err := readResponseBody(resp, "conversation_get")
 	if err != nil {
 		return nil, err
 	}
@@ -1313,7 +1352,7 @@ func (c *Client) getConversation(ctx context.Context, session tlsclient.HttpClie
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, err
+		return nil, wrapTemporaryResponseError("conversation_get", err)
 	}
 	return payload, nil
 }
@@ -1390,7 +1429,7 @@ func (c *Client) pollForImage(ctx context.Context, session tlsclient.HttpClient,
 		}
 		time.Sleep(5 * time.Second)
 	}
-	return nil, nil, errors.New("image poll timeout")
+	return nil, nil, fmt.Errorf("%w: image poll timeout", ErrTemporaryUpstream)
 }
 
 // uploadedRefIDSet collects every id belonging to the user's uploaded
@@ -1453,8 +1492,7 @@ func (c *Client) fetchDownloadURL(ctx context.Context, session tlsclient.HttpCli
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
 	}
-	body, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	body, err := readResponseBody(resp, "file_download_url")
 	if err != nil {
 		return "", err
 	}
@@ -1463,7 +1501,7 @@ func (c *Client) fetchDownloadURL(ctx context.Context, session tlsclient.HttpCli
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return "", err
+		return "", wrapTemporaryResponseError("file_download_url", err)
 	}
 	rawURL := strings.TrimSpace(stringValue(payload["download_url"]))
 	if rawURL == "" {
@@ -1474,12 +1512,14 @@ func (c *Client) fetchDownloadURL(ctx context.Context, session tlsclient.HttpCli
 
 func (c *Client) resolveImageURLs(ctx context.Context, session tlsclient.HttpClient, accessToken, conversationID string, fileIDs, sedimentIDs []string) ([]string, error) {
 	var urls []string
+	var lastErr error
 	for _, fileID := range fileIDs {
 		if fileID == "file_upload" {
 			continue
 		}
 		rawURL, err := c.getFileDownloadURL(ctx, session, accessToken, conversationID, fileID, false)
 		if err != nil {
+			lastErr = err
 			continue
 		}
 		if rawURL != "" && !containsString(urls, rawURL) {
@@ -1490,21 +1530,28 @@ func (c *Client) resolveImageURLs(ctx context.Context, session tlsclient.HttpCli
 		path := "/backend-api/conversation/" + conversationID + "/attachment/" + sedimentID + "/download"
 		req, err := http.NewRequest(http.MethodGet, baseURL+path, nil)
 		if err != nil {
+			lastErr = err
 			continue
 		}
 		req = req.WithContext(ctx)
 		req.Header = c.headers(accessToken, path, map[string]string{"accept": "application/json"})
 		resp, err := session.Do(req)
 		if err != nil {
+			lastErr = fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
 			continue
 		}
-		body, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, readErr := readResponseBody(resp, "file_download_url")
+		if readErr != nil {
+			lastErr = readErr
+			continue
+		}
+		if err := ensureOK(resp.StatusCode, body, "file_download_url"); err != nil {
+			lastErr = err
 			continue
 		}
 		var payload map[string]any
 		if err := json.Unmarshal(body, &payload); err != nil {
+			lastErr = wrapTemporaryResponseError("file_download_url", err)
 			continue
 		}
 		rawURL := strings.TrimSpace(stringValue(payload["download_url"]))
@@ -1514,6 +1561,12 @@ func (c *Client) resolveImageURLs(ctx context.Context, session tlsclient.HttpCli
 		if rawURL != "" && !containsString(urls, rawURL) {
 			urls = append(urls, rawURL)
 		}
+	}
+	if len(urls) == 0 {
+		if lastErr != nil {
+			return nil, lastErr
+		}
+		return nil, fmt.Errorf("%w: no image urls resolved", ErrTemporaryUpstream)
 	}
 	return urls, nil
 }
@@ -1536,8 +1589,7 @@ func (c *Client) downloadBytes(ctx context.Context, session tlsclient.HttpClient
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrTemporaryUpstream, err)
 		}
-		body, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		body, readErr := readResponseBody(resp, "image_download")
 		if readErr != nil {
 			return nil, readErr
 		}
@@ -1559,10 +1611,13 @@ func ensureOK(statusCode int, body []byte, context string) error {
 	case 401:
 		return fmt.Errorf("%w: %s %d %s", ErrAuth, context, statusCode, clip(body, 400))
 	case 403:
-		// Bootstrap is account-neutral. An HTML 403 is an edge/challenge response,
-		// not proof that the credential is invalid, so it must not poison the pool.
+		// Bootstrap is account-neutral. HTML/challenge responses and generic JSON
+		// 403s can come from the proxy/edge or an auth-gated asset endpoint, so they
+		// must not poison the pool. Only an explicit invalid-token response is
+		// strong enough to mark a ChatGPT credential dead.
 		lowerBody := strings.ToLower(strings.TrimSpace(string(body)))
-		if context == "bootstrap" || strings.HasPrefix(lowerBody, "<!doctype html") || strings.HasPrefix(lowerBody, "<html") {
+		if context == "bootstrap" || strings.HasPrefix(lowerBody, "<!doctype html") || strings.HasPrefix(lowerBody, "<html") ||
+			!explicitInvalidTokenResponse(lowerBody) {
 			return fmt.Errorf("%w: %s %d edge rejection", ErrTemporaryUpstream, context, statusCode)
 		}
 		return fmt.Errorf("%w: %s %d %s", ErrAuth, context, statusCode, clip(body, 400))
@@ -1572,6 +1627,56 @@ func ensureOK(statusCode int, body []byte, context string) error {
 		return fmt.Errorf("%w: %s %d %s", ErrTemporaryUpstream, context, statusCode, clip(body, 400))
 	default:
 		return fmt.Errorf("%s: %d %s", context, statusCode, clip(body, 400))
+	}
+}
+
+func explicitInvalidTokenResponse(body string) bool {
+	var payload any
+	if err := json.Unmarshal([]byte(body), &payload); err == nil {
+		return containsInvalidTokenMarker(payload, true)
+	}
+	return isInvalidTokenMarker(body)
+}
+
+func containsInvalidTokenMarker(value any, allowString bool) bool {
+	switch v := value.(type) {
+	case string:
+		return allowString && isInvalidTokenMarker(v)
+	case []any:
+		for _, item := range v {
+			if containsInvalidTokenMarker(item, allowString) {
+				return true
+			}
+		}
+	case map[string]any:
+		for key, item := range v {
+			_, nested := item.(map[string]any)
+			_, list := item.([]any)
+			semanticField := isTokenErrorField(key)
+			if (semanticField || nested || list) && containsInvalidTokenMarker(item, semanticField) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isInvalidTokenMarker(value string) bool {
+	marker := strings.NewReplacer("-", "_", " ", "_").Replace(strings.ToLower(strings.TrimSpace(value)))
+	switch marker {
+	case "invalid_access_token", "invalid_token", "token_invalid", "token_expired", "expired_token", "jwt_expired", "authentication_failed":
+		return true
+	default:
+		return false
+	}
+}
+
+func isTokenErrorField(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "error", "code", "error_code", "type", "message", "detail", "reason":
+		return true
+	default:
+		return false
 	}
 }
 

@@ -99,7 +99,11 @@ func (c *Client) GenerateVideo(ctx context.Context, token, prompt, aspectRatio, 
 	// dead stream is NOT a failed generation: poll that URL until the clip is
 	// ready instead of failing the job (which would also fail over and burn
 	// another account's credits for a video that already exists).
-	postID, userID, err := c.createPost(ctx, directClient, token, prompt)
+	// The parent post is part of the gated generation submit. It must use the
+	// same proxied session/IP as ensureChallenge and conversations/new; mixing a
+	// proxied challenge with a direct create request triggers Cloudflare's HTML
+	// challenge even when the dynamic Statsig signature is valid.
+	postID, userID, err := c.createPost(ctx, submitClient, token, prompt)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -493,9 +497,10 @@ func mapStatus(path string, status int, raw []byte) error {
 	case status == 403 && isBotChallenge(string(raw)):
 		// grok bot-detection or a Cloudflare challenge page ("Just a moment…"),
 		// NOT a dead token — transient, so a good account isn't killed by an
-		// IP/anti-bot hiccup. A statsig anti-bot rejection means the recipe likely
-		// went stale on a reship; kick the headless refresher to re-capture.
-		TriggerStatsigRefresh()
+		// IP/anti-bot hiccup. Invalidate even a TTL-fresh snapshot so the next
+		// request refreshes the homepage challenge and signer chunk through the
+		// normal HTTP/Goja path.
+		invalidateStatsigChallenge()
 		return fmt.Errorf("%w: %s 403 %s", ErrTemporaryUpstream, path, clip(raw, 160))
 	case status == 401 || status == 403:
 		return fmt.Errorf("%w: %s %d %s", ErrAuth, path, status, clip(raw, 160))

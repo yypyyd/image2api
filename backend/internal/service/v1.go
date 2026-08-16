@@ -227,11 +227,10 @@ type V1ImageRequest struct {
 	Prompt    string
 	RequestID string
 	Size      string
-	// Quality is OpenAI's image quality (low|medium|high|auto). For our tiered
-	// models it selects the resolution (low→1K, medium→2K, high→4K, auto→default),
-	// clamped to whatever tiers the model actually prices. Only used when
-	// Resolution is left blank (the strict /v1 OpenAI path); the playground passes
-	// Resolution directly and ignores this.
+	// Quality is OpenAI's image quality (low|medium|high|auto). Only the GPT Image
+	// 2 family uses it to select a resolution tier; other models keep their own
+	// size/resolution behavior. An explicit internal Resolution always remains
+	// authoritative.
 	Quality string
 	// ResponseFormat controls the OpenAI-compatible API response. Empty defaults
 	// to url for low-copy relay; b64_json is available when explicitly requested.
@@ -404,9 +403,9 @@ func (s *V1Service) SetRefresh(r *RefreshProfileService) { s.refresh = r }
 // SetBannedWords wires the prompt blocklist in after construction.
 func (s *V1Service) SetBannedWords(r *repo.BannedWordRepository) { s.banned = r }
 
-// applyGlobalProxy snapshots the administrator's proxy-eligible route onto
-// every provider. Providers keep bulk media, polling, and downloads direct; an
-// empty value makes proxy-eligible requests local as well.
+// applyGlobalProxy snapshots the administrator's residential route onto only
+// the providers with a verified protected-control-plane requirement. Other
+// providers remain on direct local egress.
 func (s *V1Service) applyGlobalProxy(ctx context.Context) string {
 	proxy := ""
 	if s.settings != nil {
@@ -429,32 +428,14 @@ func (s *V1Service) applyGlobalProxy(ctx context.Context) string {
 }
 
 func (s *V1Service) setProviderProxy(proxy string) string {
-	if s.adobe != nil {
-		s.adobe.SetProxy(proxy)
-	}
 	if s.chatgpt != nil {
 		s.chatgpt.SetProxy(proxy)
-	}
-	if s.runway != nil {
-		s.runway.SetProxy(proxy)
-	}
-	if s.leonardo != nil {
-		s.leonardo.SetProxy(proxy)
-	}
-	if s.krea != nil {
-		s.krea.SetProxy(proxy)
-	}
-	if s.imagine != nil {
-		s.imagine.SetProxy(proxy)
 	}
 	if s.grok != nil {
 		s.grok.SetProxy(proxy)
 	}
 	if s.oreate != nil {
 		s.oreate.SetProxy(proxy)
-	}
-	if s.custom != nil {
-		s.custom.SetProxy(proxy)
 	}
 	return strings.TrimSpace(proxy)
 }
@@ -2174,8 +2155,9 @@ func (s *V1Service) prepareImage(ctx context.Context, principal *APIPrincipal, i
 	// effective provider: a custom upstream serving this model id routes to
 	// "custom" (effectiveProvider only returns it when such an account exists, so
 	// the precheck is satisfied); otherwise check the native provider pool.
-	if eff := s.effectiveProvider(ctx, modelItem); eff != "custom" {
-		if ok, err := s.hasActiveProviderToken(ctx, eff, "image"); err != nil {
+	effectiveProvider := s.effectiveProvider(ctx, modelItem)
+	if effectiveProvider != "custom" {
+		if ok, err := s.hasActiveProviderToken(ctx, effectiveProvider, "image"); err != nil {
 			return nil, "", "", 0, err
 		} else if !ok {
 			return nil, "", "", 0, ErrNoProviderAccount
@@ -2195,11 +2177,10 @@ func (s *V1Service) prepareImage(ctx context.Context, principal *APIPrincipal, i
 	if err := ensureReferenceSizes(in.ReferenceImages); err != nil {
 		return nil, "", "", 0, err
 	}
-	// `size` (WxH) drives BOTH the aspect ratio AND the resolution tier — its long
-	// edge maps to a tier (<1800→1K, 1800–3499→2K, ≥3500→4K). The web path passes
-	// an explicit resolution; the OpenAI /v1 path derives it from size. There is no
-	// `quality` param — size is the single source of truth for resolution.
-	aspectRatio, resolution := parseImageSize(in.Size, in.AspectRatio, in.Resolution)
+	// Native providers use their own resolution parameter, derived from `size` on
+	// /v1 requests or supplied directly by the web UI. Only the GPT Image 2 family
+	// interprets `quality` as a resolution tier adapter.
+	aspectRatio, resolution := resolveImageSize(modelItem, in)
 	// Snap to the nearest ratio the model actually supports — a `size`-derived
 	// ratio (e.g. 1:3) must never be passed through to an upstream that rejects
 	// it (Runway 400s on ratios outside its list).
@@ -2823,12 +2804,6 @@ func (s *V1Service) generateRunwayVideo(ctx context.Context, eventID string, mod
 	if s.runway == nil {
 		return nil, "", errors.New("runway client not configured")
 	}
-	if s.settings != nil {
-		if proxy, err := s.settings.GetValue(ctx, "proxy.url"); err == nil {
-			s.runway.SetProxy(proxy)
-		}
-	}
-
 	// Runway i2v strictly requires exactly one first-frame image.
 	refs, err := decodeReferenceImages(in.ReferenceImages, 1)
 	if err != nil {
@@ -2996,8 +2971,8 @@ func (s *V1Service) effectiveProvider(ctx context.Context, modelItem *model.Mode
 }
 
 // generateCustomImage forwards an image generation to an OpenAI-compatible
-// upstream. The generation submit follows proxy.url; result handling stays
-// direct. A multipart request carrying references is itself the submit.
+// upstream. Custom upstreams use direct server egress. A multipart request
+// carrying references is itself the generation submit.
 func (s *V1Service) generateCustomImage(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1ImageRequest, aspectRatio, resolution string, noStore bool) ([]byte, string, error) {
 	urlOnly := noStore
 	if s.custom == nil {
@@ -3017,7 +2992,7 @@ func (s *V1Service) generateCustomImage(ctx context.Context, eventID string, mod
 		return nil, "", ErrNoProviderAccount
 	}
 	size := upstreamSize(aspectRatio, resolution)
-	quality := upstreamQuality(resolution)
+	quality := upstreamQualityForModel(modelItem.ID, resolution)
 	var lastErr error
 	busy := 0
 	for _, token := range active {
@@ -3073,8 +3048,8 @@ func (s *V1Service) generateCustomImage(ctx context.Context, eventID string, mod
 }
 
 // generateCustomVideo forwards a video generation to an OpenAI-compatible
-// (Sora-style) upstream. Its generation submit follows proxy.url, while polling
-// and result downloads stay direct. Billing uses the local model price.
+// (Sora-style) upstream. Custom upstream traffic uses direct server egress.
+// Billing uses the local model price.
 func (s *V1Service) generateCustomVideo(ctx context.Context, eventID string, modelItem *model.ModelConfig, in V1VideoRequest, aspectRatio, resolution string, durationSeconds int, downloadResult bool) ([]byte, string, error) {
 	if s.custom == nil {
 		return nil, "", errors.New("custom client not configured")
@@ -3220,6 +3195,13 @@ func upstreamQuality(resolution string) string {
 	return ""
 }
 
+func upstreamQualityForModel(modelID, resolution string) string {
+	if !supportsQualityResolutionModel(modelID) {
+		return ""
+	}
+	return upstreamQuality(resolution)
+}
+
 // generateOreateVideo runs OreateAI's Seedance video flow. Oreate's
 // website requires a fresh browser-generated Banti token for every attempt, so
 // risk-control failures are temporary and participate in the bounded retry loop.
@@ -3292,6 +3274,7 @@ func (s *V1Service) generateOreateVideo(ctx context.Context, eventID string, mod
 		return nil, "", ErrNoProviderAccount
 	}
 	s.rotateRoundRobin("oreate", active)
+	s.prioritizeOreate80CreditAccounts(active, requiredCredits)
 	var videoURL string
 	data, err := s.runPoolWithFailover(ctx, eventID, "oreate", active, "video", func(token model.TokenAccount) ([]byte, error) {
 		// Reserve the exact request cost under the account row lock. This closes the
@@ -3344,6 +3327,30 @@ func filterOreateAccountsByCredits(items []model.TokenAccount, required int) ([]
 		eligible = append(eligible, item)
 	}
 	return eligible, knownInsufficient
+}
+
+// prioritizeOreate80CreditAccounts drains the 80-point tier with requests it
+// can afford, preserving higher balances for expensive Seedance combinations.
+// Cooling remains the primary ordering rule; within each cooling group this is
+// a stable partition, so weight and round-robin order are preserved.
+func (s *V1Service) prioritizeOreate80CreditAccounts(items []model.TokenAccount, required int) {
+	if required > 80 || len(items) < 2 {
+		return
+	}
+	cooling := make(map[string]bool, len(items))
+	for _, item := range items {
+		cooling[item.ID] = s.accountCooling("oreate", item.ID)
+	}
+	isPreferred := func(item model.TokenAccount) bool {
+		remaining, ok := jsonMapInt(item.Meta, "cached_quota_remaining")
+		return ok && remaining == 80
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if cooling[items[i].ID] != cooling[items[j].ID] {
+			return !cooling[items[i].ID]
+		}
+		return isPreferred(items[i]) && !isPreferred(items[j])
+	})
 }
 
 func (s *V1Service) reconcileOreateCredits(ctx context.Context, token model.TokenAccount) (int, bool) {
@@ -3591,12 +3598,6 @@ func (s *V1Service) generateRunwayImage(ctx context.Context, eventID string, mod
 	if s.runway == nil {
 		return nil, "", errors.New("runway client not configured")
 	}
-	if s.settings != nil {
-		if proxy, err := s.settings.GetValue(ctx, "proxy.url"); err == nil {
-			s.runway.SetProxy(proxy)
-		}
-	}
-
 	refs, err := decodeReferenceImages(in.ReferenceImages, max(1, modelItem.MaxReferenceImages))
 	if err != nil {
 		return nil, "", err
@@ -3857,12 +3858,6 @@ func (s *V1Service) generateLeonardoImage(ctx context.Context, eventID string, m
 	if s.leonardo == nil {
 		return nil, "", errors.New("leonardo client not configured")
 	}
-	if s.settings != nil {
-		if proxy, err := s.settings.GetValue(ctx, "proxy.url"); err == nil {
-			s.leonardo.SetProxy(proxy)
-		}
-	}
-
 	items, err := s.tokens.ListByPool(ctx, "leonardo")
 	if err != nil {
 		return nil, "", err
@@ -3966,12 +3961,6 @@ func (s *V1Service) generateLeonardoVideo(ctx context.Context, eventID string, m
 	if s.leonardo == nil {
 		return nil, "", errors.New("leonardo client not configured")
 	}
-	if s.settings != nil {
-		if proxy, err := s.settings.GetValue(ctx, "proxy.url"); err == nil {
-			s.leonardo.SetProxy(proxy)
-		}
-	}
-
 	items, err := s.tokens.ListByPool(ctx, "leonardo")
 	if err != nil {
 		return nil, "", err
@@ -4115,12 +4104,6 @@ func (s *V1Service) generateKreaImage(ctx context.Context, eventID string, model
 	if s.krea == nil {
 		return nil, "", errors.New("krea client not configured")
 	}
-	if s.settings != nil {
-		if proxy, err := s.settings.GetValue(ctx, "proxy.url"); err == nil {
-			s.krea.SetProxy(proxy)
-		}
-	}
-
 	items, err := s.tokens.ListByPool(ctx, "krea")
 	if err != nil {
 		return nil, "", err
@@ -4198,12 +4181,6 @@ func (s *V1Service) generateImagineImage(ctx context.Context, eventID string, mo
 	if s.imagine == nil {
 		return nil, "", errors.New("imagine client not configured")
 	}
-	if s.settings != nil {
-		if proxy, err := s.settings.GetValue(ctx, "proxy.url"); err == nil {
-			s.imagine.SetProxy(proxy)
-		}
-	}
-
 	items, err := s.tokens.ListByPool(ctx, "imagine")
 	if err != nil {
 		return nil, "", err
@@ -4429,6 +4406,23 @@ func parseImageSize(size, aspectRatio, resolution string) (string, string) {
 	return ar, rs
 }
 
+func resolveImageSize(item *model.ModelConfig, in V1ImageRequest) (string, string) {
+	ar, resolution := parseImageSize(in.Size, in.AspectRatio, in.Resolution)
+	if supportsQualityResolutionModel(item.ID) && strings.TrimSpace(in.Resolution) == "" && strings.TrimSpace(in.Quality) != "" {
+		resolution = resolutionForQuality(item, in.Quality)
+	}
+	return ar, resolution
+}
+
+func supportsQualityResolutionModel(modelID string) bool {
+	switch strings.ToLower(strings.TrimSpace(modelID)) {
+	case "gpt-image-2", "firefly-gpt-image-2":
+		return true
+	default:
+		return false
+	}
+}
+
 // snapRatio returns the entry in supported closest in value to ar ("W:H").
 // ar is returned as-is when it's already supported, unparsable, or the model
 // has no ratio list.
@@ -4542,10 +4536,9 @@ func firstPricedResolution(item *model.ModelConfig) string {
 	return ""
 }
 
-// resolutionForQuality maps OpenAI's `quality` to one of the model's priced
+// resolutionForQuality maps GPT Image 2's `quality` to one of its priced
 // resolution tiers: low→1K, medium→2K, high→4K, auto/blank→the model's lowest
-// priced tier. The desired tier is clamped to the nearest tier the model
-// actually prices (e.g. seedream is 2K/4K only: low→2K, high→4K).
+// priced tier. Other models must not call this helper.
 func resolutionForQuality(item *model.ModelConfig, quality string) string {
 	order := []string{"1K", "2K", "4K"}
 	var priced []string

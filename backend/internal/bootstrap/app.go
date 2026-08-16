@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strconv"
 	"time"
 
 	"backend/internal/config"
@@ -124,9 +123,9 @@ func NewApp(ctx context.Context) (*App, error) {
 	appSettingsSvc := service.NewAppSettingsService(siteRepo, eventRepo, smtpSvc, rustfsClient)
 	imageAccessSvc := service.NewImageAccessService(cfg.GeneratedRoot, showcaseRepo, authSvc)
 	adobeClient := adobe.NewClient("clio-playground-web", "")
-	// The persisted site-wide proxy.url is used for authentication, account
-	// maintenance, required upstream bootstrap, and generation submits. Bulk
-	// media, polling, and downloads explicitly use direct local egress.
+	// The persisted proxy is restricted to providers whose protected control
+	// plane has a verified residential-egress requirement. Other providers start
+	// and remain direct; protected clients split bulk media onto direct egress.
 	chatGPTClient := chatgpt.NewClient("")
 	runwayClient := runway.NewClient("")
 	leonardoClient := leonardo.NewClient("")
@@ -138,21 +137,10 @@ func NewApp(ctx context.Context) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load global proxy setting: %w", err)
 	}
-	adobeClient.SetProxy(globalProxy)
 	chatGPTClient.SetProxy(globalProxy)
-	runwayClient.SetProxy(globalProxy)
-	leonardoClient.SetProxy(globalProxy)
-	kreaClient.SetProxy(globalProxy)
-	imagineClient.SetProxy(globalProxy)
 	grokClient.SetProxy(globalProxy)
 	oreateClient.SetProxy(globalProxy)
-	// Keep grok's x-statsig-id anti-bot recipe current by reading grok's own
-	// headless-browser signer output. Event-driven: seed from the persisted
-	// recipe, capture once at startup, then re-capture only on an anti-bot 403
-	// (a reship made the recipe stale). No polling.
-	startGrokStatsigRefresh(siteRepo)
 	customClient := custom.NewClient()
-	customClient.SetProxy(globalProxy)
 	v1Svc := service.NewV1Service(cfg, modelRepo, userRepo, eventRepo, tokenRepo, siteRepo, cgroupRepo, concSvc, adobeClient, chatGPTClient, runwayClient, leonardoClient, kreaClient, imagineClient, grokClient, oreateClient, customClient, rustfsClient)
 	siteSvc := service.NewSiteService(siteRepo, cfg.AppTitle)
 	showcaseSvc := service.NewShowcaseService(showcaseRepo)
@@ -161,7 +149,7 @@ func NewApp(ctx context.Context) (*App, error) {
 	cdkSvc := service.NewCDKService(cdkRepo, userRepo, siteRepo, orderRepo)
 	apiKeySvc := service.NewAPIKeyService(apiKeyRepo)
 	tokenSvc := service.NewTokenService(tokenRepo, refreshRepo, eventRepo, siteRepo, adobeClient, chatGPTClient, runwayClient, leonardoClient, kreaClient, imagineClient, grokClient, oreateClient, customClient)
-	refreshSvc := service.NewRefreshProfileService(refreshRepo, tokenRepo, siteRepo, adobeClient)
+	refreshSvc := service.NewRefreshProfileService(refreshRepo, tokenRepo, adobeClient)
 	// Enable refresh-then-retry on a mid-request Adobe 401 (re-mint access token
 	// from the cookie). Wired post-construction to avoid a ctor init cycle.
 	v1Svc.SetRefresh(refreshSvc)
@@ -203,33 +191,6 @@ func NewApp(ctx context.Context) (*App, error) {
 		Engine:            engine,
 		maintenanceCancel: loopCancel,
 	}, nil
-}
-
-// startGrokStatsigRefresh wires grok's headless x-statsig-id refresher to the
-// site-settings store (persisted across restarts) with an app-lifetime context.
-func startGrokStatsigRefresh(siteRepo *repo.SiteSettingRepository) {
-	const kHeader, kSuffix, kTrailer = "grok.statsig.header", "grok.statsig.suffix", "grok.statsig.trailer"
-	grok.StartStatsigAutoRefresh(context.Background(), 0,
-		func(ctx context.Context) (string, string, int, bool) {
-			h, _ := siteRepo.GetValue(ctx, kHeader)
-			s, _ := siteRepo.GetValue(ctx, kSuffix)
-			tv, _ := siteRepo.GetValue(ctx, kTrailer)
-			if h == "" || s == "" {
-				return "", "", 0, false
-			}
-			t, _ := strconv.Atoi(tv)
-			return h, s, t, true
-		},
-		func(ctx context.Context, h, s string, t int) {
-			if err := siteRepo.UpsertValues(ctx, map[string]string{
-				kHeader:  h,
-				kSuffix:  s,
-				kTrailer: strconv.Itoa(t),
-			}); err != nil {
-				log.Printf("grok statsig: persist recipe failed: %v", err)
-			}
-		},
-	)
 }
 
 func (a *App) Close() error {

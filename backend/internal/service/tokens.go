@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,6 +62,8 @@ type TokenService struct {
 	// kreaActivating guards the once-per-day krea /app activation sweep so the 60s
 	// maintenance tick can't pile up overlapping sweeps.
 	kreaActivating atomic.Bool
+	// oreateRetiring guards the authoritative low-credit cleanup sweep.
+	oreateRetiring atomic.Bool
 }
 
 func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileRepository, events *repo.EventRepository, settings *repo.SiteSettingRepository, adobeClient *adobe.Client, chatGPTClient *chatgpt.Client, runwayClient *runway.Client, leonardoClient *leonardo.Client, kreaClient *krea.Client, imagineClient *imagine.Client, grokClient *grok.Client, oreateClient *oreate.Client, customClient *custom.Client) *TokenService {
@@ -82,9 +85,9 @@ func NewTokenService(tokens *repo.TokenRepository, refresh *repo.RefreshProfileR
 	}
 }
 
-// applyProxy keeps each provider's proxy-eligible route synchronized with
-// proxy.url. Clients choose the proxy for authentication, maintenance, edge
-// bootstrap, and submits, while bulk media and polling stay direct.
+// applyProxy keeps only providers with a verified residential-egress
+// requirement synchronized with proxy.url. Other providers retain direct local
+// egress instead of consuming the metered proxy by default.
 func (s *TokenService) applyProxy(ctx context.Context) {
 	proxy := ""
 	if s.settings != nil {
@@ -95,32 +98,14 @@ func (s *TokenService) applyProxy(ctx context.Context) {
 			return
 		}
 	}
-	if s.adobe != nil {
-		s.adobe.SetProxy(proxy)
-	}
 	if s.chatgpt != nil {
 		s.chatgpt.SetProxy(proxy)
-	}
-	if s.runway != nil {
-		s.runway.SetProxy(proxy)
-	}
-	if s.leonardo != nil {
-		s.leonardo.SetProxy(proxy)
-	}
-	if s.krea != nil {
-		s.krea.SetProxy(proxy)
-	}
-	if s.imagine != nil {
-		s.imagine.SetProxy(proxy)
 	}
 	if s.grok != nil {
 		s.grok.SetProxy(proxy)
 	}
 	if s.oreate != nil {
 		s.oreate.SetProxy(proxy)
-	}
-	if s.custom != nil {
-		s.custom.SetProxy(proxy)
 	}
 }
 
@@ -1094,59 +1079,110 @@ func (s *TokenService) checkPendingGrok(tokenID, ssoToken string) {
 	s.finishPending(ctx, "grok", tokenID, "active", false, quotaMeta)
 }
 
-// RefreshGrokLiveness re-validates every live grok account each maintenance tick.
+const (
+	grokLivenessInterval  = 6 * time.Hour
+	grokLivenessBatchSize = 4
+)
+
+func selectGrokLivenessCandidates(items []model.TokenAccount, now time.Time) []model.TokenAccount {
+	type candidate struct {
+		account   model.TokenAccount
+		checkedAt int64
+	}
+	cutoff := now.Add(-grokLivenessInterval).Unix()
+	due := make([]candidate, 0, grokLivenessBatchSize)
+	for i := range items {
+		it := items[i]
+		if it.Pool != "grok" || it.Dead || it.Status == "disabled" || strings.TrimSpace(it.Value) == "" {
+			continue
+		}
+		checkedAt, ok := jsonMapInt(it.Meta, "grok_liveness_checked_at")
+		if !ok || checkedAt <= 0 {
+			checkedAt, _ = jsonMapInt(it.Meta, "cached_quota_at")
+		}
+		if int64(checkedAt) > cutoff {
+			continue
+		}
+		due = append(due, candidate{account: it, checkedAt: int64(checkedAt)})
+	}
+	sort.SliceStable(due, func(i, j int) bool {
+		if due[i].checkedAt != due[j].checkedAt {
+			return due[i].checkedAt < due[j].checkedAt
+		}
+		if !due[i].account.CreatedAt.Equal(due[j].account.CreatedAt) {
+			return due[i].account.CreatedAt.Before(due[j].account.CreatedAt)
+		}
+		return due[i].account.ID < due[j].account.ID
+	})
+	if len(due) > grokLivenessBatchSize {
+		due = due[:grokLivenessBatchSize]
+	}
+	out := make([]model.TokenAccount, len(due))
+	for i := range due {
+		out[i] = due[i].account
+	}
+	return out
+}
+
+// RefreshGrokLiveness re-validates a bounded batch of due Grok accounts.
 // Grok sso can't be renewed and has no reset-based death deadline (billingPeriodEnd
 // is only a credits-renewal date — the sso keeps working past it), so liveness is
 // probed directly through the authenticated credits endpoint. A missing
 // subscription is not an entitlement signal: current Grok accounts can expose
 // video without an ACTIVE subscription, so it must never become video_limited.
 // The credits balance is re-synced and 恢复时间 refreshed from its weekly reset.
+// Both successful and failed attempts record a timestamp so a bad account cannot
+// monopolize every maintenance tick or continuously consume residential traffic.
 func (s *TokenService) RefreshGrokLiveness(ctx context.Context) {
 	if s.grok == nil {
 		return
 	}
-	items, err := s.tokens.List(ctx)
+	items, err := s.tokens.ListByPool(ctx, "grok")
 	if err != nil {
+		return
+	}
+	items = selectGrokLivenessCandidates(items, time.Now())
+	if len(items) == 0 {
 		return
 	}
 	s.applyProxy(ctx)
 	for i := range items {
 		it := items[i]
-		if it.Pool != "grok" || it.Dead || it.Status == "disabled" || strings.TrimSpace(it.Value) == "" {
-			continue
-		}
 		// The credits endpoint is both the useful media balance and an authenticated
 		// liveness check. Avoid a second subscription request per account: apart from
 		// no longer being an entitlement signal, probing both endpoints for a large
 		// pool exhausts the clearance proxy's connection budget.
 		data, derr := s.grok.FetchCreditsBalance(ctx, it.Value)
+		metaPatch := map[string]any{"grok_liveness_checked_at": int(time.Now().Unix())}
 		if derr != nil && errors.Is(derr, grok.ErrAuth) {
 			// A single 401/403 can be an upstream blip or anti-bot response; leave the
-			// account alive and let the next tick retry it. Generation-time auth
+			// account alive until a later scheduled check. Generation-time auth
 			// handling remains the final authority for disabling a dead SSO.
+			_ = s.tokens.UpdateMergingMeta(ctx, "grok", it.ID, metaPatch, nil)
 			continue
 		}
 		if derr != nil {
 			// Other transient/network errors: keep the cached balance and retry later.
+			_ = s.tokens.UpdateMergingMeta(ctx, "grok", it.ID, metaPatch, nil)
 			continue
 		}
-		meta := cloneJSONMap(it.Meta)
-		meta["cached_quota_at"] = int(time.Now().Unix())
+		metaPatch["cached_quota_at"] = int(time.Now().Unix())
 		if rem, ok := data["remaining"].(int); ok {
-			meta["cached_quota_remaining"] = rem
+			metaPatch["cached_quota_remaining"] = rem
 		}
 		if used, ok := data["used"].(int); ok {
-			meta["cached_quota_used"] = used
+			metaPatch["cached_quota_used"] = used
 		}
 		if total, ok := data["total"].(int); ok {
-			meta["cached_quota_total"] = total
+			metaPatch["cached_quota_total"] = total
 		}
-		patch := map[string]any{"meta": meta}
+		patch := map[string]any{}
 		if reset := strings.TrimSpace(stringValue(data["reset_after"])); reset != "" {
 			patch["cached_quota_reset_after"] = reset
 		}
-		_, _ = s.tokens.Update(ctx, "grok", it.ID, patch)
+		_ = s.tokens.UpdateMergingMeta(ctx, "grok", it.ID, metaPatch, patch)
 	}
+	log.Printf("grok liveness: checked %d due account(s)", len(items))
 }
 
 // ImportOreateAccount stores only the website cookie and non-secret profile
@@ -1288,7 +1324,12 @@ func oreateAccountFromToken(item model.TokenAccount) oreate.Account {
 	return account
 }
 
-const oreateDeleteBelowCredits = 60
+const (
+	oreateDeleteBelowCredits         = 60
+	oreateRetirementBatchSize        = 4
+	oreateRetirementRetryInterval    = 30 * time.Minute
+	oreateRetirementCheckedAtMetaKey = "oreate_retirement_checked_at"
+)
 
 type oreateAccountDeleter interface {
 	Delete(ctx context.Context, pool, id string) (int64, error)
@@ -1316,11 +1357,119 @@ func deleteOreateAccountBelowCreditFloor(ctx context.Context, tokens oreateAccou
 	return true, nil
 }
 
+func selectOreateRetirementCandidates(items []model.TokenAccount, now time.Time) []model.TokenAccount {
+	cutoff := now.Add(-oreateRetirementRetryInterval).Unix()
+	type candidate struct {
+		account   model.TokenAccount
+		checkedAt int64
+	}
+	due := make([]candidate, 0, oreateRetirementBatchSize)
+	for i := range items {
+		item := items[i]
+		remaining, known := jsonMapInt(item.Meta, "cached_quota_remaining")
+		if !known || remaining >= oreateDeleteBelowCredits || strings.TrimSpace(item.Value) == "" {
+			continue
+		}
+		checkedAt, _ := jsonMapInt(item.Meta, oreateRetirementCheckedAtMetaKey)
+		if int64(checkedAt) > cutoff {
+			continue
+		}
+		due = append(due, candidate{account: item, checkedAt: int64(checkedAt)})
+	}
+	sort.SliceStable(due, func(i, j int) bool {
+		if due[i].checkedAt != due[j].checkedAt {
+			return due[i].checkedAt < due[j].checkedAt
+		}
+		return due[i].account.ID < due[j].account.ID
+	})
+	if len(due) > oreateRetirementBatchSize {
+		due = due[:oreateRetirementBatchSize]
+	}
+	out := make([]model.TokenAccount, len(due))
+	for i := range due {
+		out[i] = due[i].account
+	}
+	return out
+}
+
+// RetireLowCreditOreateAccounts revalidates scheduler-excluded legacy rows and
+// permanently removes them only after a fresh, successful balance response.
+// It runs off the maintenance tick so a cached reservation below the floor can
+// never cause a destructive delete by itself.
+func (s *TokenService) RetireLowCreditOreateAccounts(ctx context.Context) {
+	if s.oreate == nil || !s.oreateRetiring.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer s.oreateRetiring.Store(false)
+		items, err := s.tokens.ListByPool(ctx, "oreate")
+		if err != nil {
+			return
+		}
+		items = selectOreateRetirementCandidates(items, time.Now())
+		if len(items) == 0 {
+			return
+		}
+		s.applyProxy(ctx)
+		var wg sync.WaitGroup
+		var deleted atomic.Int32
+		for i := range items {
+			item := items[i]
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				probeCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+				defer cancel()
+				nowUnix := int(time.Now().Unix())
+				if markerErr := s.tokens.UpdateMergingMeta(probeCtx, "oreate", item.ID, map[string]any{
+					oreateRetirementCheckedAtMetaKey: nowUnix,
+				}, nil); markerErr != nil {
+					return
+				}
+				data, fetchErr := s.oreate.FetchCreditsBalance(probeCtx, oreateAccountFromToken(item))
+				if fetchErr != nil {
+					return
+				}
+				removed, deleteErr := deleteOreateAccountBelowCreditFloor(probeCtx, s.tokens, item.ID, data)
+				if deleteErr != nil {
+					log.Printf("oreate maintenance: could not delete low-credit account %s: %v", item.ID, deleteErr)
+					_, _ = s.tokens.Update(probeCtx, "oreate", item.ID, map[string]any{"status": "disabled"})
+					return
+				}
+				if removed {
+					deleted.Add(1)
+					return
+				}
+
+				metaPatch := map[string]any{
+					"cached_quota_at":                nowUnix,
+					oreateRetirementCheckedAtMetaKey: nowUnix,
+				}
+				if remaining, ok := data["remaining"].(int); ok {
+					metaPatch["cached_quota_remaining"] = remaining
+				}
+				if total, ok := data["total"].(int); ok {
+					metaPatch["cached_quota_total"] = total
+				}
+				patch := map[string]any{}
+				if reset := strings.TrimSpace(stringValue(data["reset_after"])); reset != "" {
+					patch["cached_quota_reset_after"] = reset
+				}
+				_ = s.tokens.UpdateMergingMeta(probeCtx, "oreate", item.ID, metaPatch, patch)
+			}()
+		}
+		wg.Wait()
+		if n := deleted.Load(); n > 0 {
+			log.Printf("oreate maintenance: retired %d low-credit account(s)", n)
+		}
+	}()
+}
+
 // ImportCustomAccount adds an upstream as a custom account: base_url + key, the
 // csv list of model ids it serves (empty = all), plus optional weight and
 // per-account concurrency. No probe — the account goes active immediately and is
-// matched to custom models by id at generation time. Calls follow the global
-// proxy setting, like every other provider.
+// matched to custom models by id at generation time. Custom upstream calls use
+// direct server egress and do not inherit the residential proxy setting.
 func (s *TokenService) ImportCustomAccount(ctx context.Context, baseURL, apiKey, models, name string, weight, concurrency int, tokenID string) (*model.TokenAccount, error) {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	apiKey = strings.TrimSpace(apiKey)

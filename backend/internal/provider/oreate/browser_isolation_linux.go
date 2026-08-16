@@ -3,15 +3,19 @@
 package oreate
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"os/user"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/chromedp/chromedp"
 )
+
+const chromiumShutdownWait = 5 * time.Second
 
 func browserIsolationOptions() []chromedp.ExecAllocatorOption {
 	if os.Geteuid() != 0 {
@@ -35,10 +39,28 @@ func browserIsolationOptions() []chromedp.ExecAllocatorOption {
 					break
 				}
 			}
-			cmd.SysProcAttr = &syscall.SysProcAttr{
-				Pdeathsig:  syscall.SIGKILL,
-				Credential: credential,
-			}
+			configureChromiumCommand(cmd, credential)
 		}),
 	}
+}
+
+func configureChromiumCommand(cmd *exec.Cmd, credential *syscall.Credential) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Pdeathsig:  syscall.SIGKILL,
+		Credential: credential,
+		Setpgid:    true,
+	}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
+			if errors.Is(err, syscall.ESRCH) {
+				return os.ErrProcessDone
+			}
+			return err
+		}
+		return nil
+	}
+	cmd.WaitDelay = chromiumShutdownWait
 }

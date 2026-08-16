@@ -64,6 +64,7 @@ services:
     restart: "no"
 
   backend:
+    init: true
     build:
       context: ./backend
     environment:

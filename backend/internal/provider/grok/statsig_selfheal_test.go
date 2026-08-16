@@ -82,9 +82,7 @@ func TestSelfHealStatsigE2E(t *testing.T) {
 	defer cancel()
 
 	c.ensureChallenge(ctx, client, token)
-	statsigMu.Lock()
-	ch, ok := statsigCache[token]
-	statsigMu.Unlock()
+	ch, ok := loadStatsigChallenge()
 	if !ok {
 		t.Fatal("challenge not cached (homepage fetch/derive failed)")
 	}
@@ -117,9 +115,7 @@ func TestStatsigEngineConcurrent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	c.ensureChallenge(ctx, client, token)
-	statsigMu.Lock()
-	ch, ok := statsigCache[token]
-	statsigMu.Unlock()
+	ch, ok := loadStatsigChallenge()
 	if !ok || ch.seedB64 == "" || ch.curvesJSON == "" {
 		t.Fatal("engine inputs not cached")
 	}

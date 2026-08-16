@@ -1,5 +1,108 @@
 # Design Notes
 
+### 2026-08-16 - Preserve accepted submits and close provider recovery loops
+
+**Change**: ChatGPT image-start finalization now recovers a fragmented
+`conversation_id` before classifying an SSE read error, and ChatGPT 403 account
+death requires an exact invalid/expired-token marker rather than a generic
+`unauthorized` substring. Grok anti-bot 403 responses invalidate the current
+process-wide Statsig snapshot so the next attempt enters the existing
+singleflight refresh. Maintenance revalidates Oreate accounts whose cached
+balance is below 60 and deletes them only after a fresh successful balance
+response. The authenticated proxy bridge tracks hijacked CONNECT tunnels and
+closes both ends during shutdown.
+
+**Reason**: A transport reset after upstream acceptance could otherwise submit
+the same image through another account; resource-level 403 messages could kill
+valid ChatGPT credentials; a TTL-fresh but rejected Grok signature could be
+reused for five minutes; scheduler-excluded Oreate rows had no path to the
+destructive balance predicate; and `http.Server.Close` does not own hijacked
+connections.
+
+**Impact**: Accepted ChatGPT jobs proceed to polling without duplicate submits,
+only explicit token failures poison ChatGPT accounts, Grok reships recover on
+the next attempt, legacy low-credit Oreate rows are retired in bounded batches,
+and bridge cancellation deterministically tears down active tunnels. Oreate
+maintenance probes at most four candidates concurrently and retries failed
+confirmations no more than once every 30 minutes.
+
+**Decision**: Destructive account actions require provider-specific affirmative
+evidence. Cached Oreate quota is a scheduling hint, not sufficient deletion
+evidence, because it may temporarily reflect an in-flight reservation.
+
+### 2026-08-16 - Scope image quality mapping to GPT Image 2
+
+**Change**: `/v1/images/generations` and `/v1/images/edits` derive native-provider
+aspect ratio and resolution from `size`. For the GPT Image 2 family only, an
+explicitly supplied `quality=low|medium|high` selects 1K/2K/4K when the internal
+`resolution` is absent.
+Custom multipart image edits now forward `quality` just like JSON generations.
+
+**Reason**: Native providers and unrelated custom models expose their own
+resolution-specific parameters and should not have their tier silently changed
+by an OpenAI quality enum. GPT Image 2 needs the adapter because its public
+contract uses `quality` for the requested tier, and both generation and edit
+endpoints must receive the same value.
+
+**Impact**: Non-GPT-Image-2 models use `size` or explicit `resolution` as before,
+and custom routes omit the outbound `quality` field for them. GPT Image 2
+requests can select a tier through `quality`, clamped to the tiers configured
+for that exact model. Thus native ChatGPT `gpt-image-2` remains 1K-only while
+`firefly-gpt-image-2` can select 4K. Explicit internal `resolution` remains
+authoritative on every route.
+
+**Decision**: Provider-native resolution is the source of truth. Quality-to-tier
+mapping is an adapter for the GPT Image 2 family only, not a global
+image-resolution rule.
+
+### 2026-08-16 - Selective residential egress and bounded Grok maintenance
+
+**Change**: The persisted `proxy.url` is now injected only into ChatGPT, Grok,
+and OreateAI clients. Adobe, Runway, Leonardo, Krea, Imagine, and Custom retain
+direct server egress. Grok liveness/credit maintenance checks at most four due
+accounts per sweep and gives each account a six-hour check interval. The
+account-independent Grok homepage challenge is one immutable process-wide
+snapshot; `singleflight` permits only one refresh, and requests continue using
+the last good snapshot while that refresh is in flight.
+
+**Reason**: Applying a metered residential proxy to every provider spent paid
+traffic on endpoints that work from the Hong Kong host. More importantly, the
+60-second maintenance sweep was rechecking the complete 93-account Grok pool
+continuously, while a token-keyed cache downloaded the same anonymous homepage
+once per account every five minutes.
+
+**Impact**: At the current pool size, scheduled Grok credit probes fall from up
+to 133,920 configured checks per day to about 372. Shared challenge discovery
+falls from up to 26,784 duplicate homepage reads per day to at most 288 at the
+existing five-minute freshness interval. Generation concurrency is unchanged:
+the maintenance batch is independent of account job slots, the Goja signer pool
+remains concurrent, and no mutex is held during network I/O. Failed liveness
+attempts also record their check time so bad accounts cannot monopolize each
+minute's batch.
+
+**Decision**: Preserve one residential route for each protected transaction
+instead of toggling a process-global transport during requests. Only idempotent
+media reads may later gain direct-first/proxy-fallback behavior; ambiguous
+generation POSTs must never be replayed across routes because that can duplicate
+jobs or charges.
+
+### 2026-08-16 - Grok video submit proxy affinity
+
+**Change**: Grok video parent-post creation at `/rest/media/post/create` now
+uses the same proxied TLS session as homepage challenge acquisition and the
+subsequent `/rest/app-chat/conversations/new` submit. Reference uploads,
+artifact polling, and downloads remain direct.
+
+**Reason**: The flow previously acquired its dynamic Statsig challenge through
+the configured proxy and then created the protected parent post through direct
+server egress. That mid-flow IP change caused Cloudflare to return an HTML
+`Just a moment` 403 even though the signer itself was current.
+
+**Impact**: Text-to-video and image-to-video parent posts keep challenge,
+cookies, TLS fingerprint, and source IP on one control-plane route. Only the
+small JSON create request moves to the proxy; reference bytes and generated
+artifacts retain direct egress.
+
 ### 2026-08-15 - Retire low-credit OreateAI accounts
 
 **Change**: A successful OreateAI balance read now permanently deletes the
@@ -116,6 +219,32 @@ dropping to the dedicated UID. This is weaker than Chromium's normal renderer
 sandbox. The dedicated UID, empty environment, temporary profile, and restricted
 egress are therefore mandatory compensating controls; do not run the browser as
 root or grant the backend `SYS_ADMIN` merely to enable namespaces.
+
+### 2026-08-16 - Oreate-only Chromium lifecycle and acknowledged ChatGPT stream closes
+
+**Change**: Chromium is now exclusive to OreateAI's official Banti signer.
+Grok's headless Statsig refresher, startup hook, proxy wiring, and 403 trigger
+were removed; Grok continues to fetch the live homepage challenge and execute
+the current signer chunk in Goja through its normal HTTP client. Oreate signer
+browsers run in dedicated process groups, cancellation kills the complete
+group, chromedp waits for the launched process, and the backend container uses
+an init process to reap any orphaned descendants. ChatGPT image submits now
+treat an SSE read error after `conversation_id` has arrived as an accepted
+submit and continue through conversation polling; pre-acknowledgement stream
+errors remain temporary upstream failures eligible for failover.
+
+**Reason**: Chromium was introduced specifically for OreateAI's browser-only
+signature and should not change other provider execution paths. The previous
+Grok background browser also rejected authenticated proxy arguments and left
+unnecessary browser descendants. Separately, ChatGPT's intentional
+post-acknowledgement HTTP/2 close was incorrectly aborting accepted image jobs.
+
+**Impact**: Grok returns to its pre-Chromium HTTP/Goja self-healing path and no
+longer starts browser processes at boot or after anti-bot responses. Oreate
+retains authenticated browser-proxy support while browser timeouts and exits
+have deterministic process-group cleanup plus PID 1 reaping. Accepted ChatGPT
+image jobs survive the expected SSE-to-polling handoff; proxy resets and
+malformed responses before acknowledgement remain temporary failures.
 
 ### 2026-08-14 - Unified control-plane and submit proxy, direct media egress, and unrestricted Adobe submits
 

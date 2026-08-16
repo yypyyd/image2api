@@ -93,7 +93,7 @@
 - 文本对话 `/v1/chat/completions`(普通 JSON + SSE 流式,兼容 OpenAI SDK)
 - 可直接复用后台现有 ChatGPT 账号池并使用真实模型名(`gpt-5-5-mini` / `gpt-5-5-thinking`);Grok 账号既可运行 Web fast 对话,也会按需用 SSO 自动授权 Grok Build OAuth,通过真实 `grok-4.5` 模型对话;还可走自定义 OpenAI 兼容上游
 - 文生图 `/v1/images/generations` · 图生图 `/v1/images/edits`(multipart 上传参考图) · 视频 `/v1/videos`(Sora 式异步:创建→轮询→`/content` 下载，支持按模型上传参考视频/音频及生成同步音频) · `/v1/models`(默认返回比例、分辨率、时长、参考素材上限和音频输出等扩展能力；`?extended=false` 可取严格 OpenAI 四字段对象，比例统一为 `W:H`)
-- **严格 OpenAI 入参**:`size` **同时决定比例 + 分辨率档**(图像看长边 → 1K/2K/4K,视频看短边 → 720p/1080p),改个 `base_url` + `api_key` 即接现有 OpenAI SDK
+- **严格 OpenAI 入参**:图像 `size` 决定比例和原生模型分辨率档(看长边 → 1K/2K/4K);仅 GPT Image 2 家族(`gpt-image-2` / `firefly-gpt-image-2`)使用显式 `quality=low/medium/high` 适配为 1K/2K/4K,其他模型忽略它对分辨率的影响;视频 `size` 看短边映射 720p/1080p,改个 `base_url` + `api_key` 即接现有 OpenAI SDK
 - 图片结果默认返回 **URL**,普通请求不下载、不做 base64 编码、不留存文件;显式传 `response_format=b64_json` 时才内联图片。携带 `Idempotency-Key` 的请求会把结果保存到账号私有存储,可在网关超时后通过任务查询恢复;站内 **/docs** 附「分辨率对照表」直接查 `size` 该传什么
 
 #### 🔁 多账号池 + 智能故障转移
@@ -106,7 +106,7 @@
 - 把任意 **OpenAI 兼容的 v1 端点**当成一个账号接入(填 `base_url` + `key`),无需写代码
 - **按 model id 自动路由**:上游声明支持哪些 id,生成该 id 时即走对应上游(可覆盖内置 provider);id 留空 = 全部
 - 模型管理里自由新建自定义模型(id / 文本·图像·视频类型 / 每请求价 / 分辨率·价 / 时长·价 / 多媒体参考能力),按本地价计费
-- 与内置账号一样遵循后台全局代理：配置 `proxy.url` 时，登录/账号校验、Cookie/Token 交换与刷新、Profile/配额/订阅查询、必要的上游 bootstrap/challenge 以及真正创建生成任务的 submit 请求走代理；项目/Session 准备、参考素材上传、状态轮询、结果下载、生成后的记录和 `/content` 均从服务器本机直连。Custom 带参考素材的 multipart 请求本身就是生成 submit，因此该请求整体走代理；上游可配权重与并发,与内置池统一调度
+- 自定义上游默认从服务器本机直连；上游可配权重与并发,与内置池统一调度。后台全局代理只用于 ChatGPT、Grok 与 OreateAI 已确认需要住宅出口的受保护控制面，不会无差别转发自定义上游流量
 
 #### 🔐 Token 自动保活
 - 一次性轮换 token(Krea / Imagine)**到期前 10 分钟主动续期**,新 token 自动落库
@@ -159,7 +159,7 @@ curl https://你的域名/v1/chat/completions \
   -H "Authorization: Bearer sk-xxx" -H "Content-Type: application/json" \
   -d '{"model":"gpt-5-5-mini","messages":[{"role":"user","content":"你好"}]}'
 
-# 文生图 —— 纯 OpenAI 参数:size 同时决定比例 + 分辨率档(长边 <1800→1K / <3500→2K / ≥3500→4K)
+# 文生图 —— 原生模型由 size 决定比例和分辨率;仅 GPT Image 2 家族适配 quality
 curl https://你的域名/v1/images/generations \
   -H "Authorization: Bearer sk-xxxx" \
   -H "Idempotency-Key: image-request-001" \
@@ -194,7 +194,7 @@ curl https://你的域名/v1/images/edits \
 
 > 域名 + HTTPS 由你自己的反向代理处理(本项目不内置证书签发)。
 
-**Docker(推荐)**:`docker compose up -d --build` 一条命令拉起 PostgreSQL + Redis + RustFS + 后端 + 前端(nginx **HTTP 监听容器 2000 端口**),把你的反向代理指到 `http://<本机>:2000`(端口用 `WEB_PORT` 改;要改密码 / 密钥 / `CORS_ORIGINS`(反代走 HTTPS 时把 `COOKIE_SECURE` 设为 `true`),直接改 `docker-compose.yml` 里对应值即可)。出站代理只由后台“全局代理”(`proxy.url`)控制：填写 `http://user:password@proxy:port`、HTTPS 或 SOCKS5 地址后，登录/账号校验、Cookie/Token 交换与刷新、Profile/配额/订阅查询、必要的上游 bootstrap/challenge 以及生成 submit 请求走代理；项目/Session 准备、参考素材上传、状态轮询、结果下载、生成后的记录和 `/content` 均从服务器本机直连。Custom 带参考素材的 multipart 请求本身就是生成 submit，因此完整 HTTPS 请求走代理。OreateAI 的上传令牌请求属于鉴权控制面并走全局代理，令牌签发后的 Google Storage 素材字节上传固定直连 `storage.googleapis.com`。OreateAI 运行镜像包含 Chromium，用于在临时浏览器配置中执行官网 Banti 签名。清空后这些请求也从本机直连。该值可能含凭据，请仅授予管理员、不要写入日志，并将代理出口限制为应用服务器。
+**Docker(推荐)**:`docker compose up -d --build` 一条命令拉起 PostgreSQL + Redis + RustFS + 后端 + 前端(nginx **HTTP 监听容器 2000 端口**),把你的反向代理指到 `http://<本机>:2000`(端口用 `WEB_PORT` 改;要改密码 / 密钥 / `CORS_ORIGINS`(反代走 HTTPS 时把 `COOKIE_SECURE` 设为 `true`),直接改 `docker-compose.yml` 里对应值即可)。后台“全局代理”(`proxy.url`)接受 `http://user:password@proxy:port`、HTTPS 或 SOCKS5 地址，但只注入 ChatGPT、Grok 与 OreateAI：这些平台的登录/账号校验、必要的 bootstrap/challenge、签名和受保护 submit 使用住宅出口；客户端内部已确认安全的参考素材字节上传、状态/成品读取则使用服务器直连。Adobe、Runway、Leonardo、Krea、Imagine 与 Custom 默认全程直连，不消耗住宅代理。OreateAI 的 Chromium 只用于临时浏览器配置中的官网 Banti 签名；上传令牌属于代理控制面，令牌签发后的 Google Storage 素材字节固定直连 `storage.googleapis.com`。清空 `proxy.url` 后 ChatGPT、Grok 与 OreateAI 的代理阶段也恢复直连。该值可能含凭据，请仅授予管理员、不要写入日志，并将代理出口限制为应用服务器。
 
 也可**从源码手动构建**,自备 **PostgreSQL · Redis · RustFS(或任意 S3)· 反向代理**:
 
@@ -277,7 +277,7 @@ backend/                       后端源码(Go)
 │   │   ├── krea/              Krea
 │   │   ├── imagine/           Imagine.art
 │   │   ├── oreate/            OreateAI Seedance(官网 Banti 签名)
-│   │   ├── custom/            自定义上游(OpenAI 兼容 v1,按 id 路由,生成 submit 走全局代理)
+│   │   ├── custom/            自定义上游(OpenAI 兼容 v1,按 id 路由,默认直连)
 │   │   └── epay/              易支付(mapi 下单 + 回调 MD5 验签,积分充值)
 │   ├── repo/                  数据访问层(用户 / 模型 / 账号 / 日志 / CDK / 订单 / 并发组…)
 │   ├── service/              业务逻辑(生成调度、计费、账号池、保活、维护)

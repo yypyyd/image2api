@@ -33,6 +33,7 @@ import (
 	tlsclient "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
 	"github.com/google/uuid"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -55,9 +56,7 @@ type Client struct {
 }
 
 func NewClient(proxy string) *Client {
-	c := &Client{proxy: strings.TrimSpace(proxy)}
-	SetStatsigProxy(c.proxy)
-	return c
+	return &Client{proxy: strings.TrimSpace(proxy)}
 }
 
 func (c *Client) SetProxy(proxy string) {
@@ -65,7 +64,6 @@ func (c *Client) SetProxy(proxy string) {
 	c.proxyMu.Lock()
 	c.proxy = proxy
 	c.proxyMu.Unlock()
-	SetStatsigProxy(proxy)
 }
 
 func (c *Client) proxyValue() string {
@@ -328,6 +326,7 @@ const (
 	statsigSaltPrefix     = "obfiowerehiring"
 	statsigAnimDuration   = 4096
 	statsigTTL            = 5 * time.Minute
+	statsigRefreshTimeout = 45 * time.Second
 )
 
 var (
@@ -337,12 +336,14 @@ var (
 
 	statsigMetaRe = regexp.MustCompile(`name="grok[^"]*verification"[^>]*content="([^"]+)"`)
 
-	statsigMu    sync.Mutex
-	statsigCache = map[string]statsigChallenge{} // keyed by sso token
+	statsigMu      sync.RWMutex
+	statsigCache   statsigChallenge
+	statsigRefresh singleflight.Group
 )
 
-// statsigChallenge is a resolved, self-consistent (header, salt) pair for one
-// grok session, derived from the homepage seed + curves.
+// statsigChallenge is an immutable, self-consistent (header, salt) snapshot
+// derived from the anonymous homepage. It is account-independent and shared by
+// every Grok session in this process.
 type statsigChallenge struct {
 	header    []byte
 	suffix    string
@@ -388,9 +389,49 @@ func envOr(key, def string) string {
 	return def
 }
 
-// ensureChallenge refreshes the cached (header, salt) for the session if missing
-// or stale. Any failure is non-fatal: statsigID then falls back to the static
-// defaults. An explicit env override disables dynamic fetching entirely.
+func loadStatsigChallenge() (statsigChallenge, bool) {
+	statsigMu.RLock()
+	defer statsigMu.RUnlock()
+	return statsigCache, !statsigCache.fetchedAt.IsZero()
+}
+
+func storeStatsigChallenge(ch statsigChallenge) {
+	statsigMu.Lock()
+	statsigCache = ch
+	statsigMu.Unlock()
+}
+
+func invalidateStatsigChallenge() {
+	statsigMu.Lock()
+	statsigCache = statsigChallenge{}
+	statsigMu.Unlock()
+}
+
+func beginStatsigChallengeRefresh(fetch func(context.Context) (statsigChallenge, error)) <-chan singleflight.Result {
+	return statsigRefresh.DoChan("global", func() (any, error) {
+		refreshCtx, cancel := context.WithTimeout(context.Background(), statsigRefreshTimeout)
+		defer cancel()
+
+		ch, err := fetch(refreshCtx)
+		if err != nil {
+			_, hasLastGood := loadStatsigChallenge()
+			fallback := "static defaults"
+			if hasLastGood {
+				fallback = "last good challenge"
+			}
+			log.Printf("grok statsig: self-heal failed, using %s (403 possible): %v", fallback, err)
+			return nil, err
+		}
+		storeStatsigChallenge(ch)
+		log.Printf("grok statsig: self-heal ok header[:6]=%x suffix=%s", ch.header[:6], ch.suffix)
+		return ch, nil
+	})
+}
+
+// ensureChallenge refreshes the process-wide homepage challenge if it is
+// missing or stale. A cold start waits for the first snapshot; once a last-good
+// snapshot exists, requests keep using it while one background refresh runs.
+// An explicit env override disables dynamic fetching entirely.
 func (c *Client) ensureChallenge(ctx context.Context, client tlsclient.HttpClient, token string) {
 	if token == "" || client == nil {
 		return
@@ -398,26 +439,50 @@ func (c *Client) ensureChallenge(ctx context.Context, client tlsclient.HttpClien
 	if os.Getenv("GROK_STATSIG_HEADER_HEX") != "" || os.Getenv("GROK_STATSIG_SUFFIX") != "" {
 		return
 	}
-	statsigMu.Lock()
-	cur, ok := statsigCache[token]
+	cur, ok := loadStatsigChallenge()
 	fresh := ok && time.Since(cur.fetchedAt) < statsigTTL
-	statsigMu.Unlock()
 	if fresh {
 		return
 	}
-	ch, err := fetchStatsigChallenge(ctx, client)
-	if err != nil {
-		// Silent fallback to static defaults is the #1 cause of a recurring
-		// "403 anti-bot": the homepage structure changed and we never notice.
-		// Surface it so the failure mode (fetch/parse broke vs. offsets rotated)
-		// is diagnosable from logs instead of guessing.
-		log.Printf("grok statsig: self-heal failed, using stale static defaults (403 likely): %v", err)
+	result := beginStatsigChallengeRefresh(func(refreshCtx context.Context) (statsigChallenge, error) {
+		return fetchStatsigChallenge(refreshCtx, client)
+	})
+	if ok {
+		// The existing snapshot is immutable and remains safe to use while the
+		// single refresh continues independently of this request.
 		return
 	}
-	log.Printf("grok statsig: self-heal ok header[:6]=%x suffix=%s", ch.header[:6], ch.suffix)
-	statsigMu.Lock()
-	statsigCache[token] = ch
-	statsigMu.Unlock()
+	select {
+	case <-ctx.Done():
+	case <-result:
+	}
+}
+
+func fetchStatsigHomepage(ctx context.Context, client tlsclient.HttpClient) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, apiBase+"/", nil)
+	if err != nil {
+		return "", err
+	}
+	req = req.WithContext(ctx)
+	req.Header = http.Header{
+		"accept":            {"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+		"accept-language":   {"en-US,en;q=0.9"},
+		"user-agent":        {userAgent},
+		http.HeaderOrderKey: {"accept", "accept-language", "user-agent"},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("statsig homepage http %d", resp.StatusCode)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
 }
 
 // fetchStatsigChallenge does a browser-free homepage GET and derives a
@@ -431,27 +496,10 @@ func (c *Client) ensureChallenge(ctx context.Context, client tlsclient.HttpClien
 // x-statsig-id header the server re-verifies), so the anonymous landing page is
 // the reliable source for every session.
 func fetchStatsigChallenge(ctx context.Context, client tlsclient.HttpClient) (statsigChallenge, error) {
-	req, err := http.NewRequest(http.MethodGet, apiBase+"/", nil)
+	html, err := fetchStatsigHomepage(ctx, client)
 	if err != nil {
 		return statsigChallenge{}, err
 	}
-	req = req.WithContext(ctx)
-	req.Header = http.Header{
-		"accept":            {"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
-		"accept-language":   {"en-US,en;q=0.9"},
-		"user-agent":        {userAgent},
-		http.HeaderOrderKey: {"accept", "accept-language", "user-agent"},
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return statsigChallenge{}, err
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return statsigChallenge{}, err
-	}
-	html := string(raw)
 
 	mm := statsigMetaRe.FindStringSubmatch(html)
 	if mm == nil {
@@ -675,11 +723,9 @@ func cubicBezierEase(x1, y1, x2, y2, p float64) float64 {
 // token binds to the request METHOD and URL path and to a coarse timestamp, so
 // it must be regenerated per request. See the package doc for the layout. It uses
 // the session's self-healed (header, salt) when available, else static defaults.
-func statsigID(path, method, token string) string {
+func statsigID(path, method, _ string) string {
 	header, suffix, trailer := statsigHeader, statsigSuffix, statsigTrailer
-	statsigMu.Lock()
-	ch, ok := statsigCache[token]
-	statsigMu.Unlock()
+	ch, ok := loadStatsigChallenge()
 	if ok {
 		header, suffix, trailer = ch.header, ch.suffix, ch.trailer
 		// Primary: run grok's own signer in goja (durable across reships). Falls

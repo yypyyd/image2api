@@ -48,16 +48,16 @@ function priceOf(m) {
 const imageParams = [
   ['model', 'string', '必填', '模型名(别名优先),见上表(图像)'],
   ['prompt', 'string', '必填', '文字描述'],
-  ['size', 'string', '可选', '宽x高,如 "1024x1024"。同时决定「比例」+「分辨率档」(按长边)。具体怎么填见下方对照表;留空 = 1:1 · 2K'],
-  ['quality', 'string', '可选', 'low / medium / high / auto,映射到模型支持的分辨率档'],
+  ['size', 'string', '可选', '宽x高,如 "1024x1024"。决定比例并按长边决定原生模型分辨率档;留空 = 1:1 · 2K'],
+  ['quality', 'string', '可选', 'low / medium / high / auto;仅 GPT Image 2 家族映射为 1K / 2K / 4K,其他模型不用于改变分辨率'],
   ['response_format', 'string', '可选', 'url(默认)或 b64_json'],
 ]
 const editParams = [
   ['image', 'file', '必填', '输入图;多张参考图重复 image[] 字段(multipart 文件上传)'],
   ['prompt', 'string', '必填', '编辑/参考描述'],
   ['model', 'string', '必填', '模型名(别名优先,需支持图生图)'],
-  ['size', 'string', '可选', '同图像:决定比例 + 分辨率档(见下方对照表)'],
-  ['quality', 'string', '可选', 'low / medium / high / auto'],
+  ['size', 'string', '可选', '同图像:决定比例和原生模型分辨率档(见下方对照表)'],
+  ['quality', 'string', '可选', 'low / medium / high / auto;仅 GPT Image 2 家族用于分辨率档位'],
   ['response_format', 'string', '可选', 'url(默认)或 b64_json'],
 ]
 const videoParams = [
@@ -412,7 +412,7 @@ async function copy(text) {
       <h2 class="text-lg font-semibold mb-1">图像分辨率对照表 · <code class="text-white/70 text-sm">size</code> 该传什么</h2>
       <p class="text-xs text-white/45 mb-3">
         左边选比例,上面选分辨率档,交叉格里就是 <code class="text-white/70">size</code> 要传的值(直接复制)。
-        没有 <code class="text-white/70">quality</code> 参数,图像分辨率只看 <code class="text-white/70">size</code> 的<strong class="text-white/70">长边</strong>。
+        原生模型的图像分辨率只看 <code class="text-white/70">size</code> 的<strong class="text-white/70">长边</strong>；<code class="text-white/70">quality</code> 仅用于 GPT Image 2 家族。
         档位必须是该模型支持的(见上方「可用模型」的分辨率列),不支持会自动回退到该模型最低档。
       </p>
       <div class="card overflow-hidden">
@@ -494,7 +494,7 @@ async function copy(text) {
         </ol>
         <p><strong class="text-white/90">计费(预扣)</strong>:请求<strong class="text-white/90">前</strong>按上表价格从你的 Key 账号预扣积分;文本按每请求固定价,图像/视频按档位价格。上游失败或返回无效结果会自动退回 —— 失败不扣费。</p>
         <p><strong class="text-white/90">模型发现</strong>:<code class="text-white/85 font-mono">GET /v1/models</code> 默认返回模型能力元数据，包括 <code class="text-white/70">kind</code>(image/video/text)、<code class="text-white/70">supported_ratios</code>、<code class="text-white/70">supported_resolutions</code>、<code class="text-white/70">max_reference_images</code>、<code class="text-white/70">max_reference_videos</code>、<code class="text-white/70">max_reference_audios</code>、<code class="text-white/70">max_reference_media</code>(三类参考素材合计上限)、<code class="text-white/70">supports_audio_output</code> 和 <code class="text-white/70">reference_mode</code>;视频模型还带 <code class="text-white/70">supported_durations</code>(如 <code class="text-white/70">["5s"]</code>),即 <code class="text-white/70">seconds</code> 可传的档位。需要严格 OpenAI 模型对象时使用 <code class="text-white/70">GET /v1/models?extended=false</code>。</p>
-        <p><strong class="text-white/90">参数映射</strong>:<code class="text-white/70">size</code>(宽x高)同时决定<strong class="text-white/90">比例 + 分辨率档</strong>(长边:&lt;1800→1K · 1800–3499→2K · ≥3500→4K),<code class="text-white/70">seconds</code>→视频时长。<strong class="text-white/90">没有 quality 参数</strong>,分辨率只看 size。档位须是该模型支持的(不支持会回退到该模型最低档);参数须落在定价表内否则 400,余额不足 402。</p>
+        <p><strong class="text-white/90">参数映射</strong>:<code class="text-white/70">size</code>(宽x高)决定原生模型的<strong class="text-white/90">比例 + 分辨率档</strong>(长边:&lt;1800→1K · 1800–3499→2K · ≥3500→4K),<code class="text-white/70">seconds</code>→视频时长。<code class="text-white/70">quality</code> 仅在 GPT Image 2 家族中映射为 1K/2K/4K。档位须是该模型支持的(不支持会回退到该模型最低档);参数须落在定价表内否则 400,余额不足 402。</p>
         <p><strong class="text-white/90">错误格式</strong>:与 OpenAI 一致,统一返回 <code class="text-white/85 font-mono">{{ '{ "error": { "message": "...", "type": "...", "param": null, "code": "..." } }' }}</code>;<code class="text-white/70">type</code> 为 <code class="text-white/70">invalid_request_error / insufficient_quota / rate_limit_error / server_error</code>。</p>
         <div class="pt-2 grid sm:grid-cols-2 gap-2 text-xs">
           <div class="flex items-center gap-2"><span class="badge-err">401</span> Key 无效 / 上游需重新授权</div>

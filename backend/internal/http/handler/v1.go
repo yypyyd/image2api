@@ -119,8 +119,9 @@ func (h *V1Handler) ChatCompletions(c *gin.Context) {
 }
 
 // ImageGenerations — OpenAI POST /v1/images/generations (text-to-image only).
-// Accepts exactly OpenAI's fields; size→aspect ratio and quality→resolution tier
-// are mapped server-side. Returns {created, data:[{url}]} by default.
+// Accepts exactly OpenAI's fields. Size drives resolution for ordinary image
+// models; quality selects a tier only for the GPT Image 2 family. Returns
+// {created, data:[{url}]} by default.
 func (h *V1Handler) ImageGenerations(c *gin.Context) {
 	principal, err := h.v1.Authenticate(c.Request.Context(), c.GetHeader("Authorization"))
 	if err != nil {

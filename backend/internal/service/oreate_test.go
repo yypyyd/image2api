@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"backend/internal/model"
 	"backend/internal/provider/oreate"
@@ -179,5 +180,88 @@ func TestTaskSpecificQuotaDoesNotDisableAccount(t *testing.T) {
 	}
 	if !shouldMarkAccountQuota(oreate.ErrQuotaExhausted) {
 		t.Fatal("upstream quota exhaustion should still update the account state")
+	}
+}
+
+func TestPrioritizeOreate80CreditAccounts(t *testing.T) {
+	account := func(id string, remaining any) model.TokenAccount {
+		meta := datatypes.JSONMap{}
+		if remaining != nil {
+			meta["cached_quota_remaining"] = remaining
+		}
+		return model.TokenAccount{ID: id, Meta: meta}
+	}
+	ids := func(items []model.TokenAccount) string {
+		out := make([]string, 0, len(items))
+		for _, item := range items {
+			out = append(out, item.ID)
+		}
+		return strings.Join(out, ",")
+	}
+
+	t.Run("cheap task puts 80 point tier first", func(t *testing.T) {
+		svc := &V1Service{}
+		items := []model.TokenAccount{
+			account("124-a", 124), account("unknown", nil), account("80-b", 80),
+			account("79", 79), account("80-a", 80), account("124-b", 124),
+		}
+		svc.prioritizeOreate80CreditAccounts(items, 80)
+		if got, want := ids(items), "80-b,80-a,124-a,unknown,79,124-b"; got != want {
+			t.Fatalf("account order = %s, want %s", got, want)
+		}
+	})
+
+	t.Run("expensive task keeps existing order", func(t *testing.T) {
+		svc := &V1Service{}
+		items := []model.TokenAccount{account("124", 124), account("80", 80)}
+		svc.prioritizeOreate80CreditAccounts(items, 81)
+		if got, want := ids(items), "124,80"; got != want {
+			t.Fatalf("account order = %s, want %s", got, want)
+		}
+	})
+
+	t.Run("cooling account stays behind healthy accounts", func(t *testing.T) {
+		svc := &V1Service{}
+		svc.coolDownAccount("oreate", "80-cooling")
+		items := []model.TokenAccount{account("80-cooling", 80), account("124-healthy", 124)}
+		svc.prioritizeOreate80CreditAccounts(items, 60)
+		if got, want := ids(items), "124-healthy,80-cooling"; got != want {
+			t.Fatalf("account order = %s, want %s", got, want)
+		}
+	})
+}
+
+func TestSelectOreateRetirementCandidates(t *testing.T) {
+	now := time.Unix(2_000_000_000, 0)
+	account := func(id string, remaining any, checkedAt int64) model.TokenAccount {
+		meta := datatypes.JSONMap{}
+		if remaining != nil {
+			meta["cached_quota_remaining"] = remaining
+		}
+		if checkedAt > 0 {
+			meta[oreateRetirementCheckedAtMetaKey] = checkedAt
+		}
+		return model.TokenAccount{ID: id, Pool: "oreate", Value: "cookie", Meta: meta}
+	}
+
+	items := []model.TokenAccount{
+		account("old-b", 20, now.Add(-time.Hour).Unix()),
+		account("at-floor", 60, 0),
+		account("unknown", nil, 0),
+		account("recent", 10, now.Add(-time.Minute).Unix()),
+		account("old-a", 59, now.Add(-time.Hour).Unix()),
+		account("never-c", 0, 0),
+		account("never-b", 1, 0),
+		account("never-a", 2, 0),
+	}
+	items = append(items, model.TokenAccount{ID: "missing-cookie", Meta: datatypes.JSONMap{"cached_quota_remaining": 0}})
+
+	got := selectOreateRetirementCandidates(items, now)
+	ids := make([]string, 0, len(got))
+	for _, item := range got {
+		ids = append(ids, item.ID)
+	}
+	if want := "never-a,never-b,never-c,old-a"; strings.Join(ids, ",") != want {
+		t.Fatalf("retirement candidates = %v, want %s", ids, want)
 	}
 }

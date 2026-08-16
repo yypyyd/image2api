@@ -36,7 +36,10 @@ repository layers.
 
 The Docker runtime also supplies a dedicated unprivileged `chrome` user and a
 pinned GlobalSign intermediate in both the system and Chromium NSS certificate
-stores. See [DESIGN.md](DESIGN.md) for the security boundary.
+stores. Chromium is used only by this provider. Each signer browser runs in its
+own process group; cancellation terminates the group, chromedp waits for the
+browser process, and the backend container's init process reaps any orphaned
+descendants. See [DESIGN.md](DESIGN.md) for the security boundary.
 
 ## Account Lifecycle
 
@@ -45,7 +48,10 @@ balance response contains an integer `remaining` value below 60. A balance of
 exactly 60 is retained. Missing values, malformed responses, timeouts, proxy
 failures, and other inconclusive probes never trigger deletion. This policy is
 applied after import validation, an administrator quota refresh, and successful
-or quota-exhausted generation reconciliation.
+or quota-exhausted generation reconciliation. The maintenance loop also finds
+legacy or interrupted rows whose cached balance is already below 60, rechecks
+their live balance in bounded batches, and applies the same authoritative
+predicate. Failed confirmations are throttled for 30 minutes.
 
 Before dispatch, the service resolves the request's official point cost from
 its `aiType` and excludes every account with a known cached balance below that
@@ -61,6 +67,12 @@ where two requests could otherwise both observe the same stale balance. An
 upstream quota response only changes the account to the global quota state when
 balance reconciliation cannot establish that the account still has enough
 points to remain useful for cheaper requests.
+
+For requests costing at most 80 points, accounts with a confirmed balance of
+exactly 80 are ordered ahead of other balance tiers. This spends the low tier
+on work it can afford and preserves higher balances for expensive requests.
+Cooling status still takes precedence, and accounts within the 80-point tier
+retain their existing weight and round-robin order.
 
 ## Internal Usage
 
@@ -104,6 +116,6 @@ standard input. They never create a video or print credentials or token bodies.
 - `upload.go`: Oreate upload-token exchange and fixed-host GCS resumable upload.
 - `video.go`: chat creation, SSE generation, parsing, and artifact download.
 - `signer.go`: Chromium signer, Banti report barrier, and proxy configuration.
-- `proxy_bridge.go`: loopback authenticated HTTP proxy bridge for Chromium.
+- `proxy_bridge.go`: Oreate adapter for the shared authenticated proxy bridge.
 - `browser_isolation_*.go`: Linux child-process privilege isolation.
 - `*_test.go`: deterministic protocol, proxy, model, and deployment probes.

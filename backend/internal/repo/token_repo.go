@@ -87,6 +87,26 @@ func (r *TokenRepository) Update(ctx context.Context, pool, id string, patch map
 	return r.Get(ctx, pool, id)
 }
 
+// UpdateMergingMeta atomically merges selected JSON keys while updating any
+// accompanying scalar columns. This avoids replacing provider credentials or
+// quota fields written concurrently from a stale in-memory account snapshot.
+func (r *TokenRepository) UpdateMergingMeta(ctx context.Context, pool, id string, metaPatch map[string]any, patch map[string]any) error {
+	raw, err := json.Marshal(metaPatch)
+	if err != nil {
+		return err
+	}
+	updates := make(map[string]any, len(patch)+2)
+	for key, value := range patch {
+		updates[key] = value
+	}
+	updates["meta"] = gorm.Expr("COALESCE(meta, '{}'::jsonb) || CAST(? AS jsonb)", string(raw))
+	updates["updated_at"] = time.Now()
+	return r.db.WithContext(ctx).
+		Model(&model.TokenAccount{}).
+		Where("pool = ? AND id = ?", pool, id).
+		Updates(updates).Error
+}
+
 // ReserveQuota atomically pre-deducts `amount` from an account's cached image
 // token balance under a row lock, so concurrent picks of the same near-empty
 // account can never over-commit it. Returns:
