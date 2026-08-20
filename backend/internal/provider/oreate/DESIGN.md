@@ -113,6 +113,22 @@ Quota keys are merged without replacing unrelated account metadata. An
 administrator-disabled or dead row is never reactivated merely because a
 balance refresh succeeds.
 
+An explicit upstream `212361`/`spam user` response is classified separately
+from generic Banti risk-control failures. The service marks the affected account
+`disabled` and `dead`, removes it from future scheduling, and fails over without
+counting the permanent account failure against the temporary-failure cap.
+Transport and signer timeouts remain eligible for bounded failover and never
+disable an account.
+
+Oreate awards 50 bonus credits for an account's first successful image
+generation and only pays them out when the site's first-use endpoint asks for
+the grant. Importing a new account therefore generates one image on the
+cheapest tier (Kling3.0 Omini, 1k, 1:1, 6 credits), requests the grant even
+when the stream broke, and polls the balance until the award lands. The
+attempt is stamped in account metadata before any credit is spent, so a
+re-imported cookie or a crashed probe never pays for a second image. The image
+itself is discarded.
+
 The maintenance loop closes the recovery gap for scheduler-excluded rows. It
 selects both quota-state accounts and legacy active accounts cached below the
 floor, records a probe timestamp, and fetches at most four balances
@@ -221,6 +237,12 @@ risk-control hosts.
   hostname allowlist.
 
 ## Change History
+
+### 2026-08-19 - First-use bonus claimed at import
+
+- Added a low-tier image generation plus first-use grant request on import.
+- Stamped the one-time attempt in metadata and refreshed the cached balance
+  once the award landed.
 
 ### 2026-08-17 - Recoverable low-credit quota state
 

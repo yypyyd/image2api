@@ -12,9 +12,30 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 )
 
 var videoURLPattern = regexp.MustCompile(`https?://[^\s"'<>\\]+?\.mp4(?:\?[^\s"'<>\\]*)?`)
+
+// Oreate publishes every rendered video under a CDN path derived from the
+// stream's logId, so a stream that drops after the job was accepted can still
+// be recovered instead of discarding a submit the account already paid for.
+const (
+	videoCDNBase          = "https://cdn.oreateai.com/aivideo/videodownload"
+	videoRecoveryInterval = 15 * time.Second
+	videoRecoveryWindow   = 6 * time.Minute
+)
+
+// errStreamIncomplete marks a stream that neither produced a result nor an
+// upstream verdict — the only case where logId recovery is meaningful.
+var errStreamIncomplete = errors.New("stream ended without a video URL")
+
+// videoStream is what the SSE consumer learned before the stream ended.
+type videoStream struct {
+	VideoURL string
+	LogID    string
+	Started  bool
+}
 
 type videoRequest struct {
 	ClientType  string         `json:"clientType"`
@@ -161,7 +182,7 @@ func (c *Client) GenerateVideo(ctx context.Context, account Account, options Vid
 		return nil, nil, err
 	}
 
-	chatID, err := c.createVideoChat(ctx, account)
+	chatID, err := c.createChat(ctx, account, "aiVideo")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -174,6 +195,9 @@ func (c *Client) GenerateVideo(ctx context.Context, account Account, options Vid
 	}
 	if sig.BID != "" {
 		account.BID = sig.BID
+	}
+	if sig.Cookie != "" {
+		account.Cookie = mergeCookies(account.Cookie, sig.Cookie)
 	}
 	config := videoConfig{
 		ModelName: modelName, Ratio: options.Ratio, Resolution: resolution, Duration: options.Duration,
@@ -239,11 +263,19 @@ func (c *Client) GenerateVideo(ctx context.Context, account Account, options Vid
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		return nil, nil, classifyUpstreamError(resp.StatusCode, string(body))
 	}
-	videoURL, err := parseVideoSSE(resp.Body)
+	stream, err := parseVideoSSE(resp.Body)
+	videoURL := stream.VideoURL
 	if err != nil {
-		return nil, nil, err
+		if !errors.Is(err, errStreamIncomplete) || !stream.Started || stream.LogID == "" {
+			return nil, nil, err
+		}
+		recovered := c.awaitVideoByLogID(ctx, stream.LogID)
+		if recovered == "" {
+			return nil, nil, err
+		}
+		videoURL = recovered
 	}
-	meta := map[string]any{"provider": "oreate", "chat_id": chatID, "video_url": videoURL}
+	meta := map[string]any{"provider": "oreate", "chat_id": chatID, "video_url": videoURL, "log_id": stream.LogID}
 	if !options.DownloadResult {
 		return nil, meta, nil
 	}
@@ -254,8 +286,8 @@ func (c *Client) GenerateVideo(ctx context.Context, account Account, options Vid
 	return data, meta, nil
 }
 
-func (c *Client) createVideoChat(ctx context.Context, account Account) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint("/oreate/create/chat"), strings.NewReader(`{"type":"aiVideo"}`))
+func (c *Client) createChat(ctx context.Context, account Account, chatType string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint("/oreate/create/chat"), strings.NewReader(`{"type":"`+chatType+`"}`))
 	if err != nil {
 		return "", err
 	}
@@ -292,10 +324,59 @@ func parseCreateChat(body []byte) (string, error) {
 	return strings.TrimSpace(data.ChatID), nil
 }
 
-func parseVideoSSE(r io.Reader) (string, error) {
+// awaitVideoByLogID polls the logId path until the rendered file shows up, and
+// returns an empty string once the bounded window elapses.
+func (c *Client) awaitVideoByLogID(ctx context.Context, logID string) string {
+	rawURL := c.videoCDNURL(logID)
+	deadline := time.Now().Add(videoRecoveryWindow)
+	for {
+		if c.videoReady(ctx, rawURL) {
+			return rawURL
+		}
+		if !time.Now().Before(deadline) {
+			return ""
+		}
+		select {
+		case <-ctx.Done():
+			return ""
+		case <-time.After(videoRecoveryInterval):
+		}
+	}
+}
+
+func (c *Client) videoReady(ctx context.Context, rawURL string) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, rawURL, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := c.httpClient(false).Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<10))
+	return resp.StatusCode == http.StatusOK
+}
+
+func (c *Client) videoCDNURL(logID string) string {
+	base := strings.TrimRight(strings.TrimSpace(c.cdnBaseURL), "/")
+	if base == "" {
+		base = videoCDNBase
+	}
+	return base + "/" + strings.TrimSpace(logID) + ".mp4"
+}
+
+// newStreamScanner reads one SSE line at a time; generation streams carry
+// message payloads far beyond the default scanner limit.
+func newStreamScanner(r io.Reader) *bufio.Scanner {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64<<10), 4<<20)
-	videoURL := ""
+	return scanner
+}
+
+func parseVideoSSE(r io.Reader) (videoStream, error) {
+	scanner := newStreamScanner(r)
+	stream := videoStream{}
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if !strings.HasPrefix(line, "data:") {
@@ -308,27 +389,34 @@ func parseVideoSSE(r io.Reader) (string, error) {
 		var event map[string]any
 		if err := json.Unmarshal([]byte(payload), &event); err != nil {
 			if found := extractVideoURL(payload); found != "" {
-				videoURL = found
+				stream.VideoURL = found
 			}
 			continue
 		}
+		if logID := scalarString(event["logId"], ""); logID != "" {
+			stream.LogID = logID
+		}
+		switch strings.ToLower(scalarString(event["event"], "")) {
+		case "start", "generating":
+			stream.Started = true
+		}
 		if found := findVideoURL(event); found != "" {
-			videoURL = found
+			stream.VideoURL = found
 		}
 		if strings.EqualFold(scalarString(event["event"], ""), "error") {
 			data, _ := event["data"].(map[string]any)
 			code := intFromAny(data["code"])
 			msg := scalarString(data["msg"], scalarString(data["message"], "upstream error"))
-			return "", classifyUpstreamError(code, msg)
+			return stream, classifyUpstreamError(code, msg)
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("%w: read stream: %v", ErrTemporaryUpstream, err)
+		return stream, fmt.Errorf("%w: %w: read stream: %v", ErrTemporaryUpstream, errStreamIncomplete, err)
 	}
-	if videoURL == "" {
-		return "", fmt.Errorf("%w: stream ended without a video URL", ErrTemporaryUpstream)
+	if stream.VideoURL == "" {
+		return stream, fmt.Errorf("%w: %w", ErrTemporaryUpstream, errStreamIncomplete)
 	}
-	return videoURL, nil
+	return stream, nil
 }
 
 func findVideoURL(v any) string {
@@ -372,6 +460,12 @@ func classifyUpstreamError(code int, message string) error {
 	lower := strings.ToLower(msg)
 	switch {
 	case code == 212361 || strings.Contains(lower, "spam user") || strings.Contains(lower, "risk control"):
+		if code == 212361 || strings.Contains(lower, "spam user") {
+			// An explicit spam-user response is an account-level risk decision.
+			// Keep it distinguishable from transient Banti risk-control failures so
+			// the scheduler can remove the affected account from rotation.
+			return fmt.Errorf("%w: %w: %s", ErrSpamUser, ErrRiskControl, msg)
+		}
 		return fmt.Errorf("%w: %s", ErrRiskControl, msg)
 	case code == 200017 || strings.Contains(lower, "point exceed") || strings.Contains(lower, "insufficient") || strings.Contains(lower, "not enough point"):
 		return fmt.Errorf("%w: %s", ErrQuotaExhausted, msg)

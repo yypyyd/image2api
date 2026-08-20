@@ -48,8 +48,8 @@ func TestParseVideoSSE(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := parseVideoSSE(strings.NewReader(tt.body))
-			if err != nil || got != tt.want {
-				t.Fatalf("parseVideoSSE() = %q, %v; want %q", got, err, tt.want)
+			if err != nil || got.VideoURL != tt.want {
+				t.Fatalf("parseVideoSSE() = %q, %v; want %q", got.VideoURL, err, tt.want)
 			}
 		})
 	}
@@ -72,6 +72,97 @@ func TestParseVideoSSEError(t *testing.T) {
 		if !errors.Is(err, tt.want) {
 			t.Errorf("code %d error = %v, want %v", tt.code, err, tt.want)
 		}
+		if tt.code == 212361 && !errors.Is(err, ErrSpamUser) {
+			t.Errorf("code %d error = %v, want ErrSpamUser", tt.code, err)
+		}
+	}
+}
+
+func TestParseVideoSSEIncompleteStream(t *testing.T) {
+	body := "data: {\"event\":\"start\",\"logId\":\"2098276034\"}\n\ndata: {\"event\":\"generating\",\"logId\":\"2098276034\"}\n"
+	got, err := parseVideoSSE(strings.NewReader(body))
+	if !errors.Is(err, errStreamIncomplete) || !errors.Is(err, ErrTemporaryUpstream) {
+		t.Fatalf("parseVideoSSE() error = %v", err)
+	}
+	if !got.Started || got.LogID != "2098276034" || got.VideoURL != "" {
+		t.Fatalf("parseVideoSSE() = %#v", got)
+	}
+}
+
+// A stream that drops after the job was accepted must still hand back the
+// rendered file: the submit already spent the account's credits.
+func TestGenerateVideoRecoversDroppedStreamByLogID(t *testing.T) {
+	cdnHits := 0
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/777.mp4" {
+			http.NotFound(w, r)
+			return
+		}
+		cdnHits++
+		_, _ = w.Write([]byte("recovered-mp4"))
+	}))
+	defer cdn.Close()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oreate/create/chat" {
+			_, _ = io.WriteString(w, `{"status":{"code":0},"data":{"chatId":"chat-3"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, "data: {\"event\":\"start\",\"logId\":\"777\"}\n")
+	}))
+	defer server.Close()
+	client := NewClient("")
+	client.baseURL = server.URL
+	client.cdnBaseURL = cdn.URL
+	client.SetSigner(stubSigner{sig: Signature{JT: "signed"}})
+	data, meta, err := client.GenerateVideo(context.Background(), Account{Cookie: "ouss=x"}, VideoOptions{
+		ModelID: "seedance-2.0-mini", Prompt: "hello", Ratio: "16:9", Resolution: "480p",
+		Duration: 5, DownloadResult: true,
+	})
+	if err != nil || string(data) != "recovered-mp4" || cdnHits == 0 {
+		t.Fatalf("GenerateVideo() = %q, %v", data, err)
+	}
+	if meta["video_url"] != cdn.URL+"/777.mp4" || meta["log_id"] != "777" {
+		t.Fatalf("meta = %#v", meta)
+	}
+}
+
+// Without a logId there is nothing to recover, and an upstream verdict such as
+// a spam-user rejection must never be retried as a recovery.
+func TestGenerateVideoSkipsRecoveryWithoutRecoverableJob(t *testing.T) {
+	streams := map[string]string{
+		"no-log-id": "data: {\"event\":\"start\"}\n",
+		"spam-user": "data: {\"event\":\"start\",\"logId\":\"777\"}\n\ndata: {\"event\":\"error\",\"logId\":\"777\",\"data\":{\"code\":212361,\"msg\":\"spam user\"}}\n",
+	}
+	for name, stream := range streams {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/oreate/create/chat" {
+					_, _ = io.WriteString(w, `{"status":{"code":0},"data":{"chatId":"chat-4"}}`)
+					return
+				}
+				_, _ = io.WriteString(w, stream)
+			}))
+			defer server.Close()
+			cdnCalls := 0
+			cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				cdnCalls++
+				_, _ = w.Write([]byte("unexpected"))
+			}))
+			defer cdn.Close()
+			client := NewClient("")
+			client.baseURL = server.URL
+			client.cdnBaseURL = cdn.URL
+			client.SetSigner(stubSigner{sig: Signature{JT: "signed"}})
+			_, _, err := client.GenerateVideo(context.Background(), Account{Cookie: "ouss=x"}, VideoOptions{
+				ModelID: "seedance-2.0-mini", Prompt: "hello", Ratio: "16:9", Resolution: "480p", Duration: 5,
+			})
+			if err == nil || cdnCalls != 0 {
+				t.Fatalf("GenerateVideo() error = %v, cdn calls = %d", err, cdnCalls)
+			}
+			if name == "spam-user" && !errors.Is(err, ErrSpamUser) {
+				t.Fatalf("GenerateVideo() error = %v, want ErrSpamUser", err)
+			}
+		})
 	}
 }
 
@@ -119,6 +210,33 @@ func TestGenerateVideoRequestAndDownload(t *testing.T) {
 	}
 	if gotRequest.JT != "signed" || gotRequest.Extra.BID != "browser-bid" || gotRequest.Extra.DeviceID != "device-1" || len(gotRequest.Messages) != 1 || gotRequest.Messages[0].Content != "hello" {
 		t.Fatalf("request auth/content = %#v", gotRequest)
+	}
+}
+
+// The stream request must carry the tracking cookies the signer browser minted
+// alongside the stored auth cookies; stored values win on name conflicts.
+func TestGenerateVideoMergesSignerCookies(t *testing.T) {
+	var streamCookie string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oreate/create/chat" {
+			_, _ = io.WriteString(w, `{"status":{"code":0},"data":{"chatId":"chat-1"}}`)
+			return
+		}
+		streamCookie = r.Header.Get("Cookie")
+		_, _ = io.WriteString(w, "data: {\"event\":\"end\",\"data\":{\"url\":\"https://example.com/video.mp4\"}}\n")
+	}))
+	defer server.Close()
+	client := NewClient("")
+	client.baseURL = server.URL
+	client.SetSigner(stubSigner{sig: Signature{JT: "signed", Cookie: "_ga=GA1; __bid_n=fresh; OUID=browser-ouid"}})
+	_, _, err := client.GenerateVideo(context.Background(), Account{Cookie: "OUID=device-1; ouss=session"}, VideoOptions{
+		ModelID: "seedance-2.0-mini", Prompt: "hello", Ratio: "16:9", Resolution: "480p", Duration: 5,
+	})
+	if err != nil {
+		t.Fatalf("GenerateVideo() error = %v", err)
+	}
+	if streamCookie != "OUID=device-1; ouss=session; _ga=GA1; __bid_n=fresh" {
+		t.Fatalf("stream cookie = %q", streamCookie)
 	}
 }
 

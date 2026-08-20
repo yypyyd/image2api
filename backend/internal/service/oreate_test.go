@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -166,6 +167,84 @@ func TestTaskSpecificQuotaDoesNotDisableAccount(t *testing.T) {
 	if !shouldMarkAccountQuota(oreate.ErrQuotaExhausted) {
 		t.Fatal("upstream quota exhaustion should still update the account state")
 	}
+}
+
+func TestOreateErrClass(t *testing.T) {
+	spam := fmt.Errorf("%w: %w: spam user", oreate.ErrSpamUser, oreate.ErrRiskControl)
+	tests := []struct {
+		name                    string
+		err                     error
+		wantAuth, wantQuota     bool
+		wantTemporary, wantDead bool
+	}{
+		{name: "auth", err: oreate.ErrAuth, wantAuth: true},
+		{name: "quota", err: oreate.ErrQuotaExhausted, wantQuota: true},
+		{name: "generic risk control", err: oreate.ErrRiskControl, wantTemporary: true},
+		{name: "temporary upstream", err: oreate.ErrTemporaryUpstream, wantTemporary: true},
+		{name: "spam user", err: spam, wantTemporary: true},
+		{name: "request error", err: errors.New("bad request")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			auth, quota, temporary, dead := oreateErrClass(tt.err)
+			if auth != tt.wantAuth || quota != tt.wantQuota || temporary != tt.wantTemporary || dead != tt.wantDead {
+				t.Fatalf("oreateErrClass() = (%v, %v, %v, %v), want (%v, %v, %v, %v)",
+					auth, quota, temporary, dead, tt.wantAuth, tt.wantQuota, tt.wantTemporary, tt.wantDead)
+			}
+		})
+	}
+}
+
+func TestOreateSpamQuarantine(t *testing.T) {
+	account := func(id string) model.TokenAccount {
+		return model.TokenAccount{ID: id, Pool: "oreate", Status: "active", Value: "cookie"}
+	}
+	ids := func(items []model.TokenAccount) string {
+		out := make([]string, 0, len(items))
+		for _, item := range items {
+			out = append(out, item.ID)
+		}
+		return strings.Join(out, ",")
+	}
+
+	t.Run("quarantined account is dropped from the candidate set", func(t *testing.T) {
+		svc := &V1Service{}
+		svc.quarantineOreateSpamAccount("flagged")
+		got := svc.dropOreateSpamQuarantined([]model.TokenAccount{account("flagged"), account("healthy")})
+		if ids(got) != "healthy" {
+			t.Fatalf("candidates = %s, want healthy", ids(got))
+		}
+	})
+
+	t.Run("expired quarantine is removed and account returns", func(t *testing.T) {
+		svc := &V1Service{}
+		svc.oreateSpam.Store("flagged", time.Now().Add(-time.Second))
+		got := svc.dropOreateSpamQuarantined([]model.TokenAccount{account("flagged")})
+		if ids(got) != "flagged" {
+			t.Fatalf("candidates = %s, want flagged", ids(got))
+		}
+		if _, ok := svc.oreateSpam.Load("flagged"); ok {
+			t.Fatal("expired quarantine entry was not removed")
+		}
+	})
+
+	t.Run("fully quarantined pool keeps all candidates for re-probe", func(t *testing.T) {
+		svc := &V1Service{}
+		svc.quarantineOreateSpamAccount("a")
+		svc.quarantineOreateSpamAccount("b")
+		got := svc.dropOreateSpamQuarantined([]model.TokenAccount{account("a"), account("b")})
+		if ids(got) != "a,b" {
+			t.Fatalf("candidates = %s, want a,b", ids(got))
+		}
+	})
+
+	t.Run("empty account ID is never quarantined", func(t *testing.T) {
+		svc := &V1Service{}
+		svc.quarantineOreateSpamAccount("")
+		if svc.oreateSpamQuarantined("") {
+			t.Fatal("empty account ID must not be quarantined")
+		}
+	})
 }
 
 func TestPrioritizeOreate80CreditAccounts(t *testing.T) {

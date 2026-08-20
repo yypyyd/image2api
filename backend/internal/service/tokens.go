@@ -1207,11 +1207,15 @@ func (s *TokenService) ImportOreateAccount(ctx context.Context, cookie, email, o
 		"reg_ts":        regTS,
 		"vip":           strings.TrimSpace(vip),
 	}
+	// Only a brand new row may spend credits on the first-use image: re-importing
+	// a refreshed cookie for a known account must never pay for it again.
+	fresh := true
 	item, err := s.createToken(ctx, "oreate", tokenID, cookie, "pending", meta)
 	if err != nil {
 		if !errors.Is(err, gorm.ErrDuplicatedKey) {
 			return nil, err
 		}
+		fresh = false
 		item, err = s.tokens.Update(ctx, "oreate", tokenID, map[string]any{
 			"value": cookie, "status": "pending", "dead": false, "meta": meta,
 		})
@@ -1225,11 +1229,11 @@ func (s *TokenService) ImportOreateAccount(ctx context.Context, cookie, email, o
 		}
 	}
 	account := oreate.Account{Cookie: cookie, Email: email, OUID: strings.TrimSpace(ouid), UserAgent: strings.TrimSpace(userAgent), RegTS: regTS, VIP: strings.TrimSpace(vip)}
-	go s.checkPendingOreate(tokenID, account)
+	go s.checkPendingOreate(tokenID, account, fresh)
 	return item, nil
 }
 
-func (s *TokenService) checkPendingOreate(tokenID string, account oreate.Account) {
+func (s *TokenService) checkPendingOreate(tokenID string, account oreate.Account, claimFirstImage bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("token import: oreate pending check panicked for %s: %v", tokenID, r)
@@ -1285,6 +1289,9 @@ func (s *TokenService) checkPendingOreate(tokenID string, account oreate.Account
 		// Network and upstream errors are inconclusive; keep the account usable and
 		// let the live quota path retry later.
 		s.finishPending(ctx, "oreate", tokenID, "active", false, nil)
+		if claimFirstImage {
+			go s.claimOreateFirstImage(tokenID, account)
+		}
 		return
 	}
 	quotaMeta := map[string]any{"cached_quota_at": int(time.Now().Unix())}
@@ -1303,6 +1310,101 @@ func (s *TokenService) checkPendingOreate(tokenID string, account oreate.Account
 		status = "quota"
 	}
 	s.finishPending(ctx, "oreate", tokenID, status, false, quotaMeta)
+	if claimFirstImage {
+		go s.claimOreateFirstImage(tokenID, account)
+	}
+}
+
+// claimOreateFirstImage generates the account's first image so Oreate releases
+// the 50-credit first-use bonus, then refreshes the cached balance. The image
+// itself is discarded: only the grant matters, and it is a one-time award the
+// account cannot collect later without generating.
+func (s *TokenService) claimOreateFirstImage(tokenID string, account oreate.Account) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("token import: oreate first-image claim panicked for %s: %v", tokenID, r)
+		}
+	}()
+	if s.oreate == nil {
+		return
+	}
+	s.sem <- struct{}{}
+	defer func() { <-s.sem }()
+	ctx, cancel := context.WithTimeout(context.Background(), oreateFirstImageTimeout)
+	defer cancel()
+	item, err := s.tokens.Get(ctx, "oreate", tokenID)
+	if err != nil || item == nil || item.Dead {
+		return
+	}
+	if _, claimed := jsonMapInt(item.Meta, oreateFirstImageAtMetaKey); claimed {
+		return
+	}
+	s.applyProxy(ctx)
+	// Record the attempt before spending credits: a crash or timeout must not let
+	// a later import pay for a second image.
+	if markErr := s.tokens.UpdateMergingMeta(ctx, "oreate", tokenID, map[string]any{
+		oreateFirstImageAtMetaKey:    int(time.Now().Unix()),
+		oreateFirstImageStateMetaKey: oreateFirstImageRunning,
+		oreateFirstImageErrMetaKey:   "",
+	}, nil); markErr != nil {
+		return
+	}
+	imageURL, claimErr := s.oreate.ClaimFirstImageBonus(ctx, account)
+	if claimErr != nil {
+		log.Printf("token import: oreate first-use bonus not claimed for %s: %v", tokenID, claimErr)
+	}
+	s.recordOreateFirstImage(ctx, tokenID, imageURL, claimErr)
+	// The grant lands asynchronously, so read the balance until it grows past the
+	// pre-claim reading or the bounded window elapses.
+	before, _ := jsonMapInt(item.Meta, "cached_quota_remaining")
+	for deadline := time.Now().Add(oreateFirstImageBonusWait); ; {
+		data, balanceErr := s.oreate.FetchCreditsBalance(ctx, account)
+		if balanceErr == nil {
+			if _, persistErr := persistOreateQuotaSnapshot(ctx, s.tokens, tokenID, data, time.Now()); persistErr != nil {
+				log.Printf("token import: could not persist oreate balance for %s: %v", tokenID, persistErr)
+				return
+			}
+			if remaining, ok := data["remaining"].(int); ok && remaining > before {
+				return
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(oreateFirstImageBonusPoll):
+		}
+	}
+}
+
+// recordOreateFirstImage persists the outcome of the import-time image so the
+// accounts UI can tell a spam-blocked account from one whose stream merely broke
+// (the site charged for that image and released the bonus all the same).
+func (s *TokenService) recordOreateFirstImage(ctx context.Context, tokenID, imageURL string, claimErr error) {
+	state, detail := oreateFirstImageOK, ""
+	if claimErr != nil {
+		detail = claimErr.Error()
+		if len(detail) > oreateFirstImageErrMaxLen {
+			detail = detail[:oreateFirstImageErrMaxLen]
+		}
+		switch {
+		case errors.Is(claimErr, oreate.ErrSpamUser):
+			state = oreateFirstImageSpam
+		case strings.TrimSpace(imageURL) != "":
+			// The image rendered before the stream ended badly.
+			state = oreateFirstImagePartial
+		default:
+			state = oreateFirstImageFailed
+		}
+	}
+	if err := s.tokens.UpdateMergingMeta(ctx, "oreate", tokenID, map[string]any{
+		oreateFirstImageStateMetaKey: state,
+		oreateFirstImageErrMetaKey:   detail,
+	}, nil); err != nil {
+		log.Printf("token import: could not persist oreate first-image state for %s: %v", tokenID, err)
+	}
 }
 
 func oreateAccountFromToken(item model.TokenAccount) oreate.Account {
@@ -1319,6 +1421,23 @@ func oreateAccountFromToken(item model.TokenAccount) oreate.Account {
 }
 
 const (
+	// oreateFirstImageAtMetaKey records when an account claimed the one-time
+	// first-use image bonus, whether or not the generation itself succeeded.
+	oreateFirstImageAtMetaKey = "oreate_first_image_at"
+	// oreateFirstImageStateMetaKey / oreateFirstImageErrMetaKey surface that
+	// attempt's outcome (and its upstream message) in the accounts list.
+	oreateFirstImageStateMetaKey = "oreate_first_image_state"
+	oreateFirstImageErrMetaKey   = "oreate_first_image_error"
+	oreateFirstImageErrMaxLen    = 200
+	oreateFirstImageRunning      = "running"
+	oreateFirstImageOK           = "ok"
+	oreateFirstImageSpam         = "spam"
+	oreateFirstImagePartial      = "partial"
+	oreateFirstImageFailed       = "failed"
+	oreateFirstImageTimeout      = 6 * time.Minute
+	oreateFirstImageBonusWait    = 60 * time.Second
+	oreateFirstImageBonusPoll    = 5 * time.Second
+
 	oreateMinUsableCredits             = 60
 	oreateQuotaRefreshBatchSize        = 4
 	oreateQuotaRefreshInterval         = 30 * time.Minute
@@ -2187,6 +2306,12 @@ func accountRow(item model.TokenAccount, inFlight int64) map[string]any {
 	}
 	hasQuota := typeLabel == "openai" || typeLabel == "adobe" || typeLabel == "runway" || typeLabel == "leonardo" || typeLabel == "krea" || typeLabel == "imagine" || typeLabel == "grok" || typeLabel == "oreate"
 	paidPlan, _ := jsonMapBool(item.Meta, "paid_account")
+	firstImageAt, _ := jsonMapInt(item.Meta, oreateFirstImageAtMetaKey)
+	firstImageState := strings.TrimSpace(stringValue(item.Meta[oreateFirstImageStateMetaKey]))
+	if firstImageState == "" && firstImageAt != 0 {
+		// Accounts imported before the state was tracked only carry the timestamp.
+		firstImageState = "unknown"
+	}
 	return map[string]any{
 		"id":              item.ID,
 		"pool":            item.Pool,
@@ -2226,6 +2351,11 @@ func accountRow(item model.TokenAccount, inFlight int64) map[string]any {
 		"paid_plan": paidPlan,
 		"base_url":  emptyToNil(strings.TrimSpace(stringValue(item.Meta["base_url"]))),
 		"models":    strings.TrimSpace(stringValue(item.Meta["models"])),
+		// Import-time image (oreate only): state + upstream message so the table can
+		// show whether the account ever generated and claimed its first-use bonus.
+		"first_image":       emptyToNil(firstImageState),
+		"first_image_error": emptyToNil(strings.TrimSpace(stringValue(item.Meta[oreateFirstImageErrMetaKey]))),
+		"first_image_at":    valueOrNil(firstImageAt != 0, firstImageAt),
 	}
 }
 

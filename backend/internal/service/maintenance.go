@@ -187,7 +187,15 @@ func (m *MaintenanceService) tick(ctx context.Context) {
 	// 3. Fail long-pending events so they stop blocking the per-user gate, and
 	//    refund the credits debited up-front for each abandoned generation (the
 	//    normal failure-refund path never ran for a process-restart orphan).
-	if purged, err := m.events.PurgeStale(ctx, m.stalePending); err != nil {
+	//    An event whose generation goroutine is still registered in-flight is
+	//    NOT an orphan — a slow video render can legitimately outlive the
+	//    window — so it is skipped and left to its own work-context backstop.
+	//    Past the hard cap a still-registered entry means a wedged goroutine:
+	//    purge + cancel as before.
+	skipLive := func(e repo.StaleEvent) bool {
+		return m.inflight != nil && m.inflight.Active(e.ID) && time.Since(e.TS) < 3*m.stalePending
+	}
+	if purged, err := m.events.PurgeStale(ctx, m.stalePending, skipLive); err != nil {
 		log.Printf("maintenance: purge_stale: %v", err)
 	} else if len(purged) > 0 {
 		refunded := 0
@@ -322,3 +330,4 @@ func (m *MaintenanceService) retentionDays(ctx context.Context, key string) int 
 	}
 	return days
 }
+

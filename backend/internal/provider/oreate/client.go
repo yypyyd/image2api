@@ -27,6 +27,7 @@ var (
 	ErrAuth              = errors.New("oreate auth failed")
 	ErrQuotaExhausted    = errors.New("oreate quota exhausted")
 	ErrRiskControl       = errors.New("oreate risk control")
+	ErrSpamUser          = errors.New("oreate spam user")
 	ErrTemporaryUpstream = errors.New("oreate upstream temporary error")
 	ErrContentRejected   = errors.New("oreate content rejected")
 )
@@ -60,8 +61,9 @@ func (a Account) normalized() Account {
 }
 
 type Signature struct {
-	JT  string
-	BID string
+	JT     string
+	BID    string
+	Cookie string
 }
 
 type Signer interface {
@@ -73,6 +75,7 @@ type Client struct {
 	proxy        string
 	signer       Signer
 	baseURL      string
+	cdnBaseURL   string
 	directClient *http.Client
 }
 
@@ -284,6 +287,20 @@ func cookieValue(cookie, name string) string {
 		}
 	}
 	return ""
+}
+
+// mergeCookies overlays browser-observed cookies onto the stored cookie so the
+// website request carries the full tracking jar; stored values win on conflict.
+func mergeCookies(stored, browser string) string {
+	merged := strings.TrimSpace(stored)
+	for _, part := range strings.Split(browser, ";") {
+		name, _, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if !ok || name == "" || cookieValue(merged, name) != "" {
+			continue
+		}
+		merged += "; " + strings.TrimSpace(part)
+	}
+	return merged
 }
 
 func IsOreateCookie(cookie string) bool {

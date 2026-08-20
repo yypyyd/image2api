@@ -9,8 +9,12 @@ import (
 	"testing"
 )
 
-func TestFacePanelTransformOnlyAppliesToSeedance2(t *testing.T) {
-	for _, model := range []string{"firefly-seedance-2", "firefly-seedance-2-fast", "seedance20", "seedance20-fast", "sd2.0", "sd2.0-fast"} {
+func TestFacePanelTransformAppliesToAdobeAndOreateSeedance(t *testing.T) {
+	for _, model := range []string{
+		"firefly-seedance-2", "firefly-seedance-2-fast", "seedance20", "seedance20-fast", "sd2.0", "sd2.0-fast",
+		"oreate-seedance-1.5-pro", "oreate-seedance-2.0-mini", "oreate-seedance-2.0-fast", "oreate-seedance-2.0", "oreate-seedance-2.5",
+		" OREATE-SEEDANCE-2.0-MINI ",
+	} {
 		if !(&V1Service{}).shouldApplyReferenceGrid(nil, model, false) {
 			t.Fatalf("model %q should enable face-panel transform", model)
 		}

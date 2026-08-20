@@ -91,6 +91,25 @@ function grokCapabilities(a) {
   ]
 }
 
+// 导入时那次「生图」（领 50 赠分用）的结果，只有 oreate 号有。
+const FIRST_IMAGE_STATES = {
+  ok: { label: '生图✓', cls: 'bg-emerald-500/10 text-emerald-300 ring-emerald-400/20', hint: '导入时生图成功，已领首次赠分' },
+  partial: { label: '生图≈', cls: 'bg-sky-500/10 text-sky-300 ring-sky-400/20', hint: '图已生成但流中断，赠分通常已到账' },
+  spam: { label: '生图spam', cls: 'bg-rose-500/10 text-rose-300 ring-rose-400/20', hint: '上游判定 spam user，生图被拒（未扣分）' },
+  failed: { label: '生图✗', cls: 'bg-amber-500/10 text-amber-300 ring-amber-400/20', hint: '导入时生图失败' },
+  running: { label: '生图中', cls: 'bg-white/[0.06] text-white/60 ring-white/15', hint: '导入时生图进行中' },
+  unknown: { label: '生图?', cls: 'bg-white/[0.06] text-white/45 ring-white/15', hint: '该号导入时未记录生图结果' },
+}
+function firstImageBadge(a) {
+  if (a.type !== 'oreate') return null
+  const state = FIRST_IMAGE_STATES[a.first_image]
+  if (!state) return null
+  const parts = [state.hint]
+  if (a.first_image_error) parts.push(a.first_image_error)
+  if (a.first_image_at) parts.push(fmtTs(a.first_image_at))
+  return { ...state, title: parts.join(' · ') }
+}
+
 function accountConcurrency(a) {
   if (Number(a.concurrency) > 0) return Number(a.concurrency)
   if (a.type === 'grok') return 10
@@ -518,6 +537,10 @@ onMounted(() => { loadAccounts(); loadModelList() })
                 <span v-if="a.type === 'leonardo' && a.paid_plan"
                       class="shrink-0 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium bg-violet-500/15 text-violet-300 ring-1 ring-violet-400/20"
                       :title="a.plan ? `积分号 · ${a.plan}，点数按月续期` : '积分号，点数按月续期，不参与每日重置'">积分号</span>
+                <span v-if="firstImageBadge(a)"
+                      class="shrink-0 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ring-1"
+                      :class="firstImageBadge(a).cls"
+                      :title="firstImageBadge(a).title">{{ firstImageBadge(a).label }}</span>
                 <span v-if="a.image_limited && a.status !== 'quota'"
                       class="shrink-0 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium bg-amber-500/15 text-amber-300 ring-1 ring-amber-400/20"
                       title="图片额度耗尽，仅视频可用">图片限额</span>

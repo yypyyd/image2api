@@ -123,6 +123,11 @@ type V1Service struct {
 	// next request prefers a different account instead of immediately retrying the
 	// one that just failed. Nothing is ever removed from the rotation.
 	acctCooldowns sync.Map
+	// oreateSpam holds accountID → time.Time until which an account that Oreate
+	// answered with an explicit spam-user verdict is kept out of the rotation.
+	// Unlike acctCooldowns this removes the account from the candidate set, so a
+	// flagged account is not re-submitted on every request.
+	oreateSpam sync.Map
 	// grokBuildLocks serializes SSO->Build conversion/refresh per account. OAuth
 	// refresh tokens may rotate, so concurrent first-use requests must not persist
 	// different generations of the same credential.
@@ -215,6 +220,14 @@ func (r *InflightRegistry) Cancel(eventID string) bool {
 		return true
 	}
 	return false
+}
+
+// Active reports whether a generation is still registered (running) for the
+// event, without cancelling it. Lets the maintenance sweep tell a live long
+// render apart from a process-restart orphan.
+func (r *InflightRegistry) Active(eventID string) bool {
+	_, ok := r.m.Load(eventID)
+	return ok
 }
 
 type APIPrincipal struct {
@@ -2502,6 +2515,12 @@ const adobePointsConcurrencyPerAccount = 4
 // rotation, and a pool where every account is cooling behaves exactly as before.
 const accountFailureCooldown = 45 * time.Second
 
+// oreateSpamQuarantine is how long a spam-user verdict keeps an account out of
+// the Oreate rotation. The verdict is an upstream state, not a broken
+// credential, so it must expire on its own; the window only has to outlive a
+// burst of queued requests.
+const oreateSpamQuarantine = 30 * time.Minute
+
 const providerAccountQueueWait = 90 * time.Second
 const providerAccountQueuePoll = 300 * time.Millisecond
 
@@ -2538,9 +2557,9 @@ const (
 //
 // Returns the actual upstream error (never a synthetic "retry failed"). On
 // success it stamps success_total/fails=0 on the winning account. classify maps
-// a provider error to (isAuth, isQuota, isTemporary). refreshOnAuth (nil for
-// providers whose token IS the credential) re-mints the account's token so an
-// auth retry uses a FRESH token instead of replaying the stale one.
+// a provider error to (isAuth, isQuota, isTemporary, isDead). refreshOnAuth
+// (nil for providers whose token IS the credential) re-mints the account's token
+// so an auth retry uses a FRESH token instead of replaying the stale one.
 func (s *V1Service) runPoolWithFailover(ctx context.Context, eventID, pool string, active []model.TokenAccount, kind string,
 	attempt func(token model.TokenAccount) ([]byte, error),
 	classify func(error) (isAuth, isQuota, isTemporary, isDead bool),
@@ -2701,7 +2720,8 @@ func (s *V1Service) tryAccount(ctx context.Context, eventID, pool string, token 
 				return nil, err, true, true
 			}
 			s.markTokenDead(ctx, pool, token, kind)
-			return nil, err, true, true
+			// Permanent account death must not consume the temporary-failure cap.
+			return nil, err, true, false
 		}
 		if isTemp {
 			// Temporary upstream error → record it against the upstream (not the
@@ -3327,6 +3347,7 @@ func (s *V1Service) generateOreateVideo(ctx context.Context, eventID string, mod
 		active = append(active, item)
 	}
 	active = pinTestAccount(items, active, in.AccountID)
+	active = s.dropOreateSpamQuarantined(active)
 	active, knownInsufficient := filterOreateAccountsByCredits(active, requiredCredits)
 	if len(active) == 0 {
 		if knownInsufficient {
@@ -3362,15 +3383,77 @@ func (s *V1Service) generateOreateVideo(ctx context.Context, eventID string, mod
 					genErr = fmt.Errorf("%w: %w", genErr, errAccountTaskQuota)
 				}
 			}
+			if errors.Is(genErr, oreate.ErrSpamUser) {
+				s.quarantineOreateSpamAccount(token.ID)
+				genErr = fmt.Errorf("%w (上游只对该账号的视频风控：同一 cookie 在 Oreate 官网仍能出图，已换号重试)", genErr)
+			}
 			return nil, genErr
 		}
+		s.oreateSpam.Delete(token.ID)
 		videoURL = strings.TrimSpace(stringValue(meta["video_url"]))
 		_, _ = s.reconcileOreateCredits(ctx, token)
 		return blob, nil
-	}, func(e error) (bool, bool, bool, bool) {
-		return errors.Is(e, oreate.ErrAuth), errors.Is(e, oreate.ErrQuotaExhausted), errors.Is(e, oreate.ErrTemporaryUpstream) || errors.Is(e, oreate.ErrRiskControl), false
-	}, nil, true)
+	}, oreateErrClass, nil, false)
 	return data, videoURL, err
+}
+
+// A spam-user verdict is scoped to the account and to video: the same cookie on
+// the same exit route still generates images through Oreate's web UI, every
+// video model is refused, and other accounts kept producing video inside the
+// same window. So it stays failover-eligible — rotate onto the next account
+// instead of failing the request — while quarantineOreateSpamAccount parks the
+// flagged one and dropOreateSpamQuarantined hides it from later candidate sets
+// until the window expires.
+func (s *V1Service) quarantineOreateSpamAccount(accountID string) {
+	if accountID == "" {
+		return
+	}
+	s.oreateSpam.Store(accountID, time.Now().Add(oreateSpamQuarantine))
+}
+
+func (s *V1Service) oreateSpamQuarantined(accountID string) bool {
+	value, ok := s.oreateSpam.Load(accountID)
+	if !ok {
+		return false
+	}
+	until, _ := value.(time.Time)
+	if time.Now().Before(until) {
+		return true
+	}
+	s.oreateSpam.Delete(accountID)
+	return false
+}
+
+// dropOreateSpamQuarantined hides quarantined accounts, but keeps the full set
+// when every candidate is quarantined — an upstream-wide block must still let
+// one request through to re-probe, which is what clears the quarantine once
+// Oreate accepts the account again.
+func (s *V1Service) dropOreateSpamQuarantined(items []model.TokenAccount) []model.TokenAccount {
+	kept := make([]model.TokenAccount, 0, len(items))
+	for _, item := range items {
+		if !s.oreateSpamQuarantined(item.ID) {
+			kept = append(kept, item)
+		}
+	}
+	if len(kept) == 0 {
+		return items
+	}
+	return kept
+}
+
+func isOreateTemporaryFailover(err error) bool {
+	return errors.Is(err, oreate.ErrTemporaryUpstream) || errors.Is(err, oreate.ErrRiskControl)
+}
+
+// isDead is never reported: a spam-user verdict is a reversible upstream state,
+// not a broken credential — the same cookie serves again once the account or its
+// route stops being flagged. Killing the account instead wiped ~100 usable
+// accounts during a single blocked window.
+func oreateErrClass(err error) (isAuth, isQuota, isTemporary, isDead bool) {
+	return errors.Is(err, oreate.ErrAuth),
+		errors.Is(err, oreate.ErrQuotaExhausted),
+		isOreateTemporaryFailover(err),
+		false
 }
 
 // filterOreateAccountsByCredits keeps unknown balances eligible for backwards
@@ -4987,3 +5070,4 @@ func (s *V1Service) rotateRoundRobin(pool string, items []model.TokenAccount) {
 		i = j
 	}
 }
+

@@ -1,5 +1,27 @@
 # Design Notes
 
+### 2026-08-18 - Isolate explicit Oreate spam-user accounts and pin proxy sessions
+
+**Change**: Oreate's explicit `212361`/`spam user` response now marks the
+affected account `disabled + dead` and fails over without consuming the bounded
+temporary-upstream retry budget. Generic risk-control and transport errors stay
+temporary. The production proxy session was rotated and its lifetime changed
+from five minutes to 60 minutes so the browser signer, chat creation, and full
+SSE generation keep one egress address.
+
+**Reason**: Multiple accounts returned the same explicit spam-user decision even
+with neutral prompts and no reference media; one account reproduced it from a
+new proxy IP. Separately, the five-minute proxy session changed egress during
+long video streams and produced `unexpected EOF` on a previously healthy
+account. Confirmed spam-user accounts are therefore isolated independently of
+the recoverable low-credit `quota` state.
+
+**Impact**: A risk-controlled account is removed from future rotation while a
+request can continue with another account; temporary provider failures retain
+bounded failover. Low-credit accounts remain recoverable and are refreshed by
+the existing quota maintenance path. The new proxy session is shared by the
+providers that use `proxy.url`.
+
 ### 2026-08-17 - Retain and refresh low-credit OreateAI accounts
 
 **Change**: OreateAI accounts with a confirmed balance below 60 now remain in
@@ -376,15 +398,15 @@ be set to the canonical Cloudflare/CDN HTTPS hostname in production.
 
 ### 2026-08-08 - Face-only thin red-silk reference veil
 
-**Change**: Seedance 2 and Seedance 2 Fast reference images now apply a light, medium-weight red mesh with extreme density only inside an inward-trimmed Pigo face rectangle. The previous hair-inclusive expansion and dense near-black mesh were removed; no 3x3 grid, external face, or heavy strands are added.
+**Change**: Adobe Seedance 2/2 Fast and all built-in Oreate Seedance reference images now apply a light, medium-weight red mesh with extreme density only inside an inward-trimmed Pigo face rectangle. The previous hair-inclusive expansion and dense near-black mesh were removed; no 3x3 grid, external face, or heavy strands are added.
 
 **Reason**: The previous face veil was too sparse in its reduced version and black lines were harder to distinguish from dark hair. Thin red strands improve visibility while preserving the face-only, non-solid treatment.
 
-**Impact**: Hair, shoulders, clothing, and background remain unchanged. Images without a reliable face remain unchanged, and other models still receive original reference bytes.
+**Impact**: Hair, shoulders, clothing, and background remain unchanged. Images without a reliable face remain unchanged, and models outside the Adobe/Oreate Seedance routes still receive original reference bytes.
 
 ### 2026-08-06 - Optional reference-image face swapping
 
-**Change**: Seedance 2 and Seedance 2 Fast reference images run a local Pigo face transform on the gateway for `/generate`, `/v1/images/edits`, and `/v1/videos` when an individual image contains a reliable face. This entry records the earlier experimental 3x3 grid version; it was superseded by the face-only veil above.
+**Change**: Adobe Seedance 2/2 Fast and built-in Oreate Seedance reference images run a local Pigo face transform on the gateway for `/generate`, `/v1/images/edits`, and `/v1/videos` when an individual image contains a reliable face. This entry records the earlier experimental 3x3 grid version; it was superseded by the face-only veil above.
 
 **Reason**: Pigo provides a small pure-Go face detector, allowing the gateway to break the original face identity before an upstream reference-image check while keeping the target composition.
 

@@ -434,10 +434,11 @@ func (r *EventRepository) ClearRefFiles(ctx context.Context, eventID string) err
 // credits debited up-front AND attribute the failure to the account the
 // (now-abandoned) generation was using.
 type StaleEvent struct {
-	ID        string  `gorm:"column:id"`
-	UserID    string  `gorm:"column:user_id"`
-	AccountID string  `gorm:"column:account_id"`
-	Cost      float64 `gorm:"column:cost"`
+	ID        string    `gorm:"column:id"`
+	UserID    string    `gorm:"column:user_id"`
+	AccountID string    `gorm:"column:account_id"`
+	Cost      float64   `gorm:"column:cost"`
+	TS        time.Time `gorm:"column:ts"`
 }
 
 // PurgeStale marks long-pending entries as failed/abandoned and RETURNS them so
@@ -445,7 +446,9 @@ type StaleEvent struct {
 // blocks the per-user generation gate (PendingByUser) forever AND silently eats
 // the user's credits (the charge happens at submit; the normal failure-refund
 // path never runs for a process-restart orphan). Mirrors Python purge_stale.
-func (r *EventRepository) PurgeStale(ctx context.Context, maxAge time.Duration) ([]StaleEvent, error) {
+// skip lets the caller exclude entries that are not orphans — e.g. a slow
+// render whose generation goroutine is still alive in-process.
+func (r *EventRepository) PurgeStale(ctx context.Context, maxAge time.Duration, skip func(StaleEvent) bool) ([]StaleEvent, error) {
 	if maxAge <= 0 {
 		maxAge = 600 * time.Second
 	}
@@ -455,17 +458,26 @@ func (r *EventRepository) PurgeStale(ctx context.Context, maxAge time.Duration) 
 		// Snapshot who/what to refund BEFORE flipping status, so a concurrent
 		// sweep can't double-count (the UPDATE in the same tx removes them from
 		// the pending set).
+		var candidates []StaleEvent
 		if err := tx.Model(&model.EventLog{}).
 			Where("status = ? AND ts < ?", "pending", cutoff).
-			Select("id", "user_id", "account_id", "cost").
-			Scan(&stale).Error; err != nil {
+			Select("id", "user_id", "account_id", "cost", "ts").
+			Scan(&candidates).Error; err != nil {
 			return err
 		}
-		if len(stale) == 0 {
+		ids := make([]string, 0, len(candidates))
+		for _, e := range candidates {
+			if skip != nil && skip(e) {
+				continue
+			}
+			stale = append(stale, e)
+			ids = append(ids, e.ID)
+		}
+		if len(ids) == 0 {
 			return nil
 		}
 		return tx.Model(&model.EventLog{}).
-			Where("status = ? AND ts < ?", "pending", cutoff).
+			Where("status = ? AND id IN ?", "pending", ids).
 			Updates(map[string]any{
 				"status":     "failed",
 				"error":      gorm.Expr("COALESCE(NULLIF(error, ''), ?)", "abandoned (process restarted or request interrupted)"),
@@ -769,3 +781,4 @@ func (r *EventRepository) PendingByUser(ctx context.Context, userID, onlySource 
 	}
 	return &item, nil
 }
+

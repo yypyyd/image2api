@@ -224,7 +224,7 @@ func (s *chromiumSigner) signOnce(parent context.Context, path string, account A
 	if err := reportWaiter.wait(browserCtx, bantiResponseTimeout); err != nil {
 		return Signature{}, fmt.Errorf("oreate signer: Banti report: %w", err)
 	}
-	return Signature{JT: strings.TrimSpace(jt), BID: cookieValue(browserCookie, "__bid_n")}, nil
+	return Signature{JT: strings.TrimSpace(jt), BID: cookieValue(browserCookie, "__bid_n"), Cookie: strings.TrimSpace(browserCookie)}, nil
 }
 
 type bantiReportResult struct {
